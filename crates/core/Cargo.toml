@@ -1,0 +1,7 @@
+[package]
+name = "ludo-core"
+version.workspace = true
+edition.workspace = true
+
+# Intentionally empty: the language implementation depends on nothing.
+[dependencies]
