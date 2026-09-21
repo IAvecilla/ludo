@@ -1,0 +1,7 @@
+[package]
+name = "ludo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ludo-core = { path = "../core" }
