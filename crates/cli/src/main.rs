@@ -3,6 +3,7 @@
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
+use ludo_core::parser::parse_expr;
 use ludo_core::scanner::scan_tokens;
 const EX_USAGE: u8 = 64;
 const EX_DATAERR: u8 = 65;
@@ -68,22 +69,31 @@ fn run_repl() {
             }
         }
 
-        run(line.trim());
+        let line = line.trim();
+        if !line.is_empty() {
+            run(line);
+        }
     }
 }
 
 fn run(source: &str) -> bool {
-    match scan_tokens(source) {
-        Ok(tokens) => {
-            for token in &tokens {
-                println!("{:?}", token.kind);
-            }
-            true
-        }
+    let tokens = match scan_tokens(source) {
+        Ok(tokens) => tokens,
         Err(errors) => {
             for error in &errors {
                 eprintln!("Scanning Error: {}", error.message);
             }
+            return false;
+        }
+    };
+
+    match parse_expr(tokens) {
+        Ok(expr) => {
+            println!("{expr}");
+            true
+        }
+        Err(error) => {
+            eprintln!("Parsing Error: {}", error.message);
             false
         }
     }
