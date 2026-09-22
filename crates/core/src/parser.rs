@@ -1,0 +1,409 @@
+use crate::ast::{BinaryOp, Expr, UnaryOp};
+use crate::token::{Token, TokenKind};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub message: String,
+}
+
+pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
+    let mut parser = Parser::new(tokens);
+    let expr = parser.expression()?;
+    parser.expect_end()?;
+    Ok(expr)
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    current: usize,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Self {
+        Self { tokens, current: 0 }
+    }
+
+    fn expression(&mut self) -> Result<Expr, ParseError> {
+        self.or()
+    }
+
+    fn or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.and()?;
+        while self.matches(&[TokenKind::Or]) {
+            let right = self.and()?;
+            left = Expr::Binary(Box::new(left), BinaryOp::Or, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.equality()?;
+        while self.matches(&[TokenKind::And]) {
+            let right = self.equality()?;
+            left = Expr::Binary(Box::new(left), BinaryOp::And, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn equality(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.comparison()?;
+        loop {
+            let op = match self.peek() {
+                TokenKind::EqEq => BinaryOp::Eq,
+                TokenKind::BangEq => BinaryOp::Ne,
+                _ => break,
+            };
+            self.advance();
+            let right = self.comparison()?;
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn comparison(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.pipe()?;
+        loop {
+            let op = match self.peek() {
+                TokenKind::Less => BinaryOp::Lt,
+                TokenKind::LessEq => BinaryOp::Le,
+                TokenKind::Greater => BinaryOp::Gt,
+                TokenKind::GreaterEq => BinaryOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let right = self.pipe()?;
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn pipe(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.term()?;
+        while self.matches(&[TokenKind::PipeGt]) {
+            let right = self.term()?;
+            left = pipe_into(left, right)?;
+        }
+        Ok(left)
+    }
+
+    fn term(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.factor()?;
+        loop {
+            let op = match self.peek() {
+                TokenKind::Plus => BinaryOp::Add,
+                TokenKind::Minus => BinaryOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let right = self.factor()?;
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn factor(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.unary()?;
+        loop {
+            let op = match self.peek() {
+                TokenKind::Star => BinaryOp::Mul,
+                TokenKind::Slash => BinaryOp::Div,
+                TokenKind::Percent => BinaryOp::Rem,
+                _ => break,
+            };
+            self.advance();
+            let right = self.unary()?;
+            left = Expr::Binary(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn unary(&mut self) -> Result<Expr, ParseError> {
+        let op = match self.peek() {
+            TokenKind::Minus => UnaryOp::Neg,
+            TokenKind::Not => UnaryOp::Not,
+            _ => return self.postfix(),
+        };
+        self.advance();
+        let right = self.unary()?;
+        Ok(Expr::Unary(op, Box::new(right)))
+    }
+
+    fn postfix(&mut self) -> Result<Expr, ParseError> {
+        let mut expr = self.primary()?;
+        loop {
+            if self.matches(&[TokenKind::LParen]) {
+                let args = self.arguments()?;
+                expr = Expr::Call(Box::new(expr), args);
+            } else if self.matches(&[TokenKind::Dot]) {
+                let name = self.expect_ident("a field or method name after `.`")?;
+                if self.matches(&[TokenKind::LParen]) {
+                    let mut args = vec![expr];
+                    args.extend(self.arguments()?);
+                    expr = Expr::Call(Box::new(Expr::Ident(name)), args);
+                } else {
+                    expr = Expr::Field(Box::new(expr), name);
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(expr)
+    }
+
+    fn arguments(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = Vec::new();
+        if self.peek() != &TokenKind::RParen {
+            loop {
+                args.push(self.expression()?);
+                if !self.matches(&[TokenKind::Comma]) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen, "`)` to close the argument list")?;
+        Ok(args)
+    }
+
+    fn primary(&mut self) -> Result<Expr, ParseError> {
+        let expr = match self.peek().clone() {
+            TokenKind::Int(v) => Expr::Int(v),
+            TokenKind::Float(v) => Expr::Float(v),
+            TokenKind::Str(v) => Expr::Str(v),
+            TokenKind::Symbol(v) => Expr::Symbol(v),
+            TokenKind::True => Expr::Bool(true),
+            TokenKind::False => Expr::Bool(false),
+            TokenKind::Ident(v) => Expr::Ident(v),
+            TokenKind::LParen => {
+                self.advance();
+                let inner = self.expression()?;
+                self.expect(TokenKind::RParen, "`)` to close the group")?;
+                return Ok(inner);
+            }
+            TokenKind::Eof => return Err(self.error("unexpected end of input")),
+            other => return Err(self.error(format!("`{other:?}` is not an expression"))),
+        };
+        self.advance();
+        Ok(expr)
+    }
+
+    fn peek(&self) -> &TokenKind {
+        &self.tokens[self.current].kind
+    }
+
+    fn advance(&mut self) -> &Token {
+        if self.tokens[self.current].kind != TokenKind::Eof {
+            self.current += 1;
+        }
+        &self.tokens[self.current - 1]
+    }
+
+    fn matches(&mut self, kinds: &[TokenKind]) -> bool {
+        if kinds.contains(self.peek()) {
+            self.advance();
+            return true;
+        }
+        false
+    }
+
+    fn expect(&mut self, kind: TokenKind, what: &str) -> Result<(), ParseError> {
+        if self.peek() == &kind {
+            self.advance();
+            return Ok(());
+        }
+        Err(self.error(format!("expected {what}")))
+    }
+
+    fn expect_ident(&mut self, what: &str) -> Result<String, ParseError> {
+        if let TokenKind::Ident(name) = self.peek().clone() {
+            self.advance();
+            return Ok(name);
+        }
+        Err(self.error(format!("expected {what}")))
+    }
+
+    fn expect_end(&mut self) -> Result<(), ParseError> {
+        if self.peek() == &TokenKind::Eof {
+            return Ok(());
+        }
+        Err(self.error("unexpected trailing input"))
+    }
+
+    fn error(&self, message: impl Into<String>) -> ParseError {
+        let token = &self.tokens[self.current];
+        let message = message.into();
+        if token.kind == TokenKind::Eof {
+            ParseError {
+                message: format!("{message}, at end of input"),
+            }
+        } else {
+            ParseError {
+                message: format!("{message}, found `{}`", token.lexeme),
+            }
+        }
+    }
+}
+
+fn pipe_into(left: Expr, right: Expr) -> Result<Expr, ParseError> {
+    match right {
+        Expr::Call(callee, args) => {
+            let mut piped = vec![left];
+            piped.extend(args);
+            Ok(Expr::Call(callee, piped))
+        }
+        callee @ (Expr::Ident(_) | Expr::Field(_, _)) => {
+            Ok(Expr::Call(Box::new(callee), vec![left]))
+        }
+        _ => Err(ParseError {
+            message: "the right side of `|>` must be a function or a call".to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::scan_tokens;
+
+    fn parse(source: &str) -> String {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        parse_expr(tokens)
+            .unwrap_or_else(|e| panic!("source should parse cleanly: {}", e.message))
+            .to_string()
+    }
+
+    fn error(source: &str) -> String {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        parse_expr(tokens).unwrap_err().message
+    }
+
+    #[test]
+    fn parses_literals() {
+        assert_eq!(parse("1"), "1");
+        assert_eq!(parse("1.5"), "1.5");
+        assert_eq!(parse("0.2s"), "0.2");
+        assert_eq!(parse(r#""hi""#), r#""hi""#);
+        assert_eq!(parse(":jump"), ":jump");
+        assert_eq!(parse("true"), "true");
+        assert_eq!(parse("x"), "x");
+    }
+
+    #[test]
+    fn factor_binds_tighter_than_term() {
+        assert_eq!(parse("1 + 2 * 3"), "(+ 1 (* 2 3))");
+        assert_eq!(parse("1 * 2 + 3"), "(+ (* 1 2) 3)");
+    }
+
+    #[test]
+    fn binary_operators_are_left_associative() {
+        assert_eq!(parse("1 - 2 - 3"), "(- (- 1 2) 3)");
+        assert_eq!(parse("1 / 2 / 3"), "(/ (/ 1 2) 3)");
+    }
+
+    #[test]
+    fn parentheses_leave_no_node_behind() {
+        assert_eq!(parse("(1 + 2) * 3"), "(* (+ 1 2) 3)");
+        assert_eq!(parse("(((1)))"), "1");
+    }
+
+    #[test]
+    fn unary_binds_tighter_than_factor() {
+        assert_eq!(parse("-1 * 2"), "(* (- 1) 2)");
+        assert_eq!(parse("not a and b"), "(and (not a) b)");
+        assert_eq!(parse("--1"), "(- (- 1))");
+    }
+
+    #[test]
+    fn full_precedence_ladder() {
+        assert_eq!(
+            parse("a or b and c == d < e + f * g"),
+            "(or a (and b (== c (< d (+ e (* f g))))))"
+        );
+    }
+
+    #[test]
+    fn parses_calls() {
+        assert_eq!(parse("f()"), "(call f)");
+        assert_eq!(parse("f(1, 2)"), "(call f 1 2)");
+        assert_eq!(parse("f(1)(2)"), "(call (call f 1) 2)");
+        assert_eq!(parse("f(g(1))"), "(call f (call g 1))");
+    }
+
+    #[test]
+    fn a_dot_without_parens_is_field_access() {
+        assert_eq!(parse("p.pos"), "(. p pos)");
+        assert_eq!(parse("p.pos.x"), "(. (. p pos) x)");
+    }
+
+    #[test]
+    fn a_dot_with_parens_puts_the_receiver_first() {
+        assert_eq!(parse("p.physics(dt)"), "(call physics p dt)");
+        assert_eq!(parse("p.pos.length()"), "(call length (. p pos))");
+    }
+
+    #[test]
+    fn call_dot_and_pipe_build_the_same_tree() {
+        let expected = "(call physics p dt)";
+        assert_eq!(parse("physics(p, dt)"), expected);
+        assert_eq!(parse("p.physics(dt)"), expected);
+        assert_eq!(parse("p |> physics(dt)"), expected);
+    }
+
+    #[test]
+    fn a_pipe_into_a_bare_name_calls_it_with_one_argument() {
+        assert_eq!(parse("p |> normalize"), "(call normalize p)");
+    }
+
+    #[test]
+    fn pipes_chain_left_to_right() {
+        assert_eq!(
+            parse("p |> handle(input) |> physics(dt)"),
+            "(call physics (call handle p input) dt)"
+        );
+    }
+
+    #[test]
+    fn pipe_binds_looser_than_term() {
+        assert_eq!(parse("a + b |> f"), "(call f (+ a b))");
+    }
+
+    #[test]
+    fn pipe_binds_tighter_than_and() {
+        assert_eq!(parse("x |> valid() and y"), "(and (call valid x) y)");
+    }
+
+    #[test]
+    fn pipe_binds_tighter_than_comparison() {
+        assert_eq!(parse("a |> f < b"), "(< (call f a) b)");
+    }
+
+    #[test]
+    fn rejects_a_pipe_into_a_non_callable() {
+        assert_eq!(
+            error("a |> 1"),
+            "the right side of `|>` must be a function or a call"
+        );
+    }
+
+    #[test]
+    fn reports_an_unclosed_paren() {
+        assert_eq!(
+            error("(1 + 2"),
+            "expected `)` to close the group, at end of input"
+        );
+    }
+
+    #[test]
+    fn reports_a_missing_operand() {
+        assert_eq!(error("1 +"), "unexpected end of input, at end of input");
+    }
+
+    #[test]
+    fn reports_a_token_that_cannot_start_an_expression() {
+        assert_eq!(error("let"), "`Let` is not an expression, found `let`");
+    }
+
+    #[test]
+    fn reports_trailing_input() {
+        assert_eq!(error("1 2"), "unexpected trailing input, found `2`");
+    }
+}
