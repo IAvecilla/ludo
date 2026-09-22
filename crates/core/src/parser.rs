@@ -6,11 +6,30 @@ pub struct ParseError {
     pub message: String,
 }
 
-pub fn parse_stmt(tokens: Vec<Token>) -> Result<Stmt, ParseError> {
+pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, Vec<ParseError>> {
     let mut parser = Parser::new(tokens);
-    let stmt = parser.statement()?;
-    parser.expect_end()?;
-    Ok(stmt)
+    let mut stmts = Vec::new();
+    let mut errors = Vec::new();
+
+    loop {
+        parser.skip_newlines();
+        if parser.is_at_end() {
+            break;
+        }
+        match parser.statement_line() {
+            Ok(stmt) => stmts.push(stmt),
+            Err(error) => {
+                errors.push(error);
+                parser.synchronize();
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(stmts)
+    } else {
+        Err(errors)
+    }
 }
 
 pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
@@ -28,6 +47,24 @@ struct Parser {
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, current: 0 }
+    }
+
+    fn statement_line(&mut self) -> Result<Stmt, ParseError> {
+        let stmt = self.statement()?;
+        if !self.is_at_end() && !self.matches(&[TokenKind::Newline]) {
+            return Err(self.error("expected a new line after the statement"));
+        }
+        Ok(stmt)
+    }
+
+    fn synchronize(&mut self) {
+        while !self.is_at_end() && self.peek() != &TokenKind::Newline {
+            self.advance();
+        }
+    }
+
+    fn skip_newlines(&mut self) {
+        while self.matches(&[TokenKind::Newline]) {}
     }
 
     fn statement(&mut self) -> Result<Stmt, ParseError> {
@@ -200,7 +237,7 @@ impl Parser {
                 self.expect(TokenKind::RParen, "`)` to close the group")?;
                 return Ok(inner);
             }
-            TokenKind::Eof => return Err(self.error("unexpected end of input")),
+            TokenKind::Eof | TokenKind::Newline => return Err(self.error("expected an expression")),
             other => return Err(self.error(format!("`{other:?}` is not an expression"))),
         };
         self.advance();
@@ -209,6 +246,10 @@ impl Parser {
 
     fn peek(&self) -> &TokenKind {
         &self.tokens[self.current].kind
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.peek() == &TokenKind::Eof
     }
 
     fn advance(&mut self) -> &Token {
@@ -252,15 +293,12 @@ impl Parser {
     fn error(&self, message: impl Into<String>) -> ParseError {
         let token = &self.tokens[self.current];
         let message = message.into();
-        if token.kind == TokenKind::Eof {
-            ParseError {
-                message: format!("{message}, at end of input"),
-            }
-        } else {
-            ParseError {
-                message: format!("{message}, found `{}`", token.lexeme),
-            }
-        }
+        let message = match token.kind {
+            TokenKind::Eof => format!("{message}, at end of input"),
+            TokenKind::Newline => format!("{message}, at end of line"),
+            _ => format!("{message}, found `{}`", token.lexeme),
+        };
+        ParseError { message }
     }
 }
 
@@ -415,7 +453,7 @@ mod tests {
 
     #[test]
     fn reports_a_missing_operand() {
-        assert_eq!(error("1 +"), "unexpected end of input, at end of input");
+        assert_eq!(error("1 +"), "expected an expression, at end of input");
     }
 
     #[test]
@@ -428,16 +466,34 @@ mod tests {
         assert_eq!(error("1 2"), "unexpected trailing input, found `2`");
     }
 
-    fn stmt(source: &str) -> String {
+    fn program(source: &str) -> Vec<String> {
         let tokens = scan_tokens(source).expect("source should scan cleanly");
-        parse_stmt(tokens)
-            .unwrap_or_else(|e| panic!("source should parse cleanly: {}", e.message))
-            .to_string()
+        super::parse(tokens)
+            .unwrap_or_else(|e| panic!("source should parse cleanly: {}", e[0].message))
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn stmt(source: &str) -> String {
+        let mut stmts = program(source);
+        assert_eq!(stmts.len(), 1, "expected a single statement");
+        stmts.remove(0)
+    }
+
+    fn program_errors(source: &str) -> Vec<String> {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        super::parse(tokens)
+            .unwrap_err()
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
     }
 
     fn stmt_error(source: &str) -> String {
-        let tokens = scan_tokens(source).expect("source should scan cleanly");
-        parse_stmt(tokens).unwrap_err().message
+        let mut errors = program_errors(source);
+        assert_eq!(errors.len(), 1, "expected a single error");
+        errors.remove(0)
     }
 
     #[test]
@@ -478,7 +534,54 @@ mod tests {
     fn let_rejects_trailing_input() {
         assert_eq!(
             stmt_error("let x = 1 2"),
-            "unexpected trailing input, found `2`"
+            "expected a new line after the statement, found `2`"
+        );
+    }
+
+    #[test]
+    fn parses_one_statement_per_line() {
+        assert_eq!(
+            program("let x = 1\nlet y = x + 1\ny"),
+            vec!["(let x 1)", "(let y (+ x 1))", "y"]
+        );
+    }
+
+    #[test]
+    fn blank_lines_are_skipped() {
+        assert_eq!(program("\n\nlet x = 1\n\n\nx\n"), vec!["(let x 1)", "x"]);
+        assert_eq!(program(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_call_can_span_lines() {
+        assert_eq!(program("f(\n  1,\n  2\n)"), vec!["(call f 1 2)"]);
+    }
+
+    #[test]
+    fn a_pipe_chain_can_span_lines() {
+        assert_eq!(
+            program("let p = q\n  |> handle(input)\n  |> physics(dt)"),
+            vec!["(let p (call physics (call handle q input) dt))"]
+        );
+    }
+
+    #[test]
+    fn an_expression_cannot_continue_on_the_next_line_without_a_pipe() {
+        assert_eq!(
+            stmt_error("let x = 1 +\n2"),
+            "expected an expression, at end of line"
+        );
+    }
+
+    #[test]
+    fn recovers_and_reports_every_bad_line() {
+        assert_eq!(
+            program_errors("let 1 = 2\nlet ok = 1\nlet x\n1 +"),
+            vec![
+                "expected a name after `let`, found `1`",
+                "expected `=` after the name, at end of line",
+                "expected an expression, at end of input",
+            ]
         );
     }
 }
