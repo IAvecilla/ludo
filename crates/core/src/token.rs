@@ -59,6 +59,7 @@ pub enum TokenKind {
     Colon,
     Dot,
 
+    Newline,
     Eof,
 }
 

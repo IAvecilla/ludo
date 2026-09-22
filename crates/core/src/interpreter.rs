@@ -161,7 +161,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{parse_expr, parse_stmt};
+    use crate::parser::{parse, parse_expr};
     use crate::scanner::scan_tokens;
 
     fn run(source: &str) -> Result<Value, RuntimeError> {
@@ -312,9 +312,9 @@ mod tests {
             .iter()
             .map(|line| {
                 let tokens = scan_tokens(line).expect("source should scan cleanly");
-                let stmt = parse_stmt(tokens).expect("source should parse cleanly");
+                let stmts = parse(tokens).expect("source should parse cleanly");
                 interpreter
-                    .execute(&stmt)
+                    .execute(&stmts[0])
                     .map(|value| value.map(|v| v.to_string()))
                     .map_err(|e| e.message)
             })

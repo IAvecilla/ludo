@@ -2,14 +2,13 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use ludo_core::interpreter::Interpreter;
-use ludo_core::parser::parse_stmt;
+use ludo_core::parser::parse;
 use ludo_core::scanner::scan_tokens;
 
 const EX_USAGE: u8 = 64;
 const EX_DATAERR: u8 = 65;
 const EX_SOFTWARE: u8 = 70;
 
-#[derive(Clone, Copy, PartialEq)]
 enum Failure {
     Static,
     Runtime,
@@ -40,25 +39,10 @@ fn run_file(path: &str) -> ExitCode {
         }
     };
 
-    let mut interpreter = Interpreter::new();
-    let mut worst = None;
-    for line in source.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        println!("> {line}");
-        if let Err(failure) = run(line, &mut interpreter) {
-            if worst != Some(Failure::Static) {
-                worst = Some(failure);
-            }
-        }
-    }
-
-    match worst {
-        None => ExitCode::SUCCESS,
-        Some(Failure::Static) => ExitCode::from(EX_DATAERR),
-        Some(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
+    match run(&source, &mut Interpreter::new()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure::Static) => ExitCode::from(EX_DATAERR),
+        Err(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
     }
 }
 
@@ -80,10 +64,7 @@ fn run_repl() {
             }
         }
 
-        let line = line.trim();
-        if !line.is_empty() {
-            let _ = run(line, &mut interpreter);
-        }
+        let _ = run(&line, &mut interpreter);
     }
 }
 
@@ -98,23 +79,25 @@ fn run(source: &str, interpreter: &mut Interpreter) -> Result<(), Failure> {
         }
     };
 
-    let stmt = match parse_stmt(tokens) {
-        Ok(stmt) => stmt,
-        Err(error) => {
-            eprintln!("Parsing Error: {}", error.message);
+    let stmts = match parse(tokens) {
+        Ok(stmts) => stmts,
+        Err(errors) => {
+            for error in &errors {
+                eprintln!("Parsing Error: {}", error.message);
+            }
             return Err(Failure::Static);
         }
     };
 
-    match interpreter.execute(&stmt) {
-        Ok(Some(value)) => {
-            println!("{value}");
-            Ok(())
-        }
-        Ok(None) => Ok(()),
-        Err(error) => {
-            eprintln!("Runtime Error: {}", error.message);
-            Err(Failure::Runtime)
+    for stmt in &stmts {
+        match interpreter.execute(stmt) {
+            Ok(Some(value)) => println!("{value}"),
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("Runtime Error: {}", error.message);
+                return Err(Failure::Runtime);
+            }
         }
     }
+    Ok(())
 }

@@ -15,6 +15,7 @@ struct Scanner {
     chars: Vec<char>,
     start: usize,
     current: usize,
+    depth: usize,
     tokens: Vec<Token>,
     errors: Vec<ScanError>,
 }
@@ -25,6 +26,7 @@ impl Scanner {
             chars: source.chars().collect(),
             start: 0,
             current: 0,
+            depth: 0,
             tokens: Vec::new(),
             errors: Vec::new(),
         }
@@ -49,12 +51,13 @@ impl Scanner {
     fn scan_token(&mut self) {
         let c = self.advance();
         match c {
-            ' ' | '\r' | '\t' | '\n' => {}
+            ' ' | '\r' | '\t' => {}
+            '\n' => self.newline(),
 
-            '(' => self.add_token(TokenKind::LParen),
-            ')' => self.add_token(TokenKind::RParen),
-            '[' => self.add_token(TokenKind::LBracket),
-            ']' => self.add_token(TokenKind::RBracket),
+            '(' => self.open(TokenKind::LParen),
+            ')' => self.close(TokenKind::RParen),
+            '[' => self.open(TokenKind::LBracket),
+            ']' => self.close(TokenKind::RBracket),
             '{' => self.add_token(TokenKind::LBrace),
             '}' => self.add_token(TokenKind::RBrace),
             ',' => self.add_token(TokenKind::Comma),
@@ -114,7 +117,7 @@ impl Scanner {
 
             '/' => {
                 if self.matches('/') {
-                    while !self.is_at_end() {
+                    while !self.is_at_end() && self.peek() != '\n' {
                         self.advance();
                     }
                 } else {
@@ -139,12 +142,40 @@ impl Scanner {
         }
     }
 
+    fn newline(&mut self) {
+        if self.depth > 0 || self.next_line_continues() {
+            return;
+        }
+        self.add_token(TokenKind::Newline);
+    }
+
+    fn next_line_continues(&self) -> bool {
+        let mut i = self.current;
+        while matches!(self.chars.get(i), Some(' ' | '\t' | '\r' | '\n')) {
+            i += 1;
+        }
+        matches!(
+            (self.chars.get(i), self.chars.get(i + 1)),
+            (Some('.'), _) | (Some('|'), Some('>'))
+        )
+    }
+
+    fn open(&mut self, kind: TokenKind) {
+        self.depth += 1;
+        self.add_token(kind);
+    }
+
+    fn close(&mut self, kind: TokenKind) {
+        self.depth = self.depth.saturating_sub(1);
+        self.add_token(kind);
+    }
+
     fn string(&mut self) {
-        while !self.is_at_end() && self.peek() != '"' {
+        while !self.is_at_end() && self.peek() != '"' && self.peek() != '\n' {
             self.advance();
         }
 
-        if self.is_at_end() {
+        if self.is_at_end() || self.peek() == '\n' {
             self.error(format!("unterminated string: `{}`", self.lexeme()));
             return;
         }
@@ -463,8 +494,102 @@ mod tests {
     }
 
     #[test]
-    fn a_comment_runs_to_the_end_of_the_input() {
+    fn a_comment_runs_to_the_end_of_the_line() {
         assert_eq!(kinds("1 // 2 + 3"), vec![TokenKind::Int(1)]);
+        assert_eq!(
+            kinds("1 // 2\n3"),
+            vec![TokenKind::Int(1), TokenKind::Newline, TokenKind::Int(3)]
+        );
+    }
+
+    #[test]
+    fn a_newline_ends_a_statement() {
+        assert_eq!(
+            kinds("let x = 1\nx"),
+            vec![
+                TokenKind::Let,
+                ident("x"),
+                TokenKind::Eq,
+                TokenKind::Int(1),
+                TokenKind::Newline,
+                ident("x"),
+            ]
+        );
+    }
+
+    #[test]
+    fn newlines_inside_parens_and_brackets_are_ignored() {
+        assert_eq!(
+            kinds("f(\n1,\n2\n)"),
+            vec![
+                ident("f"),
+                TokenKind::LParen,
+                TokenKind::Int(1),
+                TokenKind::Comma,
+                TokenKind::Int(2),
+                TokenKind::RParen,
+            ]
+        );
+        assert_eq!(
+            kinds("[1,\n2]"),
+            vec![
+                TokenKind::LBracket,
+                TokenKind::Int(1),
+                TokenKind::Comma,
+                TokenKind::Int(2),
+                TokenKind::RBracket,
+            ]
+        );
+    }
+
+    #[test]
+    fn newlines_inside_braces_are_kept() {
+        assert_eq!(
+            kinds("{\n1\n}"),
+            vec![
+                TokenKind::LBrace,
+                TokenKind::Newline,
+                TokenKind::Int(1),
+                TokenKind::Newline,
+                TokenKind::RBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_starting_with_a_pipe_continues_the_previous_one() {
+        assert_eq!(
+            kinds("p\n  |> f\n  |> g"),
+            vec![
+                ident("p"),
+                TokenKind::PipeGt,
+                ident("f"),
+                TokenKind::PipeGt,
+                ident("g"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_line_starting_with_a_dot_continues_the_previous_one() {
+        assert_eq!(
+            kinds("p\n  .f()"),
+            vec![
+                ident("p"),
+                TokenKind::Dot,
+                ident("f"),
+                TokenKind::LParen,
+                TokenKind::RParen,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bar_alone_does_not_continue_a_line() {
+        assert_eq!(
+            kinds("a\n| b"),
+            vec![ident("a"), TokenKind::Newline, TokenKind::Bar, ident("b")]
+        );
     }
 
     #[test]
@@ -477,6 +602,14 @@ mod tests {
     #[test]
     fn unterminated_string_is_an_error() {
         assert_eq!(errors(r#""oops"#), vec!["unterminated string: `\"oops`"]);
+    }
+
+    #[test]
+    fn a_string_cannot_span_lines() {
+        assert_eq!(
+            errors("\"oops\n1 # 2"),
+            vec!["unterminated string: `\"oops`", "unexpected character `#`"]
+        );
     }
 
     #[test]
