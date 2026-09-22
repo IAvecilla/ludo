@@ -1,12 +1,19 @@
-//! REPL.
-
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
+use ludo_core::interpreter::Interpreter;
 use ludo_core::parser::parse_expr;
 use ludo_core::scanner::scan_tokens;
+
 const EX_USAGE: u8 = 64;
 const EX_DATAERR: u8 = 65;
+const EX_SOFTWARE: u8 = 70;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Failure {
+    Static,
+    Runtime,
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,27 +40,31 @@ fn run_file(path: &str) -> ExitCode {
         }
     };
 
-    let mut ok = true;
+    let mut interpreter = Interpreter::new();
+    let mut worst = None;
     for line in source.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         println!("> {line}");
-        if !run(line) {
-            ok = false;
+        if let Err(failure) = run(line, &mut interpreter) {
+            if worst != Some(Failure::Static) {
+                worst = Some(failure);
+            }
         }
     }
 
-    if ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(EX_DATAERR)
+    match worst {
+        None => ExitCode::SUCCESS,
+        Some(Failure::Static) => ExitCode::from(EX_DATAERR),
+        Some(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
     }
 }
 
 fn run_repl() {
     let stdin = io::stdin();
+    let mut interpreter = Interpreter::new();
 
     loop {
         print!("> ");
@@ -71,30 +82,38 @@ fn run_repl() {
 
         let line = line.trim();
         if !line.is_empty() {
-            run(line);
+            let _ = run(line, &mut interpreter);
         }
     }
 }
 
-fn run(source: &str) -> bool {
+fn run(source: &str, interpreter: &mut Interpreter) -> Result<(), Failure> {
     let tokens = match scan_tokens(source) {
         Ok(tokens) => tokens,
         Err(errors) => {
             for error in &errors {
                 eprintln!("Scanning Error: {}", error.message);
             }
-            return false;
+            return Err(Failure::Static);
         }
     };
 
-    match parse_expr(tokens) {
-        Ok(expr) => {
-            println!("{expr}");
-            true
-        }
+    let expr = match parse_expr(tokens) {
+        Ok(expr) => expr,
         Err(error) => {
             eprintln!("Parsing Error: {}", error.message);
-            false
+            return Err(Failure::Static);
+        }
+    };
+
+    match interpreter.evaluate(&expr) {
+        Ok(value) => {
+            println!("{value}");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("Runtime Error: {}", error.message);
+            Err(Failure::Runtime)
         }
     }
 }
