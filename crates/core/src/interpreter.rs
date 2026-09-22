@@ -1,4 +1,6 @@
-use crate::ast::{BinaryOp, Expr, UnaryOp};
+use std::collections::HashMap;
+
+use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7,11 +9,24 @@ pub struct RuntimeError {
 }
 
 #[derive(Default)]
-pub struct Interpreter;
+pub struct Interpreter {
+    globals: HashMap<String, Value>,
+}
 
 impl Interpreter {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
+        match stmt {
+            Stmt::Let(name, value) => {
+                let value = self.evaluate(value)?;
+                self.globals.insert(name.clone(), value);
+                Ok(None)
+            }
+            Stmt::Expr(expr) => self.evaluate(expr).map(Some),
+        }
     }
 
     pub fn evaluate(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
@@ -21,7 +36,11 @@ impl Interpreter {
             Expr::Bool(v) => Ok(Value::Bool(*v)),
             Expr::Str(v) => Ok(Value::Str(v.clone())),
             Expr::Symbol(v) => Ok(Value::Symbol(v.clone())),
-            Expr::Ident(name) => Err(error(format!("undefined variable `{name}`"))),
+            Expr::Ident(name) => self
+                .globals
+                .get(name)
+                .cloned()
+                .ok_or_else(|| error(format!("undefined variable `{name}`"))),
             Expr::Unary(op, right) => self.unary(*op, right),
             Expr::Binary(left, BinaryOp::And, right) => self.and(left, right),
             Expr::Binary(left, BinaryOp::Or, right) => self.or(left, right),
@@ -142,7 +161,7 @@ fn error(message: impl Into<String>) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_expr;
+    use crate::parser::{parse_expr, parse_stmt};
     use crate::scanner::scan_tokens;
 
     fn run(source: &str) -> Result<Value, RuntimeError> {
@@ -283,7 +302,69 @@ mod tests {
     }
 
     #[test]
-    fn variables_do_not_exist_yet() {
+    fn an_unbound_name_is_an_error() {
         assert_eq!(error("x"), "undefined variable `x`");
+    }
+
+    fn session(lines: &[&str]) -> Vec<Result<Option<String>, String>> {
+        let mut interpreter = Interpreter::new();
+        lines
+            .iter()
+            .map(|line| {
+                let tokens = scan_tokens(line).expect("source should scan cleanly");
+                let stmt = parse_stmt(tokens).expect("source should parse cleanly");
+                interpreter
+                    .execute(&stmt)
+                    .map(|value| value.map(|v| v.to_string()))
+                    .map_err(|e| e.message)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn let_binds_a_name_for_later_lines() {
+        assert_eq!(
+            session(&["let x = 10", "let y = x * 2", "y + 1"]),
+            vec![Ok(None), Ok(None), Ok(Some("21".into()))]
+        );
+    }
+
+    #[test]
+    fn let_shadows_using_the_previous_value() {
+        assert_eq!(
+            session(&["let x = 1", "let x = x + 1", "x"]),
+            vec![Ok(None), Ok(None), Ok(Some("2".into()))]
+        );
+    }
+
+    #[test]
+    fn shadowing_can_change_the_type() {
+        assert_eq!(
+            session(&["let x = 1", "let x = :one", "x"]),
+            vec![Ok(None), Ok(None), Ok(Some(":one".into()))]
+        );
+    }
+
+    #[test]
+    fn a_failed_let_binds_nothing() {
+        assert_eq!(
+            session(&["let x = 1 / 0", "x"]),
+            vec![
+                Err("division by zero".into()),
+                Err("undefined variable `x`".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_let_keeps_the_previous_binding() {
+        assert_eq!(
+            session(&["let x = 1", "let x = 1 / 0", "x"]),
+            vec![
+                Ok(None),
+                Err("division by zero".into()),
+                Ok(Some("1".into()))
+            ]
+        );
     }
 }

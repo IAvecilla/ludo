@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use ludo_core::interpreter::Interpreter;
-use ludo_core::parser::parse_expr;
+use ludo_core::parser::parse_stmt;
 use ludo_core::scanner::scan_tokens;
 
 const EX_USAGE: u8 = 64;
@@ -98,19 +98,20 @@ fn run(source: &str, interpreter: &mut Interpreter) -> Result<(), Failure> {
         }
     };
 
-    let expr = match parse_expr(tokens) {
-        Ok(expr) => expr,
+    let stmt = match parse_stmt(tokens) {
+        Ok(stmt) => stmt,
         Err(error) => {
             eprintln!("Parsing Error: {}", error.message);
             return Err(Failure::Static);
         }
     };
 
-    match interpreter.evaluate(&expr) {
-        Ok(value) => {
+    match interpreter.execute(&stmt) {
+        Ok(Some(value)) => {
             println!("{value}");
             Ok(())
         }
+        Ok(None) => Ok(()),
         Err(error) => {
             eprintln!("Runtime Error: {}", error.message);
             Err(Failure::Runtime)

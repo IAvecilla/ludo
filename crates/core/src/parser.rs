@@ -1,9 +1,16 @@
-use crate::ast::{BinaryOp, Expr, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
 use crate::token::{Token, TokenKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
+}
+
+pub fn parse_stmt(tokens: Vec<Token>) -> Result<Stmt, ParseError> {
+    let mut parser = Parser::new(tokens);
+    let stmt = parser.statement()?;
+    parser.expect_end()?;
+    Ok(stmt)
 }
 
 pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
@@ -21,6 +28,20 @@ struct Parser {
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, current: 0 }
+    }
+
+    fn statement(&mut self) -> Result<Stmt, ParseError> {
+        if self.matches(&[TokenKind::Let]) {
+            return self.let_declaration();
+        }
+        Ok(Stmt::Expr(self.expression()?))
+    }
+
+    fn let_declaration(&mut self) -> Result<Stmt, ParseError> {
+        let name = self.expect_ident("a name after `let`")?;
+        self.expect(TokenKind::Eq, "`=` after the name")?;
+        let value = self.expression()?;
+        Ok(Stmt::Let(name, value))
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
@@ -405,5 +426,59 @@ mod tests {
     #[test]
     fn reports_trailing_input() {
         assert_eq!(error("1 2"), "unexpected trailing input, found `2`");
+    }
+
+    fn stmt(source: &str) -> String {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        parse_stmt(tokens)
+            .unwrap_or_else(|e| panic!("source should parse cleanly: {}", e.message))
+            .to_string()
+    }
+
+    fn stmt_error(source: &str) -> String {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        parse_stmt(tokens).unwrap_err().message
+    }
+
+    #[test]
+    fn parses_a_let() {
+        assert_eq!(stmt("let x = 1 + 2"), "(let x (+ 1 2))");
+    }
+
+    #[test]
+    fn an_expression_is_a_statement() {
+        assert_eq!(stmt("x |> f"), "(call f x)");
+    }
+
+    #[test]
+    fn let_needs_a_name() {
+        assert_eq!(
+            stmt_error("let 1 = 2"),
+            "expected a name after `let`, found `1`"
+        );
+        assert_eq!(
+            stmt_error("let"),
+            "expected a name after `let`, at end of input"
+        );
+    }
+
+    #[test]
+    fn let_needs_an_initializer() {
+        assert_eq!(
+            stmt_error("let x"),
+            "expected `=` after the name, at end of input"
+        );
+        assert_eq!(
+            stmt_error("let x 1"),
+            "expected `=` after the name, found `1`"
+        );
+    }
+
+    #[test]
+    fn let_rejects_trailing_input() {
+        assert_eq!(
+            stmt_error("let x = 1 2"),
+            "unexpected trailing input, found `2`"
+        );
     }
 }
