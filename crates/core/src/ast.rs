@@ -37,6 +37,21 @@ pub enum Expr {
     Field(Box<Expr>, String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Let(String, Expr),
+    Expr(Expr),
+}
+
+impl fmt::Display for Stmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stmt::Let(name, value) => write!(f, "(let {name} {value})"),
+            Stmt::Expr(expr) => write!(f, "{expr}"),
+        }
+    }
+}
+
 impl fmt::Display for UnaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
