@@ -1,12 +1,16 @@
 use std::rc::Rc;
 
-use crate::ast::{BinaryOp, Expr, FnDecl, Param, Stmt, StmtKind, TypeExpr, UnaryOp};
+use crate::ast::{
+    BinaryOp, Expr, FnDecl, Param, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, TypeExpr,
+    UnaryOp,
+};
 use crate::token::{Token, TokenKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
     pub line: usize,
+    pub at_end: bool,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, Vec<ParseError>> {
@@ -46,6 +50,8 @@ struct Parser {
     tokens: Vec<Token>,
     current: usize,
     blocks: usize,
+    struct_ok: bool,
+    state: Option<String>,
 }
 
 impl Parser {
@@ -54,6 +60,8 @@ impl Parser {
             tokens,
             current: 0,
             blocks: 0,
+            struct_ok: true,
+            state: None,
         }
     }
 
@@ -85,16 +93,44 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Stmt, ParseError> {
         let line = self.tokens[self.current].line;
-        let kind = if self.matches(&[TokenKind::Let]) {
-            self.let_declaration()?
-        } else if self.peek() == &TokenKind::Fn {
+        let declaration = match self.peek() {
+            TokenKind::Fn => Some("functions"),
+            TokenKind::Struct => Some("structs"),
+            TokenKind::Sequence => Some("sequences"),
+            _ => None,
+        };
+        if let Some(what) = declaration {
             if self.blocks > 0 {
-                return Err(self.error("functions can only be declared at the top level"));
+                return Err(self.error(format!("{what} can only be declared at the top level")));
             }
-            self.advance();
-            self.fn_declaration()?
-        } else {
-            StmtKind::Expr(self.expression()?)
+        }
+
+        let kind = match self.peek() {
+            TokenKind::Let => {
+                self.advance();
+                self.let_declaration()?
+            }
+            TokenKind::Fn => {
+                self.advance();
+                self.fn_declaration()?
+            }
+            TokenKind::Struct => {
+                self.advance();
+                self.struct_declaration()?
+            }
+            TokenKind::Sequence => {
+                self.advance();
+                self.sequence_declaration(line)?
+            }
+            _ => {
+                let expr = self.expression()?;
+                if self.peek() == &TokenKind::Eq {
+                    return Err(self.error(
+                        "there is no assignment: bind a new value with `let`, or change a field of the state of a sequence",
+                    ));
+                }
+                StmtKind::Expr(expr)
+            }
         };
         Ok(Stmt { kind, line })
     }
@@ -102,6 +138,22 @@ impl Parser {
     fn fn_declaration(&mut self) -> Result<StmtKind, ParseError> {
         let name = self.expect_ident("a function name after `fn`")?;
         self.expect(TokenKind::LParen, "`(` after the function name")?;
+        let params = self.parameters()?;
+        self.expect(TokenKind::Arrow, "`->` and a return type")?;
+        let ret = self.type_expr()?;
+        if self.peek() != &TokenKind::LBrace {
+            return Err(self.error("expected `{` to start the function body"));
+        }
+        let body = self.block()?;
+        Ok(StmtKind::Fn(Rc::new(FnDecl {
+            name,
+            params,
+            ret,
+            body,
+        })))
+    }
+
+    fn parameters(&mut self) -> Result<Vec<Param>, ParseError> {
         let mut params = Vec::new();
         if self.peek() != &TokenKind::RParen {
             loop {
@@ -115,18 +167,171 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen, "`)` to close the parameter list")?;
-        self.expect(TokenKind::Arrow, "`->` and a return type")?;
-        let ret = self.type_expr()?;
-        if self.peek() != &TokenKind::LBrace {
-            return Err(self.error("expected `{` to start the function body"));
+        Ok(params)
+    }
+
+    fn struct_declaration(&mut self) -> Result<StmtKind, ParseError> {
+        if let TokenKind::Ident(name) = self.peek() {
+            if !starts_uppercase(name) {
+                return Err(self.error("a struct name starts with an uppercase letter"));
+            }
         }
-        let body = self.block()?;
-        Ok(StmtKind::Fn(Rc::new(FnDecl {
-            name,
-            params,
-            ret,
-            body,
-        })))
+        let name = self.expect_ident("a struct name after `struct`")?;
+        self.expect(TokenKind::LBrace, "`{` after the struct name")?;
+
+        let mut fields: Vec<Param> = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.matches(&[TokenKind::RBrace]) {
+                break;
+            }
+            if let TokenKind::Ident(field) = self.peek() {
+                if fields.iter().any(|f| &f.name == field) {
+                    return Err(self.error("this field is already declared"));
+                }
+            }
+            let field = self.expect_ident("a field name")?;
+            self.expect(TokenKind::Colon, "`:` and a type after the field name")?;
+            let ty = self.type_expr()?;
+            fields.push(Param { name: field, ty });
+            self.field_separator()?;
+        }
+        Ok(StmtKind::Struct(Rc::new(StructDecl { name, fields })))
+    }
+
+    fn field_separator(&mut self) -> Result<(), ParseError> {
+        match self.peek() {
+            TokenKind::Comma | TokenKind::Newline => {
+                self.advance();
+                Ok(())
+            }
+            TokenKind::RBrace => Ok(()),
+            _ => Err(self.error("expected `,`, a new line or `}` after the field")),
+        }
+    }
+
+    fn sequence_declaration(&mut self, line: usize) -> Result<StmtKind, ParseError> {
+        let name = self.expect_ident("a sequence name after `sequence`")?;
+        self.expect(TokenKind::LParen, "`(` after the sequence name")?;
+        let params = self.parameters()?;
+        let Some(state) = params.first().map(|p| p.name.clone()) else {
+            return Err(ParseError {
+                message: format!(
+                    "`{name}` needs a parameter: the first one is the state the sequence runs over"
+                ),
+                line,
+                at_end: false,
+            });
+        };
+        if self.peek() != &TokenKind::LBrace {
+            return Err(self.error("expected `{` to start the sequence body"));
+        }
+        self.state = Some(state);
+        let body = self.steps(false);
+        self.state = None;
+        let body = body?;
+        Ok(StmtKind::Sequence(Rc::new(SeqDecl { name, params, body })))
+    }
+
+    fn steps(&mut self, in_over: bool) -> Result<Vec<Step>, ParseError> {
+        let closing = if in_over {
+            "expected `}` to close the body of `over`"
+        } else {
+            "expected `}` to close the sequence"
+        };
+        self.advance();
+        self.blocks += 1;
+        let mut steps = Vec::new();
+
+        loop {
+            self.skip_newlines();
+            if self.matches(&[TokenKind::RBrace]) {
+                break;
+            }
+            if self.is_at_end() {
+                return Err(self.error(closing));
+            }
+            steps.push(self.step(in_over)?);
+            if self.is_at_end() {
+                return Err(self.error(closing));
+            }
+            if !self.matches(&[TokenKind::Newline]) && self.peek() != &TokenKind::RBrace {
+                return Err(self.error("expected a new line or `}` after the statement"));
+            }
+        }
+
+        self.blocks -= 1;
+        Ok(steps)
+    }
+
+    fn step(&mut self, in_over: bool) -> Result<Step, ParseError> {
+        let line = self.tokens[self.current].line;
+        let kind = match self.peek() {
+            TokenKind::Wait | TokenKind::Over if in_over => {
+                return Err(self.error(
+                    "`wait` and `over` cannot go inside `over`: a sequence is a flat list of steps",
+                ));
+            }
+            TokenKind::Wait => {
+                self.advance();
+                StepKind::Over {
+                    duration: self.condition()?,
+                    var: None,
+                    body: Vec::new(),
+                }
+            }
+            TokenKind::Over => {
+                self.advance();
+                let duration = self.condition()?;
+                let var = if self.matches(&[TokenKind::As]) {
+                    if self.matches(&[TokenKind::Underscore]) {
+                        None
+                    } else {
+                        Some(self.expect_ident("a name or `_` after `as`")?)
+                    }
+                } else {
+                    None
+                };
+                if self.peek() != &TokenKind::LBrace {
+                    return Err(self.error("expected `{` to start the body of `over`"));
+                }
+                StepKind::Over {
+                    duration,
+                    var,
+                    body: self.steps(true)?,
+                }
+            }
+            TokenKind::Ident(name) if self.is_field_assignment() => {
+                let target = name.clone();
+                if self.state.as_ref() != Some(&target) {
+                    let state = self.state.clone().unwrap_or_default();
+                    return Err(self.error(format!(
+                        "only `{state}`, the state of the sequence, can have its fields changed"
+                    )));
+                }
+                self.advance();
+                self.advance();
+                let field = self.expect_ident("a field name")?;
+                self.advance();
+                StepKind::Set(target, field, self.expression()?)
+            }
+            _ => StepKind::Stmt(self.statement()?.kind),
+        };
+        Ok(Step { kind, line })
+    }
+
+    fn is_field_assignment(&self) -> bool {
+        let kind = |offset: usize| self.tokens.get(self.current + offset).map(|t| &t.kind);
+        kind(1) == Some(&TokenKind::Dot)
+            && matches!(kind(2), Some(TokenKind::Ident(_)))
+            && kind(3) == Some(&TokenKind::Eq)
+    }
+
+    fn condition(&mut self) -> Result<Expr, ParseError> {
+        let outer = std::mem::replace(&mut self.struct_ok, false);
+        let expr = self.expression();
+        self.struct_ok = outer;
+        expr
     }
 
     fn type_expr(&mut self) -> Result<TypeExpr, ParseError> {
@@ -280,6 +485,13 @@ impl Parser {
     }
 
     fn block(&mut self) -> Result<Expr, ParseError> {
+        let outer = std::mem::replace(&mut self.struct_ok, true);
+        let block = self.block_body();
+        self.struct_ok = outer;
+        block
+    }
+
+    fn block_body(&mut self) -> Result<Expr, ParseError> {
         let open_line = self.advance().line;
         self.blocks += 1;
         let mut stmts = Vec::new();
@@ -310,12 +522,53 @@ impl Parser {
             Some(stmt) => Err(ParseError {
                 message: "a block must end with an expression".to_string(),
                 line: stmt.line,
+                at_end: false,
             }),
             None => Err(ParseError {
                 message: "an empty block has no value".to_string(),
                 line: open_line,
+                at_end: false,
             }),
         }
+    }
+
+    fn if_expression(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        let cond = self.condition()?;
+        let then = self.branch("`{` after the condition of `if`")?;
+
+        if matches!(self.next_significant(), TokenKind::Else | TokenKind::Eof) {
+            self.skip_newlines();
+        }
+        if !self.matches(&[TokenKind::Else]) {
+            return Err(self.error("expected `else`: an `if` without one has no value"));
+        }
+
+        let otherwise = if self.peek() == &TokenKind::If {
+            self.if_expression()?
+        } else {
+            self.branch("`{` or `if` after `else`")?
+        };
+        Ok(Expr::If(
+            Box::new(cond),
+            Box::new(then),
+            Box::new(otherwise),
+        ))
+    }
+
+    fn branch(&mut self, what: &str) -> Result<Expr, ParseError> {
+        if self.peek() != &TokenKind::LBrace {
+            return Err(self.error(format!("expected {what}")));
+        }
+        self.block()
+    }
+
+    fn next_significant(&self) -> &TokenKind {
+        let mut i = self.current;
+        while self.tokens[i].kind == TokenKind::Newline {
+            i += 1;
+        }
+        &self.tokens[i].kind
     }
 
     fn arguments(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -333,26 +586,88 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, ParseError> {
-        let expr = match self.peek().clone() {
-            TokenKind::Int(v) => Expr::Int(v),
-            TokenKind::Float(v) => Expr::Float(v),
-            TokenKind::Str(v) => Expr::Str(v),
-            TokenKind::Symbol(v) => Expr::Symbol(v),
-            TokenKind::True => Expr::Bool(true),
-            TokenKind::False => Expr::Bool(false),
-            TokenKind::Ident(v) => Expr::Ident(v),
-            TokenKind::LParen => {
-                self.advance();
-                let inner = self.expression()?;
-                self.expect(TokenKind::RParen, "`)` to close the group")?;
-                return Ok(inner);
-            }
-            TokenKind::LBrace => return self.block(),
-            TokenKind::Eof | TokenKind::Newline => return Err(self.error("expected an expression")),
-            other => return Err(self.error(format!("`{other:?}` is not an expression"))),
-        };
+        let expr =
+            match self.peek().clone() {
+                TokenKind::Int(v) => Expr::Int(v),
+                TokenKind::Float(v) => Expr::Float(v),
+                TokenKind::Str(v) => Expr::Str(v),
+                TokenKind::Symbol(v) => Expr::Symbol(v),
+                TokenKind::True => Expr::Bool(true),
+                TokenKind::False => Expr::Bool(false),
+                TokenKind::Ident(v)
+                    if self.struct_ok && starts_uppercase(&v) && self.next_is_brace() =>
+                {
+                    return self.struct_literal(v);
+                }
+                TokenKind::Ident(v) => Expr::Ident(v),
+                TokenKind::LParen => {
+                    self.advance();
+                    let outer = std::mem::replace(&mut self.struct_ok, true);
+                    let inner = self.expression();
+                    self.struct_ok = outer;
+                    let inner = inner?;
+                    self.expect(TokenKind::RParen, "`)` to close the group")?;
+                    return Ok(inner);
+                }
+                TokenKind::LBrace => return self.block(),
+                TokenKind::If => return self.if_expression(),
+                TokenKind::Return => return Err(self.error(
+                    "ludo has no `return`: a function's value is the last expression of its body",
+                )),
+                TokenKind::Wait | TokenKind::Over => {
+                    return Err(
+                        self.error("`wait` and `over` only go directly in the body of a sequence")
+                    )
+                }
+                _ => return Err(self.error("expected an expression")),
+            };
         self.advance();
         Ok(expr)
+    }
+
+    fn next_is_brace(&self) -> bool {
+        self.tokens.get(self.current + 1).map(|t| &t.kind) == Some(&TokenKind::LBrace)
+    }
+
+    fn struct_literal(&mut self, name: String) -> Result<Expr, ParseError> {
+        self.advance();
+        self.advance();
+        let outer = std::mem::replace(&mut self.struct_ok, true);
+        let literal = self.struct_fields(name);
+        self.struct_ok = outer;
+        literal
+    }
+
+    fn struct_fields(&mut self, name: String) -> Result<Expr, ParseError> {
+        self.skip_newlines();
+        let starts_with_field = matches!(self.peek(), TokenKind::Ident(_))
+            && self.tokens.get(self.current + 1).map(|t| &t.kind) == Some(&TokenKind::Colon);
+        let base = if starts_with_field || self.peek() == &TokenKind::RBrace {
+            None
+        } else {
+            let base = self.expression()?;
+            self.skip_newlines();
+            self.expect(TokenKind::Bar, "`|` after the struct being updated")?;
+            Some(Box::new(base))
+        };
+
+        let mut fields: Vec<(String, Expr)> = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.matches(&[TokenKind::RBrace]) {
+                break;
+            }
+            if let TokenKind::Ident(field) = self.peek() {
+                if fields.iter().any(|(f, _)| f == field) {
+                    return Err(self.error("this field is already given"));
+                }
+            }
+            let field = self.expect_ident("a field name")?;
+            self.expect(TokenKind::Colon, "`:` after the field name")?;
+            fields.push((field, self.expression()?));
+            self.field_separator()?;
+        }
+        Ok(Expr::Struct { name, base, fields })
     }
 
     fn peek(&self) -> &TokenKind {
@@ -412,8 +727,13 @@ impl Parser {
         ParseError {
             message,
             line: token.line,
+            at_end: token.kind == TokenKind::Eof,
         }
     }
+}
+
+fn starts_uppercase(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
 fn pipe_into(left: Expr, right: Expr, line: usize) -> Result<Expr, ParseError> {
@@ -429,6 +749,7 @@ fn pipe_into(left: Expr, right: Expr, line: usize) -> Result<Expr, ParseError> {
         _ => Err(ParseError {
             message: "the right side of `|>` must be a function or a call".to_string(),
             line,
+            at_end: false,
         }),
     }
 }
@@ -573,7 +894,7 @@ mod tests {
 
     #[test]
     fn reports_a_token_that_cannot_start_an_expression() {
-        assert_eq!(error("let"), "`Let` is not an expression, found `let`");
+        assert_eq!(error("let"), "expected an expression, found `let`");
     }
 
     #[test]
@@ -846,5 +1167,245 @@ mod tests {
             stmt_error("{\n  fn f() -> Int { 1 }\n  1\n}"),
             "functions can only be declared at the top level, found `fn`"
         );
+    }
+
+    #[test]
+    fn parses_an_if() {
+        assert_eq!(stmt("if a { 1 } else { 2 }"), "(if a (block 1) (block 2))");
+    }
+
+    #[test]
+    fn an_if_is_an_expression() {
+        assert_eq!(
+            stmt("let s = if fast { 200.0 } else { 120.0 }"),
+            "(let s (if fast (block 200.0) (block 120.0)))"
+        );
+    }
+
+    #[test]
+    fn else_if_chains() {
+        assert_eq!(
+            stmt("if a { 1 } else if b { 2 } else { 3 }"),
+            "(if a (block 1) (if b (block 2) (block 3)))"
+        );
+    }
+
+    #[test]
+    fn an_if_can_span_lines() {
+        assert_eq!(
+            stmt("if a {\n  1\n} else {\n  2\n}"),
+            "(if a (block 1) (block 2))"
+        );
+    }
+
+    #[test]
+    fn else_may_start_the_next_line() {
+        assert_eq!(
+            stmt("if a {\n  1\n}\nelse {\n  2\n}"),
+            "(if a (block 1) (block 2))"
+        );
+    }
+
+    #[test]
+    fn an_if_needs_an_else() {
+        assert_eq!(
+            stmt_error("if a { 1 }"),
+            "expected `else`: an `if` without one has no value, at end of input"
+        );
+        assert_eq!(
+            stmt_error("if a { 1 }\nlet x = 1"),
+            "expected `else`: an `if` without one has no value, at end of line"
+        );
+    }
+
+    #[test]
+    fn if_branches_are_blocks() {
+        assert_eq!(
+            stmt_error("if a 1 else 2"),
+            "expected `{` after the condition of `if`, found `1`"
+        );
+        assert_eq!(
+            stmt_error("if a { 1 } else 2"),
+            "expected `{` or `if` after `else`, found `2`"
+        );
+    }
+
+    #[test]
+    fn return_is_reserved_but_not_part_of_the_language() {
+        assert_eq!(
+            program_errors("fn f(x: Int) -> Int {\n  return x\n}"),
+            vec!["ludo has no `return`: a function's value is the last expression of its body, found `return`"]
+        );
+    }
+
+    #[test]
+    fn errors_know_whether_the_input_ended_too_soon() {
+        let at_end = |source: &str| {
+            super::parse(scan_tokens(source).unwrap())
+                .unwrap_err()
+                .last()
+                .unwrap()
+                .at_end
+        };
+        assert!(at_end("fn f() -> Int {\n"));
+        assert!(!at_end("let x =\n"));
+        assert!(at_end("if a { 1 }\n"));
+        assert!(at_end("(1 +\n"));
+        assert!(!at_end("1 + )\n"));
+        assert!(!at_end("{ let x = 1 }\n"));
+        assert!(!at_end("fn f() -> Int { 1 }\nfn g( -> Int { 2 }\n"));
+    }
+
+    #[test]
+    fn parses_a_struct_declaration() {
+        assert_eq!(
+            stmt("struct Ball { x: Float, y: Float }"),
+            "(struct Ball (x: Float, y: Float))"
+        );
+        assert_eq!(
+            stmt("struct Ball {\n  x: Float\n  y: Float,\n}"),
+            "(struct Ball (x: Float, y: Float))"
+        );
+        assert_eq!(stmt("struct Empty {}"), "(struct Empty ())");
+    }
+
+    #[test]
+    fn struct_declaration_errors() {
+        assert_eq!(
+            stmt_error("struct ball { x: Float }"),
+            "a struct name starts with an uppercase letter, found `ball`"
+        );
+        assert_eq!(
+            stmt_error("struct Ball { x: Float, x: Int }"),
+            "this field is already declared, found `x`"
+        );
+        assert_eq!(
+            stmt_error("struct Ball { x }"),
+            "expected `:` and a type after the field name, found `}`"
+        );
+        assert_eq!(
+            stmt_error("fn f() -> Int {\n  struct A {}\n  1\n}"),
+            "structs can only be declared at the top level, found `struct`"
+        );
+    }
+
+    #[test]
+    fn parses_a_struct_literal() {
+        assert_eq!(parse("Ball { x: 1.0, y: 2.0 }"), "(Ball x: 1.0 y: 2.0)");
+        assert_eq!(parse("Empty {}"), "(Empty)");
+        assert_eq!(
+            stmt("let b = Ball {\n  x: 1.0,\n  y: 2.0\n}"),
+            "(let b (Ball x: 1.0 y: 2.0))"
+        );
+    }
+
+    #[test]
+    fn parses_a_struct_update() {
+        assert_eq!(parse("Ball { b | x: 3.0 }"), "(Ball b | x: 3.0)");
+        assert_eq!(
+            parse("Ball { move(b) | x: b.x + 1.0 }"),
+            "(Ball (call move b) | x: (+ (. b x) 1.0))"
+        );
+    }
+
+    #[test]
+    fn struct_literal_errors() {
+        assert_eq!(
+            error("Ball { x: 1.0, x: 2.0 }"),
+            "this field is already given, found `x`"
+        );
+        assert_eq!(
+            error("Ball { b x: 1.0 }"),
+            "expected `|` after the struct being updated, found `x`"
+        );
+    }
+
+    #[test]
+    fn a_lowercase_name_before_a_brace_is_not_a_struct() {
+        assert_eq!(
+            stmt("if ready { 1 } else { 2 }"),
+            "(if ready (block 1) (block 2))"
+        );
+    }
+
+    #[test]
+    fn the_condition_of_an_if_is_not_a_struct_literal() {
+        assert_eq!(
+            stmt("if x > MAX { 1 } else { 2 }"),
+            "(if (> x MAX) (block 1) (block 2))"
+        );
+        assert_eq!(
+            stmt("if (Ball { x: 1.0 }) == b { 1 } else { 2 }"),
+            "(if (== (Ball x: 1.0) b) (block 1) (block 2))"
+        );
+        assert_eq!(
+            stmt("if ok { Ball { x: 1.0 } } else { b }"),
+            "(if ok (block (Ball x: 1.0)) (block b))"
+        );
+    }
+
+    #[test]
+    fn parses_a_sequence() {
+        assert_eq!(
+            stmt("sequence serve(b: Ball, speed: Float) {\n  wait 1.0s\n  b.vx = speed\n}"),
+            "(sequence serve (b: Ball, speed: Float) (over 1.0 _) (set b.vx speed))"
+        );
+    }
+
+    #[test]
+    fn parses_over() {
+        assert_eq!(
+            stmt("sequence slide(b: Ball) {\n  let from = b.x\n  over 0.5s as t {\n    b.x = from + t\n  }\n}"),
+            "(sequence slide (b: Ball) (let from (. b x)) (over 0.5 t (set b.x (+ from t))))"
+        );
+        assert_eq!(
+            stmt("sequence s(b: Ball) {\n  over 0.5s as _ {}\n  over d {}\n}"),
+            "(sequence s (b: Ball) (over 0.5 _) (over d _))"
+        );
+    }
+
+    #[test]
+    fn a_sequence_runs_over_its_first_parameter() {
+        assert_eq!(
+            stmt_error("sequence serve() {}"),
+            "`serve` needs a parameter: the first one is the state the sequence runs over"
+        );
+        assert_eq!(
+            stmt_error("sequence serve(b: Ball, other: Ball) {\n  other.x = 1.0\n}"),
+            "only `b`, the state of the sequence, can have its fields changed, found `other`"
+        );
+    }
+
+    #[test]
+    fn a_sequence_is_flat() {
+        assert_eq!(
+            stmt_error("sequence s(b: Ball) {\n  over 1.0s {\n    wait 1.0s\n  }\n}"),
+            "`wait` and `over` cannot go inside `over`: a sequence is a flat list of steps, found `wait`"
+        );
+        assert_eq!(
+            stmt_error("sequence s(b: Ball) {\n  if ok { wait 1.0s } else { 1 }\n}"),
+            "`wait` and `over` only go directly in the body of a sequence, found `wait`"
+        );
+        assert_eq!(
+            stmt_error("fn f() -> Int {\n  wait 1.0s\n  1\n}"),
+            "`wait` and `over` only go directly in the body of a sequence, found `wait`"
+        );
+    }
+
+    #[test]
+    fn there_is_no_assignment() {
+        assert_eq!(
+            stmt_error("x = 1"),
+            "there is no assignment: bind a new value with `let`, or change a field of the state of a sequence, found `=`"
+        );
+        assert_eq!(
+            stmt_error("b.x = 1"),
+            "there is no assignment: bind a new value with `let`, or change a field of the state of a sequence, found `=`"
+        );
+    }
+
+    #[test]
+    fn a_non_expression_token_is_reported_by_its_text() {
+        assert_eq!(error("1 + )"), "expected an expression, found `)`");
     }
 }
