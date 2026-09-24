@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
     pub message: String,
+    pub line: Option<usize>,
 }
 
 #[derive(Default)]
@@ -19,13 +20,20 @@ impl Interpreter {
     }
 
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
-        match stmt {
-            Stmt::Let(name, value) => {
+        self.execute_kind(&stmt.kind).map_err(|mut error| {
+            error.line.get_or_insert(stmt.line);
+            error
+        })
+    }
+
+    fn execute_kind(&mut self, kind: &StmtKind) -> Result<Option<Value>, RuntimeError> {
+        match kind {
+            StmtKind::Let(name, value) => {
                 let value = self.evaluate(value)?;
                 self.globals.insert(name.clone(), value);
                 Ok(None)
             }
-            Stmt::Expr(expr) => self.evaluate(expr).map(Some),
+            StmtKind::Expr(expr) => self.evaluate(expr).map(Some),
         }
     }
 
@@ -155,6 +163,7 @@ fn mismatch(op: BinaryOp, a: &Value, b: &Value) -> RuntimeError {
 fn error(message: impl Into<String>) -> RuntimeError {
     RuntimeError {
         message: message.into(),
+        line: None,
     }
 }
 
@@ -366,5 +375,15 @@ mod tests {
                 Ok(Some("1".into()))
             ]
         );
+    }
+
+    #[test]
+    fn a_runtime_error_records_the_line_of_its_statement() {
+        let tokens = scan_tokens("let x = 1\n\nlet y = x / 0").unwrap();
+        let stmts = parse(tokens).unwrap();
+        let mut interpreter = Interpreter::new();
+        interpreter.execute(&stmts[0]).unwrap();
+        let error = interpreter.execute(&stmts[1]).unwrap_err();
+        assert_eq!(error.line, Some(3));
     }
 }

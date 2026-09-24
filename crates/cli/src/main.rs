@@ -39,7 +39,7 @@ fn run_file(path: &str) -> ExitCode {
         }
     };
 
-    match run(&source, &mut Interpreter::new()) {
+    match run(&source, &mut Interpreter::new(), true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Static) => ExitCode::from(EX_DATAERR),
         Err(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
@@ -64,16 +64,24 @@ fn run_repl() {
             }
         }
 
-        let _ = run(&line, &mut interpreter);
+        let _ = run(&line, &mut interpreter, false);
     }
 }
 
-fn run(source: &str, interpreter: &mut Interpreter) -> Result<(), Failure> {
+fn run(source: &str, interpreter: &mut Interpreter, show_lines: bool) -> Result<(), Failure> {
+    let at = |line: usize| {
+        if show_lines {
+            format!("[line {line}] ")
+        } else {
+            String::new()
+        }
+    };
+
     let tokens = match scan_tokens(source) {
         Ok(tokens) => tokens,
         Err(errors) => {
             for error in &errors {
-                eprintln!("Scanning Error: {}", error.message);
+                eprintln!("{}Scanning Error: {}", at(error.line), error.message);
             }
             return Err(Failure::Static);
         }
@@ -83,7 +91,7 @@ fn run(source: &str, interpreter: &mut Interpreter) -> Result<(), Failure> {
         Ok(stmts) => stmts,
         Err(errors) => {
             for error in &errors {
-                eprintln!("Parsing Error: {}", error.message);
+                eprintln!("{}Parsing Error: {}", at(error.line), error.message);
             }
             return Err(Failure::Static);
         }
@@ -94,7 +102,8 @@ fn run(source: &str, interpreter: &mut Interpreter) -> Result<(), Failure> {
             Ok(Some(value)) => println!("{value}"),
             Ok(None) => {}
             Err(error) => {
-                eprintln!("Runtime Error: {}", error.message);
+                let line = error.line.map(at).unwrap_or_default();
+                eprintln!("{line}Runtime Error: {}", error.message);
                 return Err(Failure::Runtime);
             }
         }

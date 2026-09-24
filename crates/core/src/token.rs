@@ -67,13 +67,15 @@ pub enum TokenKind {
 pub struct Token {
     pub kind: TokenKind,
     pub lexeme: String,
+    pub line: usize,
 }
 
 impl Token {
-    pub fn new(kind: TokenKind, lexeme: impl Into<String>) -> Self {
+    pub fn new(kind: TokenKind, lexeme: impl Into<String>, line: usize) -> Self {
         Self {
             kind,
             lexeme: lexeme.into(),
+            line,
         }
     }
 }

@@ -38,16 +38,22 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Stmt {
+pub enum StmtKind {
     Let(String, Expr),
     Expr(Expr),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub line: usize,
+}
+
 impl fmt::Display for Stmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Stmt::Let(name, value) => write!(f, "(let {name} {value})"),
-            Stmt::Expr(expr) => write!(f, "{expr}"),
+        match &self.kind {
+            StmtKind::Let(name, value) => write!(f, "(let {name} {value})"),
+            StmtKind::Expr(expr) => write!(f, "{expr}"),
         }
     }
 }
