@@ -36,7 +36,20 @@ Expressions, from loosest to tightest. Every binary level is left-associative.
 | unary | `-` `not` |
 | postfix | `f(x)` `a.b` `a.b(x)` |
 
+A statement ends at the end of its line. A newline is ignored inside `( )` and
+`[ ]`, and a line that starts with `|>` or `.` continues the previous one:
+
 ```
+let p = player
+  |> handle(input)
+  |> physics(dt)
+```
+
+```
+program        → ( statement? NEWLINE )* EOF ;
+statement      → letDecl | expression ;
+letDecl        → "let" IDENT "=" expression ;
+
 expression     → or ;
 or             → and ( "or" and )* ;
 and            → equality ( "and" equality )* ;

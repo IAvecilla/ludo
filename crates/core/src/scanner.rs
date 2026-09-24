@@ -5,6 +5,7 @@ const DURATION_SUFFIX: &str = "s";
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanError {
     pub message: String,
+    pub line: usize,
 }
 
 pub fn scan_tokens(source: &str) -> Result<Vec<Token>, Vec<ScanError>> {
@@ -15,6 +16,7 @@ struct Scanner {
     chars: Vec<char>,
     start: usize,
     current: usize,
+    line: usize,
     depth: usize,
     tokens: Vec<Token>,
     errors: Vec<ScanError>,
@@ -26,6 +28,7 @@ impl Scanner {
             chars: source.chars().collect(),
             start: 0,
             current: 0,
+            line: 1,
             depth: 0,
             tokens: Vec::new(),
             errors: Vec::new(),
@@ -143,10 +146,10 @@ impl Scanner {
     }
 
     fn newline(&mut self) {
-        if self.depth > 0 || self.next_line_continues() {
-            return;
+        if self.depth == 0 && !self.next_line_continues() {
+            self.add_token(TokenKind::Newline);
         }
-        self.add_token(TokenKind::Newline);
+        self.line += 1;
     }
 
     fn next_line_continues(&self) -> bool {
@@ -311,11 +314,14 @@ impl Scanner {
 
     fn add_token(&mut self, kind: TokenKind) {
         let lexeme = self.lexeme();
-        self.tokens.push(Token::new(kind, lexeme));
+        self.tokens.push(Token::new(kind, lexeme, self.line));
     }
 
     fn error(&mut self, message: String) {
-        self.errors.push(ScanError { message });
+        self.errors.push(ScanError {
+            message,
+            line: self.line,
+        });
     }
 }
 
@@ -610,6 +616,35 @@ mod tests {
             errors("\"oops\n1 # 2"),
             vec!["unterminated string: `\"oops`", "unexpected character `#`"]
         );
+    }
+
+    fn lines(source: &str) -> Vec<usize> {
+        scan_tokens(source)
+            .expect("source should scan cleanly")
+            .into_iter()
+            .map(|t| t.line)
+            .collect()
+    }
+
+    #[test]
+    fn tokens_record_their_line() {
+        assert_eq!(lines("let x\n\nx"), vec![1, 1, 1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn a_suppressed_newline_still_counts_as_a_line() {
+        assert_eq!(lines("f(\n1\n)"), vec![1, 1, 2, 3, 3]);
+        assert_eq!(lines("p\n|> f"), vec![1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn errors_record_their_line() {
+        let lines: Vec<usize> = scan_tokens("1\n# 2\n$")
+            .unwrap_err()
+            .into_iter()
+            .map(|e| e.line)
+            .collect();
+        assert_eq!(lines, vec![2, 3]);
     }
 
     #[test]

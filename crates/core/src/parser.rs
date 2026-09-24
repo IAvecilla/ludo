@@ -1,9 +1,10 @@
-use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
 use crate::token::{Token, TokenKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
+    pub line: usize,
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, Vec<ParseError>> {
@@ -68,17 +69,20 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, ParseError> {
-        if self.matches(&[TokenKind::Let]) {
-            return self.let_declaration();
-        }
-        Ok(Stmt::Expr(self.expression()?))
+        let line = self.tokens[self.current].line;
+        let kind = if self.matches(&[TokenKind::Let]) {
+            self.let_declaration()?
+        } else {
+            StmtKind::Expr(self.expression()?)
+        };
+        Ok(Stmt { kind, line })
     }
 
-    fn let_declaration(&mut self) -> Result<Stmt, ParseError> {
+    fn let_declaration(&mut self) -> Result<StmtKind, ParseError> {
         let name = self.expect_ident("a name after `let`")?;
         self.expect(TokenKind::Eq, "`=` after the name")?;
         let value = self.expression()?;
-        Ok(Stmt::Let(name, value))
+        Ok(StmtKind::Let(name, value))
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
@@ -138,8 +142,9 @@ impl Parser {
     fn pipe(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.term()?;
         while self.matches(&[TokenKind::PipeGt]) {
+            let line = self.tokens[self.current - 1].line;
             let right = self.term()?;
-            left = pipe_into(left, right)?;
+            left = pipe_into(left, right, line)?;
         }
         Ok(left)
     }
@@ -298,11 +303,14 @@ impl Parser {
             TokenKind::Newline => format!("{message}, at end of line"),
             _ => format!("{message}, found `{}`", token.lexeme),
         };
-        ParseError { message }
+        ParseError {
+            message,
+            line: token.line,
+        }
     }
 }
 
-fn pipe_into(left: Expr, right: Expr) -> Result<Expr, ParseError> {
+fn pipe_into(left: Expr, right: Expr, line: usize) -> Result<Expr, ParseError> {
     match right {
         Expr::Call(callee, args) => {
             let mut piped = vec![left];
@@ -314,6 +322,7 @@ fn pipe_into(left: Expr, right: Expr) -> Result<Expr, ParseError> {
         }
         _ => Err(ParseError {
             message: "the right side of `|>` must be a function or a call".to_string(),
+            line,
         }),
     }
 }
@@ -583,5 +592,27 @@ mod tests {
                 "expected an expression, at end of input",
             ]
         );
+    }
+
+    #[test]
+    fn statements_record_their_line() {
+        let tokens = scan_tokens("let x = 1\n\nx").unwrap();
+        let lines: Vec<usize> = super::parse(tokens)
+            .unwrap()
+            .iter()
+            .map(|s| s.line)
+            .collect();
+        assert_eq!(lines, vec![1, 3]);
+    }
+
+    #[test]
+    fn errors_record_their_line() {
+        let tokens = scan_tokens("let ok = 1\nlet 1 = 2\n\nlet x").unwrap();
+        let lines: Vec<usize> = super::parse(tokens)
+            .unwrap_err()
+            .iter()
+            .map(|e| e.line)
+            .collect();
+        assert_eq!(lines, vec![2, 4]);
     }
 }
