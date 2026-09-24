@@ -1,4 +1,6 @@
-use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
+use std::rc::Rc;
+
+use crate::ast::{BinaryOp, Expr, FnDecl, Param, Stmt, StmtKind, TypeExpr, UnaryOp};
 use crate::token::{Token, TokenKind};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,10 +87,61 @@ impl Parser {
         let line = self.tokens[self.current].line;
         let kind = if self.matches(&[TokenKind::Let]) {
             self.let_declaration()?
+        } else if self.peek() == &TokenKind::Fn {
+            if self.blocks > 0 {
+                return Err(self.error("functions can only be declared at the top level"));
+            }
+            self.advance();
+            self.fn_declaration()?
         } else {
             StmtKind::Expr(self.expression()?)
         };
         Ok(Stmt { kind, line })
+    }
+
+    fn fn_declaration(&mut self) -> Result<StmtKind, ParseError> {
+        let name = self.expect_ident("a function name after `fn`")?;
+        self.expect(TokenKind::LParen, "`(` after the function name")?;
+        let mut params = Vec::new();
+        if self.peek() != &TokenKind::RParen {
+            loop {
+                let name = self.expect_ident("a parameter name")?;
+                self.expect(TokenKind::Colon, "`:` and a type after the parameter name")?;
+                let ty = self.type_expr()?;
+                params.push(Param { name, ty });
+                if !self.matches(&[TokenKind::Comma]) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RParen, "`)` to close the parameter list")?;
+        self.expect(TokenKind::Arrow, "`->` and a return type")?;
+        let ret = self.type_expr()?;
+        if self.peek() != &TokenKind::LBrace {
+            return Err(self.error("expected `{` to start the function body"));
+        }
+        let body = self.block()?;
+        Ok(StmtKind::Fn(Rc::new(FnDecl {
+            name,
+            params,
+            ret,
+            body,
+        })))
+    }
+
+    fn type_expr(&mut self) -> Result<TypeExpr, ParseError> {
+        let name = self.expect_ident("a type")?;
+        let mut args = Vec::new();
+        if self.matches(&[TokenKind::LBracket]) {
+            loop {
+                args.push(self.type_expr()?);
+                if !self.matches(&[TokenKind::Comma]) {
+                    break;
+                }
+            }
+            self.expect(TokenKind::RBracket, "`]` to close the type arguments")?;
+        }
+        Ok(TypeExpr { name, args })
     }
 
     fn let_declaration(&mut self) -> Result<StmtKind, ParseError> {
@@ -729,5 +782,69 @@ mod tests {
         let tokens = scan_tokens("let a = {\n  let 1 = 2\n  3\n}").unwrap();
         let errors = super::parse(tokens).unwrap_err();
         assert_eq!(errors[0].line, 2);
+    }
+
+    #[test]
+    fn parses_a_function() {
+        assert_eq!(
+            stmt("fn add(a: Int, b: Int) -> Int {\n  a + b\n}"),
+            "(fn add (a: Int, b: Int) -> Int (block (+ a b)))"
+        );
+    }
+
+    #[test]
+    fn parses_a_function_on_one_line() {
+        assert_eq!(
+            stmt("fn double(x: Int) -> Int { x * 2 }"),
+            "(fn double (x: Int) -> Int (block (* x 2)))"
+        );
+    }
+
+    #[test]
+    fn parses_a_function_without_parameters() {
+        assert_eq!(
+            stmt("fn one() -> Int { 1 }"),
+            "(fn one () -> Int (block 1))"
+        );
+    }
+
+    #[test]
+    fn parses_generic_type_arguments() {
+        assert_eq!(
+            stmt("fn f(xs: List[Int], m: Map[String, List[Int]]) -> Int { 1 }"),
+            "(fn f (xs: List[Int], m: Map[String, List[Int]]) -> Int (block 1))"
+        );
+    }
+
+    #[test]
+    fn a_parameter_needs_a_type() {
+        assert_eq!(
+            stmt_error("fn f(x) -> Int { x }"),
+            "expected `:` and a type after the parameter name, found `)`"
+        );
+    }
+
+    #[test]
+    fn a_function_needs_a_return_type() {
+        assert_eq!(
+            stmt_error("fn f(x: Int) { x }"),
+            "expected `->` and a return type, found `{`"
+        );
+    }
+
+    #[test]
+    fn a_function_body_is_a_block() {
+        assert_eq!(
+            stmt_error("fn f(x: Int) -> Int x"),
+            "expected `{` to start the function body, found `x`"
+        );
+    }
+
+    #[test]
+    fn functions_are_only_declared_at_the_top_level() {
+        assert_eq!(
+            stmt_error("{\n  fn f() -> Int { 1 }\n  1\n}"),
+            "functions can only be declared at the top level, found `fn`"
+        );
     }
 }

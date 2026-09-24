@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
+use crate::ast::{BinaryOp, Expr, FnDecl, Stmt, StmtKind, UnaryOp};
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,9 +17,13 @@ struct Binding {
 
 type Env = Option<Rc<Binding>>;
 
+const MAX_CALL_DEPTH: usize = 200;
+
 #[derive(Default)]
 pub struct Interpreter {
     env: Env,
+    globals: Env,
+    depth: usize,
 }
 
 impl Interpreter {
@@ -28,6 +32,12 @@ impl Interpreter {
     }
 
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
+        let result = self.execute_stmt(stmt);
+        self.globals = self.env.clone();
+        result
+    }
+
+    fn execute_stmt(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
         self.execute_kind(&stmt.kind).map_err(|mut error| {
             error.line.get_or_insert(stmt.line);
             error
@@ -39,6 +49,10 @@ impl Interpreter {
             StmtKind::Let(name, value) => {
                 let value = self.evaluate(value)?;
                 self.bind(name.clone(), value);
+                Ok(None)
+            }
+            StmtKind::Fn(decl) => {
+                self.bind(decl.name.clone(), Value::Function(decl.clone()));
                 Ok(None)
             }
             StmtKind::Expr(expr) => self.evaluate(expr).map(Some),
@@ -61,7 +75,7 @@ impl Interpreter {
             Expr::Binary(left, BinaryOp::And, right) => self.and(left, right),
             Expr::Binary(left, BinaryOp::Or, right) => self.or(left, right),
             Expr::Binary(left, op, right) => self.binary(left, *op, right),
-            Expr::Call(..) => Err(error("function calls are not supported yet")),
+            Expr::Call(callee, args) => self.call(callee, args),
             Expr::Field(..) => Err(error("field access is not supported yet")),
         }
     }
@@ -75,9 +89,56 @@ impl Interpreter {
 
     fn run_block(&mut self, stmts: &[Stmt], tail: &Expr) -> Result<Value, RuntimeError> {
         for stmt in stmts {
-            self.execute(stmt)?;
+            self.execute_stmt(stmt)?;
         }
         self.evaluate(tail)
+    }
+
+    fn call(&mut self, callee: &Expr, args: &[Expr]) -> Result<Value, RuntimeError> {
+        let decl = match self.evaluate(callee)? {
+            Value::Function(decl) => decl,
+            other => {
+                return Err(error(format!(
+                    "can only call functions, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+
+        if args.len() != decl.params.len() {
+            return Err(error(format!(
+                "`{}` expects {} argument{}, got {}",
+                decl.name,
+                decl.params.len(),
+                if decl.params.len() == 1 { "" } else { "s" },
+                args.len()
+            )));
+        }
+
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.evaluate(arg)?);
+        }
+
+        if self.depth == MAX_CALL_DEPTH {
+            return Err(error(format!(
+                "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
+            )));
+        }
+
+        let caller = std::mem::replace(&mut self.env, self.globals.clone());
+        self.depth += 1;
+        let result = self.run_function(&decl, values);
+        self.depth -= 1;
+        self.env = caller;
+        result
+    }
+
+    fn run_function(&mut self, decl: &FnDecl, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        for (param, value) in decl.params.iter().zip(args) {
+            self.bind(param.name.clone(), value);
+        }
+        self.evaluate(&decl.body)
     }
 
     fn bind(&mut self, name: String, value: Value) {
@@ -171,6 +232,10 @@ impl Interpreter {
             (Le, Float(a), Float(b)) => Ok(Bool(a <= b)),
             (Gt, Float(a), Float(b)) => Ok(Bool(a > b)),
             (Ge, Float(a), Float(b)) => Ok(Bool(a >= b)),
+
+            (Eq | Ne, Value::Function(_), Value::Function(_)) => {
+                Err(error("functions cannot be compared"))
+            }
 
             (Eq, a, b) if a.same_type(&b) => Ok(Bool(a == b)),
             (Ne, a, b) if a.same_type(&b) => Ok(Bool(a != b)),
@@ -505,6 +570,179 @@ mod tests {
         assert_eq!(
             runtime_error_line("let y = {\n  let x = 1\n  x / 0\n}"),
             Some(1)
+        );
+    }
+
+    fn program(source: &str) -> Vec<Result<Option<String>, String>> {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        let stmts = parse(tokens).expect("source should parse cleanly");
+        let mut interpreter = Interpreter::new();
+        stmts
+            .iter()
+            .map(|stmt| {
+                interpreter
+                    .execute(stmt)
+                    .map(|value| value.map(|v| v.to_string()))
+                    .map_err(|e| e.message)
+            })
+            .collect()
+    }
+
+    fn last(source: &str) -> Result<Option<String>, String> {
+        program(source).pop().expect("program should not be empty")
+    }
+
+    #[test]
+    fn calls_a_function() {
+        assert_eq!(
+            last("fn add(a: Int, b: Int) -> Int { a + b }\nadd(2, 3)"),
+            Ok(Some("5".into()))
+        );
+    }
+
+    #[test]
+    fn a_declaration_produces_no_value() {
+        assert_eq!(program("fn one() -> Int { 1 }"), vec![Ok(None)]);
+    }
+
+    #[test]
+    fn call_pipe_and_dot_are_the_same_call() {
+        let source = "fn add(a: Int, b: Int) -> Int { a + b }";
+        for call in ["add(2, 3)", "2 |> add(3)", "2.add(3)"] {
+            assert_eq!(last(&format!("{source}\n{call}")), Ok(Some("5".into())));
+        }
+    }
+
+    #[test]
+    fn pipes_chain_through_functions() {
+        assert_eq!(
+            last("fn double(x: Int) -> Int { x * 2 }\nfn inc(x: Int) -> Int { x + 1 }\n3\n  |> double\n  |> inc"),
+            Ok(Some("7".into()))
+        );
+    }
+
+    #[test]
+    fn a_function_body_can_have_several_lines() {
+        assert_eq!(
+            last("fn area(w: Int, h: Int) -> Int {\n  let a = w * h\n  a\n}\narea(4, 5)"),
+            Ok(Some("20".into()))
+        );
+    }
+
+    #[test]
+    fn functions_can_recurse_through_each_other() {
+        let source = "fn is_even(n: Int) -> Bool { n == 0 or is_odd(n - 1) }\n\
+                      fn is_odd(n: Int) -> Bool { n != 0 and is_even(n - 1) }";
+        assert_eq!(
+            last(&format!("{source}\nis_even(10)")),
+            Ok(Some("true".into()))
+        );
+        assert_eq!(
+            last(&format!("{source}\nis_odd(7)")),
+            Ok(Some("true".into()))
+        );
+        assert_eq!(
+            last(&format!("{source}\nis_even(7)")),
+            Ok(Some("false".into()))
+        );
+    }
+
+    #[test]
+    fn a_function_sees_top_level_names_declared_before_the_call() {
+        assert_eq!(
+            last("fn scaled(x: Int) -> Int { x * SCALE }\nlet SCALE = 10\nscaled(3)"),
+            Ok(Some("30".into()))
+        );
+    }
+
+    #[test]
+    fn a_function_does_not_see_the_callers_locals() {
+        assert_eq!(
+            last("fn peek() -> Int { secret }\n{\n  let secret = 1\n  peek()\n}"),
+            Err("undefined variable `secret`".into())
+        );
+    }
+
+    #[test]
+    fn parameters_shadow_top_level_names() {
+        assert_eq!(
+            last("let x = 100\nfn id(x: Int) -> Int { x }\nid(1)"),
+            Ok(Some("1".into()))
+        );
+    }
+
+    #[test]
+    fn a_call_does_not_leak_its_parameters() {
+        assert_eq!(
+            last("fn id(y: Int) -> Int { y }\nid(1)\ny"),
+            Err("undefined variable `y`".into())
+        );
+    }
+
+    #[test]
+    fn functions_are_values() {
+        assert_eq!(
+            last("fn double(x: Int) -> Int { x * 2 }\nlet g = double\ng(4)"),
+            Ok(Some("8".into()))
+        );
+        assert_eq!(
+            last("fn double(x: Int) -> Int { x * 2 }\nfn twice(f: Fn, x: Int) -> Int { f(f(x)) }\ntwice(double, 3)"),
+            Ok(Some("12".into()))
+        );
+        assert_eq!(
+            last("fn double(x: Int) -> Int { x * 2 }\ndouble"),
+            Ok(Some("<fn double>".into()))
+        );
+    }
+
+    #[test]
+    fn checks_the_number_of_arguments() {
+        assert_eq!(
+            last("fn add(a: Int, b: Int) -> Int { a + b }\nadd(1)"),
+            Err("`add` expects 2 arguments, got 1".into())
+        );
+        assert_eq!(
+            last("fn id(x: Int) -> Int { x }\nid(1, 2)"),
+            Err("`id` expects 1 argument, got 2".into())
+        );
+    }
+
+    #[test]
+    fn only_functions_can_be_called() {
+        assert_eq!(
+            last("let x = 1\nx(2)"),
+            Err("can only call functions, got Int".into())
+        );
+    }
+
+    #[test]
+    fn functions_cannot_be_compared() {
+        assert_eq!(
+            last("fn f() -> Int { 1 }\nf == f"),
+            Err("functions cannot be compared".into())
+        );
+    }
+
+    #[test]
+    fn infinite_recursion_is_an_error_not_a_crash() {
+        assert_eq!(
+            last("fn loop_forever(n: Int) -> Int { loop_forever(n + 1) }\nloop_forever(0)"),
+            Err(format!(
+                "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_scope_is_restored_after_a_failing_call() {
+        assert_eq!(
+            program("let x = 1\nfn boom(x: Int) -> Int { x / 0 }\nboom(5)\nx"),
+            vec![
+                Ok(None),
+                Ok(None),
+                Err("division by zero".into()),
+                Ok(Some("1".into()))
+            ]
         );
     }
 }

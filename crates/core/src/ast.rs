@@ -1,4 +1,5 @@
 use std::fmt;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
@@ -39,8 +40,29 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TypeExpr {
+    pub name: String,
+    pub args: Vec<TypeExpr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub ty: TypeExpr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: TypeExpr,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum StmtKind {
     Let(String, Expr),
+    Fn(Rc<FnDecl>),
     Expr(Expr),
 }
 
@@ -54,8 +76,38 @@ impl fmt::Display for Stmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             StmtKind::Let(name, value) => write!(f, "(let {name} {value})"),
+            StmtKind::Fn(decl) => write!(f, "{decl}"),
             StmtKind::Expr(expr) => write!(f, "{expr}"),
         }
+    }
+}
+
+impl fmt::Display for TypeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)?;
+        if !self.args.is_empty() {
+            let args: Vec<String> = self.args.iter().map(|a| a.to_string()).collect();
+            write!(f, "[{}]", args.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for FnDecl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let params: Vec<String> = self
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, p.ty))
+            .collect();
+        write!(
+            f,
+            "(fn {} ({}) -> {} {})",
+            self.name,
+            params.join(", "),
+            self.ret,
+            self.body
+        )
     }
 }
 
