@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::ast::{BinaryOp, Expr, FnDecl, Stmt, StmtKind, UnaryOp};
-use crate::value::Value;
+use crate::ast::{
+    BinaryOp, Expr, FnDecl, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, UnaryOp,
+};
+use crate::prelude::NATIVES;
+use crate::value::{Instance, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -24,11 +28,38 @@ pub struct Interpreter {
     env: Env,
     globals: Env,
     depth: usize,
+    structs: HashMap<String, Rc<StructDecl>>,
+    sequences: HashMap<String, Rc<SeqDecl>>,
+}
+
+pub struct Run {
+    decl: Rc<SeqDecl>,
+    env: Env,
+    step: usize,
+    pass: usize,
+    passes: usize,
+}
+
+impl Run {
+    pub fn state(&self) -> Value {
+        lookup(&self.env, &self.decl.params[0].name)
+            .cloned()
+            .expect("a running sequence always has its state")
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.step == self.decl.body.len()
+    }
 }
 
 impl Interpreter {
     pub fn new() -> Self {
-        Self::default()
+        let mut interpreter = Self::default();
+        for native in NATIVES {
+            interpreter.bind(native.name.to_string(), Value::Native(*native));
+        }
+        interpreter.globals = interpreter.env.clone();
+        interpreter
     }
 
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
@@ -55,6 +86,14 @@ impl Interpreter {
                 self.bind(decl.name.clone(), Value::Function(decl.clone()));
                 Ok(None)
             }
+            StmtKind::Struct(decl) => {
+                self.structs.insert(decl.name.clone(), decl.clone());
+                Ok(None)
+            }
+            StmtKind::Sequence(decl) => {
+                self.sequences.insert(decl.name.clone(), decl.clone());
+                Ok(None)
+            }
             StmtKind::Expr(expr) => self.evaluate(expr).map(Some),
         }
     }
@@ -66,18 +105,102 @@ impl Interpreter {
             Expr::Bool(v) => Ok(Value::Bool(*v)),
             Expr::Str(v) => Ok(Value::Str(v.clone())),
             Expr::Symbol(v) => Ok(Value::Symbol(v.clone())),
-            Expr::Ident(name) => self
-                .lookup(name)
-                .cloned()
-                .ok_or_else(|| error(format!("undefined variable `{name}`"))),
+            Expr::Ident(name) => self.variable(name),
             Expr::Block(stmts, tail) => self.block(stmts, tail),
+            Expr::If(cond, then, otherwise) => {
+                let branch = match self.evaluate(cond)? {
+                    Value::Bool(true) => then,
+                    Value::Bool(false) => otherwise,
+                    other => {
+                        return Err(error(format!(
+                            "the condition of `if` must be a Bool, got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                self.evaluate(branch)
+            }
             Expr::Unary(op, right) => self.unary(*op, right),
             Expr::Binary(left, BinaryOp::And, right) => self.and(left, right),
             Expr::Binary(left, BinaryOp::Or, right) => self.or(left, right),
             Expr::Binary(left, op, right) => self.binary(left, *op, right),
             Expr::Call(callee, args) => self.call(callee, args),
-            Expr::Field(..) => Err(error("field access is not supported yet")),
+            Expr::Field(target, field) => match self.evaluate(target)? {
+                Value::Struct(instance) => instance
+                    .get(field)
+                    .cloned()
+                    .ok_or_else(|| error(format!("`{}` has no field `{field}`", instance.name))),
+                other => Err(error(format!("{} has no fields", other.type_name()))),
+            },
+            Expr::Struct { name, base, fields } => self.construct(name, base.as_deref(), fields),
         }
+    }
+
+    fn variable(&self, name: &str) -> Result<Value, RuntimeError> {
+        if let Some(value) = self.lookup(name) {
+            return Ok(value.clone());
+        }
+        if self.structs.contains_key(name) {
+            return Err(error(format!(
+                "`{name}` is a struct, not a value: build one with `{name} {{ ... }}`"
+            )));
+        }
+        if self.sequences.contains_key(name) {
+            return Err(error(format!(
+                "`{name}` is a sequence, not a function: it runs over time and cannot be called"
+            )));
+        }
+        Err(error(format!("undefined variable `{name}`")))
+    }
+
+    fn construct(
+        &mut self,
+        name: &str,
+        base: Option<&Expr>,
+        fields: &[(String, Expr)],
+    ) -> Result<Value, RuntimeError> {
+        let decl = self
+            .structs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("undefined struct `{name}`")))?;
+
+        let mut values: Vec<Option<Value>> = match base {
+            Some(base) => match self.evaluate(base)? {
+                Value::Struct(instance) if instance.name == name => instance
+                    .fields
+                    .iter()
+                    .map(|(_, v)| Some(v.clone()))
+                    .collect(),
+                other => {
+                    return Err(error(format!(
+                        "`{name} {{ x | ... }}` needs a {name} as `x`, got {}",
+                        other.type_name()
+                    )))
+                }
+            },
+            None => vec![None; decl.fields.len()],
+        };
+
+        for (field, expr) in fields {
+            let index = decl
+                .fields
+                .iter()
+                .position(|f| &f.name == field)
+                .ok_or_else(|| error(format!("`{name}` has no field `{field}`")))?;
+            values[index] = Some(self.evaluate(expr)?);
+        }
+
+        let mut instance = Vec::with_capacity(values.len());
+        for (field, value) in decl.fields.iter().zip(values) {
+            let value = value
+                .ok_or_else(|| error(format!("missing field `{}` in `{name}`", field.name)))?;
+            instance.push((field.name.clone(), value));
+        }
+        Ok(Value::Struct(Rc::new(Instance {
+            name: name.to_string(),
+            fields: instance,
+        })))
     }
 
     fn block(&mut self, stmts: &[Stmt], tail: &Expr) -> Result<Value, RuntimeError> {
@@ -97,6 +220,11 @@ impl Interpreter {
     fn call(&mut self, callee: &Expr, args: &[Expr]) -> Result<Value, RuntimeError> {
         let decl = match self.evaluate(callee)? {
             Value::Function(decl) => decl,
+            Value::Native(native) => {
+                check_arity(native.name, native.arity, args.len())?;
+                let values = self.arguments(args)?;
+                return (native.fun)(&values).map_err(error);
+            }
             other => {
                 return Err(error(format!(
                     "can only call functions, got {}",
@@ -105,20 +233,8 @@ impl Interpreter {
             }
         };
 
-        if args.len() != decl.params.len() {
-            return Err(error(format!(
-                "`{}` expects {} argument{}, got {}",
-                decl.name,
-                decl.params.len(),
-                if decl.params.len() == 1 { "" } else { "s" },
-                args.len()
-            )));
-        }
-
-        let mut values = Vec::with_capacity(args.len());
-        for arg in args {
-            values.push(self.evaluate(arg)?);
-        }
+        check_arity(&decl.name, decl.params.len(), args.len())?;
+        let values = self.arguments(args)?;
 
         if self.depth == MAX_CALL_DEPTH {
             return Err(error(format!(
@@ -134,6 +250,147 @@ impl Interpreter {
         result
     }
 
+    fn arguments(&mut self, args: &[Expr]) -> Result<Vec<Value>, RuntimeError> {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.evaluate(arg)?);
+        }
+        Ok(values)
+    }
+
+    pub fn start(&mut self, name: &str, args: Vec<Value>) -> Result<Run, RuntimeError> {
+        let decl = self
+            .sequences
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("undefined sequence `{name}`")))?;
+        check_arity(&decl.name, decl.params.len(), args.len())?;
+
+        let mut env = self.globals.clone();
+        for (param, value) in decl.params.iter().zip(args) {
+            env = Some(Rc::new(Binding {
+                name: param.name.clone(),
+                value,
+                next: env,
+            }));
+        }
+        Ok(Run {
+            decl,
+            env,
+            step: 0,
+            pass: 0,
+            passes: 0,
+        })
+    }
+
+    pub fn step(&mut self, run: &mut Run, dt: f64) -> Result<(), RuntimeError> {
+        if dt.is_nan() || dt <= 0.0 {
+            return Err(error(format!("a step must last more than 0s, got {dt:?}")));
+        }
+        let outer = std::mem::replace(&mut self.env, run.env.take());
+        let result = self.advance(run, dt);
+        run.env = std::mem::replace(&mut self.env, outer);
+        result
+    }
+
+    fn advance(&mut self, run: &mut Run, dt: f64) -> Result<(), RuntimeError> {
+        let decl = run.decl.clone();
+        while let Some(step) = decl.body.get(run.step) {
+            let StepKind::Over {
+                duration,
+                var,
+                body,
+            } = &step.kind
+            else {
+                self.execute_step(step)?;
+                run.step += 1;
+                continue;
+            };
+
+            if run.pass == 0 {
+                run.passes = passes(self.evaluate(duration), dt).map_err(|mut e| {
+                    e.line.get_or_insert(step.line);
+                    e
+                })?;
+            }
+            run.pass += 1;
+            let t = if run.pass == run.passes {
+                1.0
+            } else {
+                run.pass as f64 / run.passes as f64
+            };
+            self.over_pass(&decl.params[0].name, var.as_deref(), t, body)?;
+
+            if run.pass == run.passes {
+                run.pass = 0;
+                run.step += 1;
+                while let Some(step) = decl.body.get(run.step) {
+                    if matches!(step.kind, StepKind::Over { .. }) {
+                        break;
+                    }
+                    self.execute_step(step)?;
+                    run.step += 1;
+                }
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn over_pass(
+        &mut self,
+        state: &str,
+        var: Option<&str>,
+        t: f64,
+        body: &[Step],
+    ) -> Result<(), RuntimeError> {
+        let outer = self.env.clone();
+        if let Some(var) = var {
+            self.bind(var.to_string(), Value::Float(t));
+        }
+        let result = body.iter().try_for_each(|step| self.execute_step(step));
+        let value = self.lookup(state).cloned();
+        self.env = outer;
+        result?;
+        if let Some(value) = value {
+            self.bind(state.to_string(), value);
+        }
+        Ok(())
+    }
+
+    fn execute_step(&mut self, step: &Step) -> Result<(), RuntimeError> {
+        let result = match &step.kind {
+            StepKind::Stmt(kind) => self.execute_kind(kind).map(|_| ()),
+            StepKind::Set(target, field, expr) => self.set_field(target, field, expr),
+            StepKind::Over { .. } => unreachable!("the parser keeps `over` out of `over`"),
+        };
+        result.map_err(|mut error| {
+            error.line.get_or_insert(step.line);
+            error
+        })
+    }
+
+    fn set_field(&mut self, target: &str, field: &str, expr: &Expr) -> Result<(), RuntimeError> {
+        let value = self.evaluate(expr)?;
+        let instance = match self.lookup(target) {
+            Some(Value::Struct(instance)) => instance.clone(),
+            Some(other) => {
+                return Err(error(format!(
+                    "`{target}.{field} = ...` needs `{target}` to be a struct, got {}",
+                    other.type_name()
+                )))
+            }
+            None => unreachable!("a running sequence always has its state"),
+        };
+        let mut updated = (*instance).clone();
+        match updated.fields.iter_mut().find(|(f, _)| f == field) {
+            Some((_, slot)) => *slot = value,
+            None => return Err(error(format!("`{}` has no field `{field}`", instance.name))),
+        }
+        self.bind(target.to_string(), Value::Struct(Rc::new(updated)));
+        Ok(())
+    }
+
     fn run_function(&mut self, decl: &FnDecl, args: Vec<Value>) -> Result<Value, RuntimeError> {
         for (param, value) in decl.params.iter().zip(args) {
             self.bind(param.name.clone(), value);
@@ -147,14 +404,7 @@ impl Interpreter {
     }
 
     fn lookup(&self, name: &str) -> Option<&Value> {
-        let mut node = self.env.as_deref();
-        while let Some(binding) = node {
-            if binding.name == name {
-                return Some(&binding.value);
-            }
-            node = binding.next.as_deref();
-        }
-        None
+        lookup(&self.env, name)
     }
 
     fn unary(&mut self, op: UnaryOp, right: &Expr) -> Result<Value, RuntimeError> {
@@ -233,9 +483,11 @@ impl Interpreter {
             (Gt, Float(a), Float(b)) => Ok(Bool(a > b)),
             (Ge, Float(a), Float(b)) => Ok(Bool(a >= b)),
 
-            (Eq | Ne, Value::Function(_), Value::Function(_)) => {
-                Err(error("functions cannot be compared"))
-            }
+            (
+                Eq | Ne,
+                Value::Function(_) | Value::Native(_),
+                Value::Function(_) | Value::Native(_),
+            ) => Err(error("functions cannot be compared")),
 
             (Eq, a, b) if a.same_type(&b) => Ok(Bool(a == b)),
             (Ne, a, b) if a.same_type(&b) => Ok(Bool(a != b)),
@@ -243,6 +495,42 @@ impl Interpreter {
             (op, a, b) => Err(mismatch(op, &a, &b)),
         }
     }
+}
+
+fn lookup<'a>(env: &'a Env, name: &str) -> Option<&'a Value> {
+    let mut node = env.as_deref();
+    while let Some(binding) = node {
+        if binding.name == name {
+            return Some(&binding.value);
+        }
+        node = binding.next.as_deref();
+    }
+    None
+}
+
+fn passes(duration: Result<Value, RuntimeError>, dt: f64) -> Result<usize, RuntimeError> {
+    match duration? {
+        Value::Float(d) if d >= 0.0 && d.is_finite() => {
+            Ok(((d / dt - 1e-9).ceil() as usize).max(1))
+        }
+        Value::Float(d) => Err(error(format!(
+            "a duration must be a finite number of seconds, at least 0s, got {d:?}"
+        ))),
+        other => Err(error(format!(
+            "a duration must be a Float in seconds, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RuntimeError> {
+    if expected == got {
+        return Ok(());
+    }
+    Err(error(format!(
+        "`{name}` expects {expected} argument{}, got {got}",
+        if expected == 1 { "" } else { "s" }
+    )))
 }
 
 fn checked(result: Option<i64>, op: BinaryOp) -> Result<Value, RuntimeError> {
@@ -743,6 +1031,426 @@ mod tests {
                 Err("division by zero".into()),
                 Ok(Some("1".into()))
             ]
+        );
+    }
+
+    #[test]
+    fn if_picks_a_branch() {
+        assert_eq!(eval("if 1 < 2 { :yes } else { :no }"), ":yes");
+        assert_eq!(eval("if 1 > 2 { :yes } else { :no }"), ":no");
+    }
+
+    #[test]
+    fn the_branch_not_taken_is_not_evaluated() {
+        assert_eq!(eval("if true { 1 } else { 1 / 0 }"), "1");
+        assert_eq!(eval("if false { 1 / 0 } else { 2 }"), "2");
+    }
+
+    #[test]
+    fn else_if_chains() {
+        assert_eq!(
+            last("fn sign(n: Int) -> Symbol {\n  if n < 0 { :neg } else if n == 0 { :zero } else { :pos }\n}\nsign(0)"),
+            Ok(Some(":zero".into()))
+        );
+    }
+
+    #[test]
+    fn the_condition_must_be_a_bool() {
+        assert_eq!(
+            error("if 1 { 2 } else { 3 }"),
+            "the condition of `if` must be a Bool, got Int"
+        );
+    }
+
+    #[test]
+    fn recursion_terminates_with_if() {
+        assert_eq!(
+            last("fn fact(n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }\nfact(10)"),
+            Ok(Some("3628800".into()))
+        );
+        assert_eq!(
+            last("fn fib(n: Int) -> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\nfib(15)"),
+            Ok(Some("610".into()))
+        );
+    }
+
+    const BALL: &str = "struct Ball { x: Float, y: Float }\n";
+
+    #[test]
+    fn builds_a_struct() {
+        assert_eq!(
+            last(&format!("{BALL}Ball {{ y: 2.0, x: 1.0 }}")),
+            Ok(Some("Ball { x: 1.0, y: 2.0 }".into()))
+        );
+        assert_eq!(
+            last("struct Label { text: String }\nLabel { text: \"hi\" }"),
+            Ok(Some("Label { text: \"hi\" }".into()))
+        );
+        assert_eq!(
+            last("struct Empty {}\nEmpty {}"),
+            Ok(Some("Empty {}".into()))
+        );
+    }
+
+    #[test]
+    fn reads_a_field() {
+        assert_eq!(
+            last(&format!("{BALL}let b = Ball {{ x: 1.0, y: 2.0 }}\nb.y")),
+            Ok(Some("2.0".into()))
+        );
+    }
+
+    #[test]
+    fn updates_a_struct_without_changing_the_original() {
+        assert_eq!(
+            program(&format!(
+                "{BALL}let b = Ball {{ x: 1.0, y: 2.0 }}\nBall {{ b | y: 5.0 }}\nb"
+            ))[2..],
+            [
+                Ok(Some("Ball { x: 1.0, y: 5.0 }".into())),
+                Ok(Some("Ball { x: 1.0, y: 2.0 }".into()))
+            ]
+        );
+    }
+
+    #[test]
+    fn structs_compare_by_value() {
+        assert_eq!(
+            last(&format!(
+                "{BALL}Ball {{ x: 1.0, y: 2.0 }} == Ball {{ y: 2.0, x: 1.0 }}"
+            )),
+            Ok(Some("true".into()))
+        );
+        assert_eq!(
+            last(&format!(
+                "{BALL}struct Paddle {{ y: Float }}\nBall {{ x: 1.0, y: 2.0 }} == Paddle {{ y: 2.0 }}"
+            )),
+            Err("operands of `==` must be two values of the same type, got Ball and Paddle".into())
+        );
+    }
+
+    #[test]
+    fn struct_errors() {
+        let cases = [
+            ("Ball { x: 1.0 }", "missing field `y` in `Ball`"),
+            ("Ball { x: 1.0, y: 2.0, z: 3.0 }", "`Ball` has no field `z`"),
+            ("Paddle { y: 1.0 }", "undefined struct `Paddle`"),
+            (
+                "Ball { 1 | x: 2.0 }",
+                "`Ball { x | ... }` needs a Ball as `x`, got Int",
+            ),
+            ("Ball { x: 1.0, y: 2.0 }.z", "`Ball` has no field `z`"),
+            ("let n = 1\nn.x", "Int has no fields"),
+            (
+                "Ball",
+                "`Ball` is a struct, not a value: build one with `Ball { ... }`",
+            ),
+        ];
+        for (source, message) in cases {
+            assert_eq!(
+                last(&format!("{BALL}{source}")),
+                Err(message.into()),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_struct_can_be_redeclared() {
+        assert_eq!(
+            last(&format!(
+                "{BALL}struct Ball {{ r: Float }}\nBall {{ r: 1.0 }}"
+            )),
+            Ok(Some("Ball { r: 1.0 }".into()))
+        );
+    }
+
+    #[test]
+    fn functions_take_and_return_structs() {
+        assert_eq!(
+            last(&format!(
+                "{BALL}fn fall(b: Ball, dy: Float) -> Ball {{ Ball {{ b | y: b.y + dy }} }}\nBall {{ x: 0.0, y: 0.0 }} |> fall(1.0) |> fall(2.0)"
+            )),
+            Ok(Some("Ball { x: 0.0, y: 3.0 }".into()))
+        );
+    }
+
+    #[test]
+    fn calls_natives() {
+        let cases = [
+            ("abs(-3)", "3"),
+            ("abs(-1.5)", "1.5"),
+            ("min(2, 3)", "2"),
+            ("max(2.0, 3.0)", "3.0"),
+            ("clamp(5, 0, 3)", "3"),
+            ("clamp(-1.0, 0.0, 1.0)", "0.0"),
+            ("sqrt(9.0)", "3.0"),
+            ("sin(0.0)", "0.0"),
+            ("cos(0.0)", "1.0"),
+            ("to_float(2)", "2.0"),
+            ("to_int(-2.7)", "-2"),
+            ("3 |> max(4)", "4"),
+        ];
+        for (source, value) in cases {
+            assert_eq!(last(source), Ok(Some(value.into())), "{source}");
+        }
+    }
+
+    #[test]
+    fn native_errors() {
+        let cases = [
+            ("abs(true)", "`abs` expects an Int or a Float, got Bool"),
+            ("abs(-9223372036854775807 - 1)", "integer overflow in `abs`"),
+            (
+                "min(1, 2.0)",
+                "`min` expects all Ints or all Floats, got Int, Float",
+            ),
+            (
+                "clamp(1, 3, 0)",
+                "`clamp` expects its lower bound to be at most its upper bound",
+            ),
+            ("sqrt(-1.0)", "`sqrt` of a negative number"),
+            ("sqrt(4)", "`sqrt` expects a Float, got Int"),
+            (
+                "to_int(1.0 / 0.0)",
+                "`to_int` cannot represent inf as an Int",
+            ),
+            ("min(1)", "`min` expects 2 arguments, got 1"),
+            ("abs == abs", "functions cannot be compared"),
+        ];
+        for (source, message) in cases {
+            assert_eq!(last(source), Err(message.into()), "{source}");
+        }
+    }
+
+    #[test]
+    fn natives_are_ordinary_names() {
+        assert_eq!(last("abs"), Ok(Some("<fn abs>".into())));
+        assert_eq!(last("let abs = 1\nabs + 1"), Ok(Some("2".into())));
+        assert_eq!(
+            last("fn f(x: Int) -> Int { abs(x) }\nf(-4)"),
+            Ok(Some("4".into()))
+        );
+    }
+
+    fn sequence(source: &str, name: &str, args: &[&str]) -> (Interpreter, Run) {
+        let mut interpreter = Interpreter::new();
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        for stmt in parse(tokens).expect("source should parse cleanly") {
+            interpreter
+                .execute(&stmt)
+                .expect("source should run cleanly");
+        }
+        let args = args
+            .iter()
+            .map(|arg| {
+                let tokens = scan_tokens(arg).expect("argument should scan cleanly");
+                let expr = parse_expr(tokens).expect("argument should parse cleanly");
+                interpreter
+                    .evaluate(&expr)
+                    .expect("argument should evaluate")
+            })
+            .collect();
+        let run = interpreter
+            .start(name, args)
+            .expect("sequence should start");
+        (interpreter, run)
+    }
+
+    fn frames(source: &str, args: &[&str], dt: f64, count: usize) -> Vec<String> {
+        let (mut interpreter, mut run) = sequence(&format!("{BALL}{source}"), "s", args);
+        (0..count)
+            .map(|_| {
+                interpreter
+                    .step(&mut run, dt)
+                    .expect("step should run cleanly");
+                let done = if run.is_done() { " done" } else { "" };
+                match run.state() {
+                    Value::Struct(ball) => format!("{}{done}", ball.fields[0].1),
+                    other => format!("{other}{done}"),
+                }
+            })
+            .collect()
+    }
+
+    const START: &str = "Ball { x: 0.0, y: 0.0 }";
+
+    #[test]
+    fn a_sequence_without_time_finishes_in_one_step() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball) {\n  b.x = 1.0\n  b.x = b.x + 1.0\n}",
+                &[START],
+                0.25,
+                1
+            ),
+            ["2.0 done"]
+        );
+    }
+
+    #[test]
+    fn wait_takes_as_many_steps_as_its_duration() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball) {\n  wait 1.0s\n  b.x = 5.0\n}",
+                &[START],
+                0.25,
+                4
+            ),
+            ["0.0", "0.0", "0.0", "5.0 done"]
+        );
+    }
+
+    #[test]
+    fn over_runs_its_body_once_per_step_with_t() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball) {\n  over 1.0s as t {\n    b.x = t\n  }\n}",
+                &[START],
+                0.25,
+                4
+            ),
+            ["0.25", "0.5", "0.75", "1.0 done"]
+        );
+    }
+
+    #[test]
+    fn over_rounds_up_and_ends_on_exactly_one() {
+        let steps = frames(
+            "sequence s(b: Ball) {\n  over 0.1s as t {\n    b.x = t\n  }\n}",
+            &[START],
+            1.0 / 60.0,
+            6,
+        );
+        assert_eq!(steps[5], "1.0 done");
+        assert!(!steps[4].ends_with("done"));
+        let steps = frames(
+            "sequence s(b: Ball) {\n  over 0.3s as t {\n    b.x = t\n  }\n}",
+            &[START],
+            0.25,
+            2,
+        );
+        assert_eq!(steps, ["0.5", "1.0 done"]);
+    }
+
+    #[test]
+    fn a_zero_duration_still_takes_one_step() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball) {\n  wait 0.0s\n  b.x = 1.0\n}",
+                &[START],
+                0.25,
+                1
+            ),
+            ["1.0 done"]
+        );
+    }
+
+    #[test]
+    fn steps_between_waits_run_in_the_step_that_reaches_them() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball) {\n  b.x = 1.0\n  wait 0.5s\n  b.x = 2.0\n  wait 0.25s\n  b.x = 3.0\n}",
+                &[START],
+                0.25,
+                3
+            ),
+            ["1.0", "2.0", "3.0 done"]
+        );
+    }
+
+    #[test]
+    fn bindings_live_across_steps() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball, to: Float) {\n  let from = b.x\n  over 0.5s as t {\n    let d = to - from\n    b.x = from + d * t\n  }\n}",
+                &["Ball { x: 10.0, y: 0.0 }", "20.0"],
+                0.25,
+                2
+            ),
+            ["15.0", "20.0 done"]
+        );
+    }
+
+    #[test]
+    fn a_finished_sequence_stays_finished() {
+        assert_eq!(
+            frames(
+                "sequence s(b: Ball) {\n  b.x = b.x + 1.0\n}",
+                &[START],
+                0.25,
+                3
+            ),
+            ["1.0 done", "1.0 done", "1.0 done"]
+        );
+    }
+
+    #[test]
+    fn a_sequence_can_call_functions() {
+        assert_eq!(
+            frames(
+                "fn half(x: Float) -> Float { x / 2.0 }\nsequence s(b: Ball) {\n  over 0.5s as t {\n    b.x = half(t) |> max(0.3)\n  }\n}",
+                &[START],
+                0.25,
+                2
+            ),
+            ["0.3", "0.5 done"]
+        );
+    }
+
+    fn step_error(source: &str, args: &[&str], dt: f64) -> RuntimeError {
+        let (mut interpreter, mut run) = sequence(&format!("{BALL}{source}"), "s", args);
+        interpreter.step(&mut run, dt).unwrap_err()
+    }
+
+    #[test]
+    fn sequence_errors() {
+        let error = step_error("sequence s(b: Ball) {\n  wait 1\n}", &[START], 0.25);
+        assert_eq!(
+            error.message,
+            "a duration must be a Float in seconds, got Int"
+        );
+        assert_eq!(error.line, Some(3));
+
+        let error = step_error("sequence s(b: Ball) {\n  wait -1.0s\n}", &[START], 0.25);
+        assert_eq!(
+            error.message,
+            "a duration must be a finite number of seconds, at least 0s, got -1.0"
+        );
+
+        let error = step_error("sequence s(b: Ball) {\n  b.z = 1.0\n}", &[START], 0.25);
+        assert_eq!(error.message, "`Ball` has no field `z`");
+        assert_eq!(error.line, Some(3));
+
+        let error = step_error("sequence s(n: Int) {\n  n.z = 1.0\n}", &["1"], 0.25);
+        assert_eq!(
+            error.message,
+            "`n.z = ...` needs `n` to be a struct, got Int"
+        );
+
+        let error = step_error("sequence s(b: Ball) {}", &[START], 0.0);
+        assert_eq!(error.message, "a step must last more than 0s, got 0.0");
+    }
+
+    #[test]
+    fn starting_errors() {
+        let mut interpreter = Interpreter::new();
+        assert_eq!(
+            interpreter.start("s", vec![]).err().unwrap().message,
+            "undefined sequence `s`"
+        );
+        let (mut interpreter, _) = sequence("sequence s(n: Int) {}", "s", &["1"]);
+        assert_eq!(
+            interpreter.start("s", vec![]).err().unwrap().message,
+            "`s` expects 1 argument, got 0"
+        );
+    }
+
+    #[test]
+    fn a_sequence_is_not_a_function() {
+        assert_eq!(
+            last("sequence s(n: Int) {}\ns(1)"),
+            Err("`s` is a sequence, not a function: it runs over time and cannot be called".into())
         );
     }
 }

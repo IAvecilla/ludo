@@ -49,13 +49,14 @@ fn run_file(path: &str) -> ExitCode {
 fn run_repl() {
     let stdin = io::stdin();
     let mut interpreter = Interpreter::new();
+    let mut source = String::new();
 
     loop {
-        print!("> ");
+        print!("{}", if source.is_empty() { "> " } else { "... " });
         let _ = io::stdout().flush();
 
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
+        let mut bytes = Vec::new();
+        match stdin.lock().read_until(b'\n', &mut bytes) {
             Ok(0) => break,
             Ok(_) => {}
             Err(err) => {
@@ -64,7 +65,22 @@ fn run_repl() {
             }
         }
 
-        let _ = run(&line, &mut interpreter, false);
+        let line = String::from_utf8_lossy(&bytes);
+        let blank = line.trim().is_empty();
+        source.push_str(&line);
+        if !blank && needs_more(&source) {
+            continue;
+        }
+
+        let _ = run(&source, &mut interpreter, false);
+        source.clear();
+    }
+}
+
+fn needs_more(source: &str) -> bool {
+    match scan_tokens(source) {
+        Ok(tokens) => parse(tokens).is_err_and(|errors| errors.last().is_some_and(|e| e.at_end)),
+        Err(_) => false,
     }
 }
 
