@@ -17,7 +17,7 @@ struct Scanner {
     start: usize,
     current: usize,
     line: usize,
-    depth: usize,
+    open: Vec<char>,
     tokens: Vec<Token>,
     errors: Vec<ScanError>,
 }
@@ -29,7 +29,7 @@ impl Scanner {
             start: 0,
             current: 0,
             line: 1,
-            depth: 0,
+            open: Vec::new(),
             tokens: Vec::new(),
             errors: Vec::new(),
         }
@@ -57,12 +57,12 @@ impl Scanner {
             ' ' | '\r' | '\t' => {}
             '\n' => self.newline(),
 
-            '(' => self.open(TokenKind::LParen),
+            '(' => self.open('(', TokenKind::LParen),
             ')' => self.close(TokenKind::RParen),
-            '[' => self.open(TokenKind::LBracket),
+            '[' => self.open('[', TokenKind::LBracket),
             ']' => self.close(TokenKind::RBracket),
-            '{' => self.add_token(TokenKind::LBrace),
-            '}' => self.add_token(TokenKind::RBrace),
+            '{' => self.open('{', TokenKind::LBrace),
+            '}' => self.close(TokenKind::RBrace),
             ',' => self.add_token(TokenKind::Comma),
             '.' => self.add_token(TokenKind::Dot),
 
@@ -146,7 +146,8 @@ impl Scanner {
     }
 
     fn newline(&mut self) {
-        if self.depth == 0 && !self.next_line_continues() {
+        let in_group = matches!(self.open.last(), Some('(' | '['));
+        if !in_group && !self.next_line_continues() {
             self.add_token(TokenKind::Newline);
         }
         self.line += 1;
@@ -163,13 +164,13 @@ impl Scanner {
         )
     }
 
-    fn open(&mut self, kind: TokenKind) {
-        self.depth += 1;
+    fn open(&mut self, delimiter: char, kind: TokenKind) {
+        self.open.push(delimiter);
         self.add_token(kind);
     }
 
     fn close(&mut self, kind: TokenKind) {
-        self.depth = self.depth.saturating_sub(1);
+        self.open.pop();
         self.add_token(kind);
     }
 
@@ -544,6 +545,23 @@ mod tests {
                 TokenKind::Comma,
                 TokenKind::Int(2),
                 TokenKind::RBracket,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_brace_inside_parens_keeps_its_newlines() {
+        assert_eq!(
+            kinds("f({\n1\n})"),
+            vec![
+                ident("f"),
+                TokenKind::LParen,
+                TokenKind::LBrace,
+                TokenKind::Newline,
+                TokenKind::Int(1),
+                TokenKind::Newline,
+                TokenKind::RBrace,
+                TokenKind::RParen,
             ]
         );
     }

@@ -35,6 +35,7 @@ pub enum Expr {
     Binary(Box<Expr>, BinaryOp, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     Field(Box<Expr>, String),
+    Block(Vec<Stmt>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +100,13 @@ impl fmt::Display for Expr {
             Expr::Unary(op, e) => write!(f, "({op} {e})"),
             Expr::Binary(l, op, r) => write!(f, "({op} {l} {r})"),
             Expr::Field(e, name) => write!(f, "(. {e} {name})"),
+            Expr::Block(stmts, tail) => {
+                f.write_str("(block")?;
+                for stmt in stmts {
+                    write!(f, " {stmt}")?;
+                }
+                write!(f, " {tail})")
+            }
             Expr::Call(callee, args) => {
                 write!(f, "(call {callee}")?;
                 for arg in args {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
 use crate::value::Value;
@@ -9,9 +9,17 @@ pub struct RuntimeError {
     pub line: Option<usize>,
 }
 
+struct Binding {
+    name: String,
+    value: Value,
+    next: Env,
+}
+
+type Env = Option<Rc<Binding>>;
+
 #[derive(Default)]
 pub struct Interpreter {
-    globals: HashMap<String, Value>,
+    env: Env,
 }
 
 impl Interpreter {
@@ -30,7 +38,7 @@ impl Interpreter {
         match kind {
             StmtKind::Let(name, value) => {
                 let value = self.evaluate(value)?;
-                self.globals.insert(name.clone(), value);
+                self.bind(name.clone(), value);
                 Ok(None)
             }
             StmtKind::Expr(expr) => self.evaluate(expr).map(Some),
@@ -45,10 +53,10 @@ impl Interpreter {
             Expr::Str(v) => Ok(Value::Str(v.clone())),
             Expr::Symbol(v) => Ok(Value::Symbol(v.clone())),
             Expr::Ident(name) => self
-                .globals
-                .get(name)
+                .lookup(name)
                 .cloned()
                 .ok_or_else(|| error(format!("undefined variable `{name}`"))),
+            Expr::Block(stmts, tail) => self.block(stmts, tail),
             Expr::Unary(op, right) => self.unary(*op, right),
             Expr::Binary(left, BinaryOp::And, right) => self.and(left, right),
             Expr::Binary(left, BinaryOp::Or, right) => self.or(left, right),
@@ -56,6 +64,36 @@ impl Interpreter {
             Expr::Call(..) => Err(error("function calls are not supported yet")),
             Expr::Field(..) => Err(error("field access is not supported yet")),
         }
+    }
+
+    fn block(&mut self, stmts: &[Stmt], tail: &Expr) -> Result<Value, RuntimeError> {
+        let outer = self.env.clone();
+        let result = self.run_block(stmts, tail);
+        self.env = outer;
+        result
+    }
+
+    fn run_block(&mut self, stmts: &[Stmt], tail: &Expr) -> Result<Value, RuntimeError> {
+        for stmt in stmts {
+            self.execute(stmt)?;
+        }
+        self.evaluate(tail)
+    }
+
+    fn bind(&mut self, name: String, value: Value) {
+        let next = self.env.take();
+        self.env = Some(Rc::new(Binding { name, value, next }));
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Value> {
+        let mut node = self.env.as_deref();
+        while let Some(binding) = node {
+            if binding.name == name {
+                return Some(&binding.value);
+            }
+            node = binding.next.as_deref();
+        }
+        None
     }
 
     fn unary(&mut self, op: UnaryOp, right: &Expr) -> Result<Value, RuntimeError> {
@@ -385,5 +423,88 @@ mod tests {
         interpreter.execute(&stmts[0]).unwrap();
         let error = interpreter.execute(&stmts[1]).unwrap_err();
         assert_eq!(error.line, Some(3));
+    }
+
+    #[test]
+    fn a_block_evaluates_to_its_last_expression() {
+        assert_eq!(
+            session(&["{\n  let w = 4\n  let h = 5\n  w * h\n}"]),
+            vec![Ok(Some("20".into()))]
+        );
+    }
+
+    #[test]
+    fn names_bound_in_a_block_do_not_leak() {
+        assert_eq!(
+            session(&["let area = {\n  let w = 4\n  w * 5\n}", "area", "w"]),
+            vec![
+                Ok(None),
+                Ok(Some("20".into())),
+                Err("undefined variable `w`".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_block_reads_the_outer_scope() {
+        assert_eq!(
+            session(&["let x = 10", "{ x + 1 }"]),
+            vec![Ok(None), Ok(Some("11".into()))]
+        );
+    }
+
+    #[test]
+    fn shadowing_inside_a_block_does_not_touch_the_outside() {
+        assert_eq!(
+            session(&["let x = 1", "let y = {\n  let x = 10\n  x + 1\n}", "y", "x"]),
+            vec![
+                Ok(None),
+                Ok(None),
+                Ok(Some("11".into())),
+                Ok(Some("1".into()))
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_blocks_see_every_enclosing_scope() {
+        assert_eq!(
+            session(&["let a = 1", "{\n  let b = 2\n  { a + b }\n}"]),
+            vec![Ok(None), Ok(Some("3".into()))]
+        );
+    }
+
+    #[test]
+    fn a_failing_block_still_restores_the_outer_scope() {
+        assert_eq!(
+            session(&["let x = 1", "{\n  let x = 2\n  x / 0\n}", "x"]),
+            vec![
+                Ok(None),
+                Err("division by zero".into()),
+                Ok(Some("1".into()))
+            ]
+        );
+    }
+
+    fn runtime_error_line(source: &str) -> Option<usize> {
+        let tokens = scan_tokens(source).unwrap();
+        let stmts = parse(tokens).unwrap();
+        Interpreter::new().execute(&stmts[0]).unwrap_err().line
+    }
+
+    #[test]
+    fn a_failing_statement_inside_a_block_reports_its_own_line() {
+        assert_eq!(
+            runtime_error_line("let y = {\n  let x = 1 / 0\n  x\n}"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_failing_tail_expression_reports_the_line_of_the_enclosing_statement() {
+        assert_eq!(
+            runtime_error_line("let y = {\n  let x = 1\n  x / 0\n}"),
+            Some(1)
+        );
     }
 }
