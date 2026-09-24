@@ -43,11 +43,16 @@ pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    blocks: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, current: 0 }
+        Self {
+            tokens,
+            current: 0,
+            blocks: 0,
+        }
     }
 
     fn statement_line(&mut self) -> Result<Stmt, ParseError> {
@@ -59,9 +64,17 @@ impl Parser {
     }
 
     fn synchronize(&mut self) {
-        while !self.is_at_end() && self.peek() != &TokenKind::Newline {
+        let mut depth = self.blocks;
+        while !self.is_at_end() {
+            match self.peek() {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth = depth.saturating_sub(1),
+                TokenKind::Newline if depth == 0 => break,
+                _ => {}
+            }
             self.advance();
         }
+        self.blocks = 0;
     }
 
     fn skip_newlines(&mut self) {
@@ -213,6 +226,45 @@ impl Parser {
         Ok(expr)
     }
 
+    fn block(&mut self) -> Result<Expr, ParseError> {
+        let open_line = self.advance().line;
+        self.blocks += 1;
+        let mut stmts = Vec::new();
+
+        loop {
+            self.skip_newlines();
+            if self.matches(&[TokenKind::RBrace]) {
+                break;
+            }
+            if self.is_at_end() {
+                return Err(self.error("expected `}` to close the block"));
+            }
+            stmts.push(self.statement()?);
+            if self.is_at_end() {
+                return Err(self.error("expected `}` to close the block"));
+            }
+            if !self.matches(&[TokenKind::Newline]) && self.peek() != &TokenKind::RBrace {
+                return Err(self.error("expected a new line or `}` after the statement"));
+            }
+        }
+
+        self.blocks -= 1;
+        match stmts.pop() {
+            Some(Stmt {
+                kind: StmtKind::Expr(tail),
+                ..
+            }) => Ok(Expr::Block(stmts, Box::new(tail))),
+            Some(stmt) => Err(ParseError {
+                message: "a block must end with an expression".to_string(),
+                line: stmt.line,
+            }),
+            None => Err(ParseError {
+                message: "an empty block has no value".to_string(),
+                line: open_line,
+            }),
+        }
+    }
+
     fn arguments(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         if self.peek() != &TokenKind::RParen {
@@ -242,6 +294,7 @@ impl Parser {
                 self.expect(TokenKind::RParen, "`)` to close the group")?;
                 return Ok(inner);
             }
+            TokenKind::LBrace => return self.block(),
             TokenKind::Eof | TokenKind::Newline => return Err(self.error("expected an expression")),
             other => return Err(self.error(format!("`{other:?}` is not an expression"))),
         };
@@ -614,5 +667,67 @@ mod tests {
             .map(|e| e.line)
             .collect();
         assert_eq!(lines, vec![2, 4]);
+    }
+
+    #[test]
+    fn parses_a_block_on_one_line() {
+        assert_eq!(stmt("{ 1 + 2 }"), "(block (+ 1 2))");
+    }
+
+    #[test]
+    fn parses_a_block_over_several_lines() {
+        assert_eq!(
+            stmt("let area = {\n  let w = 4\n  let h = 5\n  w * h\n}"),
+            "(let area (block (let w 4) (let h 5) (* w h)))"
+        );
+    }
+
+    #[test]
+    fn blocks_nest() {
+        assert_eq!(
+            stmt("{\n  let a = { 1 }\n  { a + 1 }\n}"),
+            "(block (let a (block 1)) (block (+ a 1)))"
+        );
+    }
+
+    #[test]
+    fn a_block_is_an_expression() {
+        assert_eq!(stmt("{ 1 } + { 2 }"), "(+ (block 1) (block 2))");
+        assert_eq!(stmt("f({\n  1\n})"), "(call f (block 1))");
+    }
+
+    #[test]
+    fn a_block_must_end_with_an_expression() {
+        assert_eq!(
+            stmt_error("{\n  let a = 1\n}"),
+            "a block must end with an expression"
+        );
+        assert_eq!(stmt_error("{ }"), "an empty block has no value");
+    }
+
+    #[test]
+    fn reports_an_unclosed_block() {
+        assert_eq!(
+            stmt_error("{\n  1"),
+            "expected `}` to close the block, at end of input"
+        );
+    }
+
+    #[test]
+    fn an_error_inside_a_block_skips_the_rest_of_the_block() {
+        assert_eq!(
+            program_errors("let a = {\n  let 1 = 2\n  3\n}\nlet 2 = b"),
+            vec![
+                "expected a name after `let`, found `1`",
+                "expected a name after `let`, found `2`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_block_error_reports_the_line_inside_the_block() {
+        let tokens = scan_tokens("let a = {\n  let 1 = 2\n  3\n}").unwrap();
+        let errors = super::parse(tokens).unwrap_err();
+        assert_eq!(errors[0].line, 2);
     }
 }
