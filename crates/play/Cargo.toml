@@ -1,8 +1,8 @@
 [package]
-name = "ludo"
+name = "ludo-play"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 ludo-core = { path = "../core" }
-ludo-play = { path = "../play" }
+macroquad = "0.4"

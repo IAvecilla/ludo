@@ -1,0 +1,13 @@
+World :: struct { x: Float, y: Float }
+
+init :: () -> World { World { x: 320.0, y: 240.0 } }
+
+update :: (w: World, input: Input, dt: Float) -> World {
+    let speed = 200.0 * dt
+    let x = if held(input, :left) { w.x - speed } else if held(input, :right) { w.x + speed } else { w.x }
+    World { w | x: x }
+}
+
+draw :: (w: World) -> List[Shape] {
+    [Rect { x: w.x, y: w.y, w: 20.0, h: 20.0, color: :yellow }]
+}
