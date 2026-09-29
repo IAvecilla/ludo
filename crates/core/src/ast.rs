@@ -36,8 +36,9 @@ pub enum Expr {
     Binary(Box<Expr>, BinaryOp, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     Field(Box<Expr>, String),
-    Block(Vec<Stmt>, Box<Expr>),
+    Block(Vec<Stmt>, Box<Expr>, usize),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    List(Vec<Expr>),
     Struct {
         name: String,
         base: Option<Box<Expr>>,
@@ -80,7 +81,7 @@ pub struct SeqDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepKind {
-    Stmt(StmtKind),
+    Stmt(Stmt),
     Set(String, String, Expr),
     Over {
         duration: Expr,
@@ -101,6 +102,7 @@ pub enum StmtKind {
     Fn(Rc<FnDecl>),
     Struct(Rc<StructDecl>),
     Sequence(Rc<SeqDecl>),
+    Start(String, Vec<Expr>),
     Expr(Expr),
 }
 
@@ -123,6 +125,7 @@ impl fmt::Display for StmtKind {
             StmtKind::Fn(decl) => write!(f, "{decl}"),
             StmtKind::Struct(decl) => write!(f, "{decl}"),
             StmtKind::Sequence(decl) => write!(f, "{decl}"),
+            StmtKind::Start(name, args) => write!(f, "(start {name}{})", spaced(args)),
             StmtKind::Expr(expr) => write!(f, "{expr}"),
         }
     }
@@ -136,30 +139,31 @@ impl fmt::Display for StructDecl {
 
 impl fmt::Display for SeqDecl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(sequence {} ({})", self.name, params(&self.params))?;
-        for step in &self.body {
-            write!(f, " {step}")?;
-        }
-        f.write_str(")")
+        write!(
+            f,
+            "(sequence {} ({}){})",
+            self.name,
+            params(&self.params),
+            spaced(&self.body)
+        )
     }
 }
 
 impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            StepKind::Stmt(kind) => write!(f, "{kind}"),
+            StepKind::Stmt(stmt) => write!(f, "{stmt}"),
             StepKind::Set(target, field, value) => write!(f, "(set {target}.{field} {value})"),
             StepKind::Over {
                 duration,
                 var,
                 body,
-            } => {
-                write!(f, "(over {duration} {}", var.as_deref().unwrap_or("_"))?;
-                for step in body {
-                    write!(f, " {step}")?;
-                }
-                f.write_str(")")
-            }
+            } => write!(
+                f,
+                "(over {duration} {}{})",
+                var.as_deref().unwrap_or("_"),
+                spaced(body)
+            ),
         }
     }
 }
@@ -170,6 +174,10 @@ fn params(params: &[Param]) -> String {
         .map(|p| format!("{}: {}", p.name, p.ty))
         .collect();
     params.join(", ")
+}
+
+fn spaced(items: &[impl fmt::Display]) -> String {
+    items.iter().map(|item| format!(" {item}")).collect()
 }
 
 impl fmt::Display for TypeExpr {
@@ -200,7 +208,7 @@ impl fmt::Display for UnaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             UnaryOp::Neg => "-",
-            UnaryOp::Not => "not",
+            UnaryOp::Not => "!",
         })
     }
 }
@@ -238,13 +246,8 @@ impl fmt::Display for Expr {
             Expr::Binary(l, op, r) => write!(f, "({op} {l} {r})"),
             Expr::Field(e, name) => write!(f, "(. {e} {name})"),
             Expr::If(cond, then, otherwise) => write!(f, "(if {cond} {then} {otherwise})"),
-            Expr::Block(stmts, tail) => {
-                f.write_str("(block")?;
-                for stmt in stmts {
-                    write!(f, " {stmt}")?;
-                }
-                write!(f, " {tail})")
-            }
+            Expr::Block(statements, tail, _) => write!(f, "(block{} {tail})", spaced(statements)),
+            Expr::List(items) => write!(f, "(list{})", spaced(items)),
             Expr::Struct { name, base, fields } => {
                 write!(f, "({name}")?;
                 if let Some(base) = base {
@@ -255,13 +258,7 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(")")
             }
-            Expr::Call(callee, args) => {
-                write!(f, "(call {callee}")?;
-                for arg in args {
-                    write!(f, " {arg}")?;
-                }
-                f.write_str(")")
-            }
+            Expr::Call(callee, args) => write!(f, "(call {callee}{})", spaced(args)),
         }
     }
 }

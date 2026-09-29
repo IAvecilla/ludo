@@ -1,7 +1,7 @@
 CARGO ?= cargo
 FILE  ?=
 
-.PHONY: help build check test run repl fmt fmt-check lint ci clean
+.PHONY: help build check test run play install repl fmt fmt-check lint ci clean
 
 build:
 	$(CARGO) build
@@ -13,7 +13,13 @@ test:
 	$(CARGO) test
 
 run:
-	@$(CARGO) run -q -p ludo -- $(FILE)
+	@$(CARGO) run -q -p ludo -- run $(FILE)
+
+play:
+	@$(CARGO) run -q -p ludo -- play $(FILE)
+
+install:
+	$(CARGO) install --path crates/cli
 
 fmt:
 	$(CARGO) fmt --all

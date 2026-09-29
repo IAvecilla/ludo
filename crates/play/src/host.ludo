@@ -1,0 +1,31 @@
+Config :: struct { width: Int, height: Int, title: String }
+
+Input :: struct {
+    held: List[Symbol],
+    pressed: List[Symbol],
+    up: Bool, down: Bool, left: Bool, right: Bool,
+    w: Bool, a: Bool, s: Bool, d: Bool, space: Bool,
+}
+
+held :: (input: Input, key: Symbol) -> Bool {
+    input.held |> contains(key)
+}
+
+pressed :: (input: Input, key: Symbol) -> Bool {
+    input.pressed |> contains(key)
+}
+
+Color :: struct { r: Int, g: Int, b: Int, a: Int }
+
+rgb :: (r: Int, g: Int, b: Int) -> Color {
+    Color { r: r, g: g, b: b, a: 255 }
+}
+
+rgba :: (r: Int, g: Int, b: Int, a: Int) -> Color {
+    Color { r: r, g: g, b: b, a: a }
+}
+
+Rect :: struct { x: Float, y: Float, w: Float, h: Float, color: Color }
+Circle :: struct { x: Float, y: Float, r: Float, color: Color }
+Line :: struct { x1: Float, y1: Float, x2: Float, y2: Float, thickness: Float, color: Color }
+Text :: struct { x: Float, y: Float, size: Float, text: String, color: Color }

@@ -2,6 +2,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::FnDecl;
+use crate::interpreter::{Interpreter, RuntimeError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -13,6 +14,7 @@ pub enum Value {
     Function(Rc<FnDecl>),
     Native(Native),
     Struct(Rc<Instance>),
+    List(Rc<Vec<Value>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,7 +33,7 @@ impl Instance {
 pub struct Native {
     pub name: &'static str,
     pub arity: usize,
-    pub fun: fn(&[Value]) -> Result<Value, String>,
+    pub fun: fn(&mut Interpreter, &[Value]) -> Result<Value, RuntimeError>,
 }
 
 impl PartialEq for Native {
@@ -50,6 +52,7 @@ impl Value {
             Value::Symbol(_) => "Symbol",
             Value::Function(_) | Value::Native(_) => "Function",
             Value::Struct(instance) => &instance.name,
+            Value::List(_) => "List",
         }
     }
 
@@ -75,10 +78,8 @@ impl fmt::Display for Value {
                 write!(f, "{} {{", instance.name)?;
                 for (i, (field, value)) in instance.fields.iter().enumerate() {
                     let sep = if i == 0 { " " } else { ", " };
-                    match value {
-                        Value::Str(v) => write!(f, "{sep}{field}: {v:?}")?,
-                        v => write!(f, "{sep}{field}: {v}")?,
-                    }
+                    write!(f, "{sep}{field}: ")?;
+                    nested(f, value)?;
                 }
                 if instance.fields.is_empty() {
                     f.write_str("}")
@@ -86,6 +87,23 @@ impl fmt::Display for Value {
                     f.write_str(" }")
                 }
             }
+            Value::List(items) => {
+                f.write_str("[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    nested(f, item)?;
+                }
+                f.write_str("]")
+            }
         }
+    }
+}
+
+fn nested(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
+    match value {
+        Value::Str(v) => write!(f, "{v:?}"),
+        v => write!(f, "{v}"),
     }
 }

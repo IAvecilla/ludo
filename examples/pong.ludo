@@ -1,0 +1,145 @@
+Paddle :: struct { y: Float, score: Int }
+Ball :: struct { x: Float, y: Float, vx: Float, vy: Float }
+World :: struct { left: Paddle, right: Paddle, ball: Ball, serving: Bool, pop: Float }
+
+let width = 640.0
+let height = 480.0
+let margin = 30.0
+let paddle_w = 10.0
+let paddle_h = 80.0
+let player_speed = 360.0
+let cpu_speed = 200.0
+let ball_r = 7.0
+let ball_speed = 320.0
+let max_speed = 700.0
+
+print("This is a game file to play pong")
+
+config :: () -> Config {
+    Config { width: to_int(width), height: to_int(height), title: "Pong" }
+}
+
+init :: () -> World {
+    let w = World {
+        left: Paddle { y: height / 2.0, score: 0 },
+        right: Paddle { y: height / 2.0, score: 0 },
+        ball: centered(),
+        serving: true,
+        pop: 0.0,
+    }
+    start serve(w, -1.0)
+    w
+}
+
+centered :: () -> Ball {
+    Ball { x: width / 2.0, y: height / 2.0, vx: 0.0, vy: 0.0 }
+}
+
+serve :: sequence (w: World, dir: Float) {
+    w.pop = 0.0
+    wait 0.6s
+    over 0.4s as t {
+        w.pop = t
+    }
+    let up = (w.left.score + w.right.score) % 2 == 0
+    let vy = if up { -0.4 } else { 0.4 }
+    w.ball = Ball { w.ball | vx: ball_speed * dir, vy: ball_speed * vy }
+    w.serving = false
+}
+
+update :: (w: World, input: Input, dt: Float) -> World {
+    let dy = axis(input.w or input.up, input.s or input.down) * player_speed * dt
+    let left = Paddle { w.left | y: move_paddle(w.left.y, dy) }
+    let right = Paddle { w.right | y: move_paddle(w.right.y, follow(w.right.y, w.ball.y, cpu_speed * dt)) }
+    let w = World { w | left: left, right: right }
+    if w.serving { w } else { play(w, dt) }
+}
+
+axis :: (negative: Bool, positive: Bool) -> Float {
+    if negative and !positive {
+        -1.0
+    } else if positive and !negative {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+move_paddle :: (y: Float, dy: Float) -> Float {
+    clamp(y + dy, paddle_h / 2.0, height - paddle_h / 2.0)
+}
+
+follow :: (from: Float, to: Float, step: Float) -> Float {
+    clamp(to - from, -step, step)
+}
+
+play :: (w: World, dt: Float) -> World {
+    let b = w.ball
+    let b = Ball { b | x: b.x + b.vx * dt, y: b.y + b.vy * dt }
+    let b = b
+        |> walls()
+        |> hit(w.left.y, margin, 1.0)
+        |> hit(w.right.y, width - margin, -1.0)
+    score(World { w | ball: b })
+}
+
+walls :: (b: Ball) -> Ball {
+    if b.y < ball_r {
+        Ball { b | y: ball_r, vy: abs(b.vy) }
+    } else if b.y > height - ball_r {
+        Ball { b | y: height - ball_r, vy: -abs(b.vy) }
+    } else {
+        b
+    }
+}
+
+hit :: (b: Ball, paddle_y: Float, x: Float, dir: Float) -> Ball {
+    let towards = b.vx * dir < 0.0
+    let near_x = abs(b.x - x) < ball_r + paddle_w / 2.0
+    let near_y = abs(b.y - paddle_y) < ball_r + paddle_h / 2.0
+    if towards and near_x and near_y {
+        let offset = (b.y - paddle_y) / (paddle_h / 2.0)
+        let speed = min(abs(b.vx) * 1.05, max_speed)
+        Ball { b | vx: speed * dir, vy: offset * ball_speed }
+    } else {
+        b
+    }
+}
+
+score :: (w: World) -> World {
+    if w.ball.x < 0.0 {
+        let w = World { w | right: Paddle { w.right | score: w.right.score + 1 }, ball: centered(), serving: true }
+        start serve(w, -1.0)
+        w
+    } else if w.ball.x > width {
+        let w = World { w | left: Paddle { w.left | score: w.left.score + 1 }, ball: centered(), serving: true }
+        start serve(w, 1.0)
+        w
+    } else {
+        w
+    }
+}
+
+draw :: (w: World) -> List[Shape] {
+    concat(net(), [
+        Line { x1: 0.0, y1: 2.0, x2: width, y2: 2.0, thickness: 4.0, color: rgb(60, 60, 90) },
+        Line { x1: 0.0, y1: height - 2.0, x2: width, y2: height - 2.0, thickness: 4.0, color: rgb(60, 60, 90) },
+        paddle(margin, w.left.y),
+        paddle(width - margin, w.right.y),
+        Circle { x: w.ball.x, y: w.ball.y, r: ball_r * w.pop, color: :yellow },
+        Text { x: width / 2.0 - 70.0, y: 60.0, size: 48.0, text: to_string(w.left.score), color: :white },
+        Text { x: width / 2.0 + 45.0, y: 60.0, size: 48.0, text: to_string(w.right.score), color: :white },
+    ])
+}
+
+paddle :: (x: Float, y: Float) -> Rect {
+    Rect { x: x - paddle_w / 2.0, y: y - paddle_h / 2.0, w: paddle_w, h: paddle_h, color: :white }
+}
+
+net :: () -> List[Rect] {
+    range(0, to_int(height / 32.0) + 1) |> map(dash)
+}
+
+dash :: (i: Int) -> Rect {
+    Rect { x: width / 2.0 - 2.0, y: to_float(i) * 32.0, w: 4.0, h: 16.0, color: rgb(90, 90, 120) }
+}

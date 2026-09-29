@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 ludo-core = { path = "../core" }
+ludo-play = { path = "../play" }

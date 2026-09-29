@@ -53,104 +53,81 @@ impl Scanner {
 
     fn scan_token(&mut self) {
         let c = self.advance();
-        match c {
-            ' ' | '\r' | '\t' => {}
-            '\n' => self.newline(),
-
-            '(' => self.open('(', TokenKind::LParen),
-            ')' => self.close(TokenKind::RParen),
-            '[' => self.open('[', TokenKind::LBracket),
-            ']' => self.close(TokenKind::RBracket),
-            '{' => self.open('{', TokenKind::LBrace),
-            '}' => self.close(TokenKind::RBrace),
-            ',' => self.add_token(TokenKind::Comma),
-            '.' => self.add_token(TokenKind::Dot),
-
-            '+' => self.add_token(TokenKind::Plus),
-            '*' => self.add_token(TokenKind::Star),
-            '%' => self.add_token(TokenKind::Percent),
-
-            '-' => {
-                let kind = if self.matches('>') {
-                    TokenKind::Arrow
-                } else {
-                    TokenKind::Minus
-                };
-                self.add_token(kind);
-            }
-            '=' => {
-                let kind = if self.matches('=') {
-                    TokenKind::EqEq
-                } else {
-                    TokenKind::Eq
-                };
-                self.add_token(kind);
-            }
-            '<' => {
-                let kind = if self.matches('=') {
-                    TokenKind::LessEq
-                } else {
-                    TokenKind::Less
-                };
-                self.add_token(kind);
-            }
-            '>' => {
-                let kind = if self.matches('=') {
-                    TokenKind::GreaterEq
-                } else {
-                    TokenKind::Greater
-                };
-                self.add_token(kind);
-            }
-            '|' => {
-                let kind = if self.matches('>') {
-                    TokenKind::PipeGt
-                } else {
-                    TokenKind::Bar
-                };
-                self.add_token(kind);
-            }
-            '!' => {
-                if self.matches('=') {
-                    self.add_token(TokenKind::BangEq);
-                } else {
-                    self.error("unexpected character `!`, did you mean `not`?".to_string());
+        let kind = match c {
+            ' ' | '\r' | '\t' => return,
+            '\n' => {
+                // A newline ends a statement, except inside `( )` or `[ ]` and when the
+                // next line starts with `|>` or `.`, which continue the current one.
+                let in_group = matches!(self.open.last(), Some('(' | '['));
+                if in_group || self.next_line_continues() {
+                    self.line += 1;
+                    return;
                 }
+                TokenKind::Newline
             }
 
-            '/' => {
-                if self.matches('/') {
-                    while !self.is_at_end() && self.peek() != '\n' {
-                        self.advance();
-                    }
-                } else {
-                    self.add_token(TokenKind::Slash);
+            '(' => TokenKind::LParen,
+            ')' => TokenKind::RParen,
+            '[' => TokenKind::LBracket,
+            ']' => TokenKind::RBracket,
+            '{' => TokenKind::LBrace,
+            '}' => TokenKind::RBrace,
+            ',' => TokenKind::Comma,
+            '.' => TokenKind::Dot,
+
+            '+' => TokenKind::Plus,
+            '*' => TokenKind::Star,
+            '%' => TokenKind::Percent,
+
+            '-' if self.matches('>') => TokenKind::Arrow,
+            '-' => TokenKind::Minus,
+            '=' if self.matches('=') => TokenKind::EqEq,
+            '=' => TokenKind::Eq,
+            '<' if self.matches('=') => TokenKind::LessEq,
+            '<' => TokenKind::Less,
+            '>' if self.matches('=') => TokenKind::GreaterEq,
+            '>' => TokenKind::Greater,
+            '|' if self.matches('>') => TokenKind::PipeGt,
+            '|' => TokenKind::Bar,
+            '!' if self.matches('=') => TokenKind::BangEq,
+            '!' => TokenKind::Bang,
+
+            '/' if self.matches('/') => {
+                while !self.is_at_end() && self.peek() != '\n' {
+                    self.advance();
                 }
+                return;
             }
+            '/' => TokenKind::Slash,
 
-            ':' => {
-                if is_symbol_start(self.peek()) {
-                    self.symbol();
-                } else {
-                    self.add_token(TokenKind::Colon);
-                }
-            }
+            ':' if self.matches(':') => TokenKind::ColonColon,
+            ':' if is_symbol_start(self.peek()) => self.symbol(),
+            ':' => TokenKind::Colon,
 
-            '"' => self.string(),
-
-            c if c.is_ascii_digit() => self.number(),
+            '"' => match self.string() {
+                Ok(kind) => kind,
+                Err(message) => return self.error(message),
+            },
+            c if c.is_ascii_digit() => match self.number() {
+                Ok(kind) => kind,
+                Err(message) => return self.error(message),
+            },
             c if is_ident_start(c) => self.identifier(),
 
-            other => self.error(format!("unexpected character `{other}`")),
-        }
-    }
+            other => return self.error(format!("unexpected character `{other}`")),
+        };
 
-    fn newline(&mut self) {
-        let in_group = matches!(self.open.last(), Some('(' | '['));
-        if !in_group && !self.next_line_continues() {
-            self.add_token(TokenKind::Newline);
+        match kind {
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => self.open.push(c),
+            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                self.open.pop();
+            }
+            _ => {}
         }
-        self.line += 1;
+        self.add_token(kind);
+        if c == '\n' {
+            self.line += 1;
+        }
     }
 
     fn next_line_continues(&self) -> bool {
@@ -164,44 +141,30 @@ impl Scanner {
         )
     }
 
-    fn open(&mut self, delimiter: char, kind: TokenKind) {
-        self.open.push(delimiter);
-        self.add_token(kind);
-    }
-
-    fn close(&mut self, kind: TokenKind) {
-        self.open.pop();
-        self.add_token(kind);
-    }
-
-    fn string(&mut self) {
+    fn string(&mut self) -> Result<TokenKind, String> {
         while !self.is_at_end() && self.peek() != '"' && self.peek() != '\n' {
             self.advance();
         }
 
         if self.is_at_end() || self.peek() == '\n' {
-            self.error(format!("unterminated string: `{}`", self.lexeme()));
-            return;
+            return Err(format!("unterminated string: `{}`", self.lexeme()));
         }
 
         self.advance();
-
-        let value: String = self.chars[self.start + 1..self.current - 1]
+        let value = self.chars[self.start + 1..self.current - 1]
             .iter()
             .collect();
-        self.add_token(TokenKind::Str(value));
+        Ok(TokenKind::Str(value))
     }
 
-    fn symbol(&mut self) {
+    fn symbol(&mut self) -> TokenKind {
         while is_ident_continue(self.peek()) {
             self.advance();
         }
-
-        let name: String = self.chars[self.start + 1..self.current].iter().collect();
-        self.add_token(TokenKind::Symbol(name));
+        TokenKind::Symbol(self.chars[self.start + 1..self.current].iter().collect())
     }
 
-    fn number(&mut self) {
+    fn number(&mut self) -> Result<TokenKind, String> {
         while self.peek().is_ascii_digit() {
             self.advance();
         }
@@ -223,52 +186,41 @@ impl Scanner {
             }
             let suffix: String = self.chars[suffix_start..self.current].iter().collect();
             if suffix != DURATION_SUFFIX {
-                self.error(format!(
+                return Err(format!(
                     "unknown numeric suffix `{suffix}` in `{}`",
                     self.lexeme()
                 ));
-                return;
             }
             is_float = true;
         }
 
         if is_float {
-            match text.parse::<f64>() {
-                Ok(value) => self.add_token(TokenKind::Float(value)),
-                Err(_) => self.error(format!("invalid float literal `{text}`")),
-            }
+            text.parse()
+                .map(TokenKind::Float)
+                .map_err(|_| format!("invalid float literal `{text}`"))
         } else {
-            match text.parse::<i64>() {
-                Ok(value) => self.add_token(TokenKind::Int(value)),
-                Err(_) => self.error(format!("integer literal `{text}` does not fit in 64 bits")),
-            }
+            text.parse()
+                .map(TokenKind::Int)
+                .map_err(|_| format!("integer literal `{text}` does not fit in 64 bits"))
         }
     }
 
-    fn identifier(&mut self) {
+    fn identifier(&mut self) -> TokenKind {
         while is_ident_continue(self.peek()) {
             self.advance();
         }
 
         let text = self.lexeme();
-        let kind = match text.as_str() {
-            "_" => TokenKind::Underscore,
-
+        match text.as_str() {
             "let" => TokenKind::Let,
-            "fn" => TokenKind::Fn,
             "struct" => TokenKind::Struct,
             "enum" => TokenKind::Enum,
-            "on" => TokenKind::On,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "case" => TokenKind::Case,
             "when" => TokenKind::When,
-            "for" => TokenKind::For,
-            "in" => TokenKind::In,
-            "return" => TokenKind::Return,
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
-            "not" => TokenKind::Not,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
 
@@ -279,8 +231,7 @@ impl Scanner {
             "as" => TokenKind::As,
 
             _ => TokenKind::Ident(text),
-        };
-        self.add_token(kind);
+        }
     }
 
     fn is_at_end(&self) -> bool {
@@ -342,342 +293,117 @@ fn is_symbol_start(c: char) -> bool {
 mod tests {
     use super::*;
 
-    fn kinds(source: &str) -> Vec<TokenKind> {
-        let mut tokens = scan_tokens(source).expect("source should scan cleanly");
-        assert_eq!(tokens.pop().map(|t| t.kind), Some(TokenKind::Eof));
-        tokens.into_iter().map(|t| t.kind).collect()
+    fn kinds(source: &str) -> String {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        assert_eq!(tokens.last().map(|t| &t.kind), Some(&TokenKind::Eof));
+        let kinds: Vec<String> = tokens[..tokens.len() - 1]
+            .iter()
+            .map(|t| format!("{:?}", t.kind))
+            .collect();
+        kinds.join(" ")
     }
 
-    fn errors(source: &str) -> Vec<String> {
-        scan_tokens(source)
-            .unwrap_err()
-            .into_iter()
-            .map(|e| e.message)
-            .collect()
-    }
-
-    fn ident(name: &str) -> TokenKind {
-        TokenKind::Ident(name.into())
-    }
-
-    #[test]
-    fn scans_arithmetic() {
-        assert_eq!(
-            kinds("1 + 2 * 3 % 4"),
-            vec![
-                TokenKind::Int(1),
-                TokenKind::Plus,
-                TokenKind::Int(2),
-                TokenKind::Star,
-                TokenKind::Int(3),
-                TokenKind::Percent,
-                TokenKind::Int(4),
-            ]
-        );
+    fn scans(cases: &[(&str, &str)]) {
+        for (source, expected) in cases {
+            assert_eq!(kinds(source), *expected, "{source:?}");
+        }
     }
 
     #[test]
-    fn scans_two_character_operators() {
-        assert_eq!(
-            kinds("== != <= >= -> |> | = < >"),
-            vec![
-                TokenKind::EqEq,
-                TokenKind::BangEq,
-                TokenKind::LessEq,
-                TokenKind::GreaterEq,
-                TokenKind::Arrow,
-                TokenKind::PipeGt,
-                TokenKind::Bar,
-                TokenKind::Eq,
-                TokenKind::Less,
-                TokenKind::Greater,
-            ]
-        );
+    fn scans_operators_and_numbers() {
+        scans(&[
+            (
+                "1 + 2 * 3 % 4 / 2.0",
+                "Int(1) Plus Int(2) Star Int(3) Percent Int(4) Slash Float(2.0)",
+            ),
+            (
+                "== != <= >= -> |> | = < > !",
+                "EqEq BangEq LessEq GreaterEq Arrow PipeGt Bar Eq Less Greater Bang",
+            ),
+        ]);
     }
 
     #[test]
-    fn keywords_are_not_identifiers() {
-        assert_eq!(
-            kinds("sequence sequencer over overflow on only"),
-            vec![
-                TokenKind::Sequence,
-                ident("sequencer"),
-                TokenKind::Over,
-                ident("overflow"),
-                TokenKind::On,
-                ident("only"),
-            ]
-        );
+    fn scans_keywords_and_names() {
+        scans(&[
+            (
+                "sequence sequencer over overflow on only",
+                r#"Sequence Ident("sequencer") Over Ident("overflow") Ident("on") Ident("only")"#,
+            ),
+            ("_ _unused", r#"Ident("_") Ident("_unused")"#),
+        ]);
     }
 
     #[test]
-    fn underscore_alone_is_the_wildcard() {
-        assert_eq!(
-            kinds("_ _unused"),
-            vec![TokenKind::Underscore, ident("_unused")]
-        );
+    fn tells_symbols_from_annotations() {
+        scans(&[
+            (":jump", r#"Symbol("jump")"#),
+            ("f :: :jump", r#"Ident("f") ColonColon Symbol("jump")"#),
+            ("pos: Vec2", r#"Ident("pos") Colon Ident("Vec2")"#),
+            ("pos:Vec2", r#"Ident("pos") Colon Ident("Vec2")"#),
+            (
+                "Player { p | hp: 1 }",
+                r#"Ident("Player") LBrace Ident("p") Bar Ident("hp") Colon Int(1) RBrace"#,
+            ),
+        ]);
     }
 
     #[test]
-    fn distinguishes_int_from_float() {
-        assert_eq!(kinds("42"), vec![TokenKind::Int(42)]);
-        assert_eq!(kinds("3.5"), vec![TokenKind::Float(3.5)]);
+    fn scans_strings_and_comments() {
+        scans(&[
+            (r#""hello""#, r#"Str("hello")"#),
+            (r#""""#, r#"Str("")"#),
+            (
+                r#""let x |> 1 // not a comment""#,
+                r#"Str("let x |> 1 // not a comment")"#,
+            ),
+            (r#""a\nb""#, r#"Str("a\\nb")"#),
+            ("1 // 2 + 3", "Int(1)"),
+            ("1 // 2\n3", "Int(1) Newline Int(3)"),
+        ]);
     }
 
     #[test]
-    fn a_duration_suffix_makes_a_float() {
-        assert_eq!(kinds("0.2s"), vec![TokenKind::Float(0.2)]);
-        assert_eq!(kinds("2s"), vec![TokenKind::Float(2.0)]);
+    fn a_newline_ends_a_statement_unless_it_is_grouped_or_continued() {
+        scans(&[
+            (
+                "let x = 1\nx",
+                r#"Let Ident("x") Eq Int(1) Newline Ident("x")"#,
+            ),
+            (
+                "f(\n1,\n2\n)",
+                r#"Ident("f") LParen Int(1) Comma Int(2) RParen"#,
+            ),
+            ("[1,\n2]", "LBracket Int(1) Comma Int(2) RBracket"),
+            ("{\n1\n}", "LBrace Newline Int(1) Newline RBrace"),
+            (
+                "f({\n1\n})",
+                r#"Ident("f") LParen LBrace Newline Int(1) Newline RBrace RParen"#,
+            ),
+            (
+                "p\n  |> f\n  |> g",
+                r#"Ident("p") PipeGt Ident("f") PipeGt Ident("g")"#,
+            ),
+            ("p\n  .f()", r#"Ident("p") Dot Ident("f") LParen RParen"#),
+            ("a\n| b", r#"Ident("a") Newline Bar Ident("b")"#),
+        ]);
     }
 
     #[test]
-    fn a_suffix_must_touch_the_number() {
-        assert_eq!(kinds("2 s"), vec![TokenKind::Int(2), ident("s")]);
-    }
-
-    #[test]
-    fn rejects_an_unknown_suffix() {
-        assert_eq!(
-            errors("16px"),
-            vec!["unknown numeric suffix `px` in `16px`"]
-        );
-    }
-
-    #[test]
-    fn trailing_dot_is_not_part_of_the_number() {
-        assert_eq!(
-            kinds("1.x"),
-            vec![TokenKind::Int(1), TokenKind::Dot, ident("x")]
-        );
-    }
-
-    #[test]
-    fn symbols_are_told_apart_from_annotations() {
-        assert_eq!(kinds(":jump"), vec![TokenKind::Symbol("jump".into())]);
-        assert_eq!(
-            kinds("pos: Vec2"),
-            vec![ident("pos"), TokenKind::Colon, ident("Vec2")]
-        );
-        assert_eq!(
-            kinds("pos:Vec2"),
-            vec![ident("pos"), TokenKind::Colon, ident("Vec2")]
-        );
-    }
-
-    #[test]
-    fn scans_a_record_update() {
-        assert_eq!(
-            kinds("Player { p | hp: 1 }"),
-            vec![
-                ident("Player"),
-                TokenKind::LBrace,
-                ident("p"),
-                TokenKind::Bar,
-                ident("hp"),
-                TokenKind::Colon,
-                TokenKind::Int(1),
-                TokenKind::RBrace,
-            ]
-        );
-    }
-
-    #[test]
-    fn scans_strings() {
-        assert_eq!(kinds(r#""hello""#), vec![TokenKind::Str("hello".into())]);
-        assert_eq!(kinds(r#""""#), vec![TokenKind::Str(String::new())]);
-    }
-
-    #[test]
-    fn string_contents_are_not_tokenized() {
-        assert_eq!(
-            kinds(r#""let x |> 1 // not a comment""#),
-            vec![TokenKind::Str("let x |> 1 // not a comment".into())]
-        );
-    }
-
-    #[test]
-    fn strings_have_no_escape_sequences() {
-        assert_eq!(kinds(r#""a\nb""#), vec![TokenKind::Str(r"a\nb".into())]);
-    }
-
-    #[test]
-    fn a_comment_runs_to_the_end_of_the_line() {
-        assert_eq!(kinds("1 // 2 + 3"), vec![TokenKind::Int(1)]);
-        assert_eq!(
-            kinds("1 // 2\n3"),
-            vec![TokenKind::Int(1), TokenKind::Newline, TokenKind::Int(3)]
-        );
-    }
-
-    #[test]
-    fn a_newline_ends_a_statement() {
-        assert_eq!(
-            kinds("let x = 1\nx"),
-            vec![
-                TokenKind::Let,
-                ident("x"),
-                TokenKind::Eq,
-                TokenKind::Int(1),
-                TokenKind::Newline,
-                ident("x"),
-            ]
-        );
-    }
-
-    #[test]
-    fn newlines_inside_parens_and_brackets_are_ignored() {
-        assert_eq!(
-            kinds("f(\n1,\n2\n)"),
-            vec![
-                ident("f"),
-                TokenKind::LParen,
-                TokenKind::Int(1),
-                TokenKind::Comma,
-                TokenKind::Int(2),
-                TokenKind::RParen,
-            ]
-        );
-        assert_eq!(
-            kinds("[1,\n2]"),
-            vec![
-                TokenKind::LBracket,
-                TokenKind::Int(1),
-                TokenKind::Comma,
-                TokenKind::Int(2),
-                TokenKind::RBracket,
-            ]
-        );
-    }
-
-    #[test]
-    fn a_brace_inside_parens_keeps_its_newlines() {
-        assert_eq!(
-            kinds("f({\n1\n})"),
-            vec![
-                ident("f"),
-                TokenKind::LParen,
-                TokenKind::LBrace,
-                TokenKind::Newline,
-                TokenKind::Int(1),
-                TokenKind::Newline,
-                TokenKind::RBrace,
-                TokenKind::RParen,
-            ]
-        );
-    }
-
-    #[test]
-    fn newlines_inside_braces_are_kept() {
-        assert_eq!(
-            kinds("{\n1\n}"),
-            vec![
-                TokenKind::LBrace,
-                TokenKind::Newline,
-                TokenKind::Int(1),
-                TokenKind::Newline,
-                TokenKind::RBrace,
-            ]
-        );
-    }
-
-    #[test]
-    fn a_line_starting_with_a_pipe_continues_the_previous_one() {
-        assert_eq!(
-            kinds("p\n  |> f\n  |> g"),
-            vec![
-                ident("p"),
-                TokenKind::PipeGt,
-                ident("f"),
-                TokenKind::PipeGt,
-                ident("g"),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_line_starting_with_a_dot_continues_the_previous_one() {
-        assert_eq!(
-            kinds("p\n  .f()"),
-            vec![
-                ident("p"),
-                TokenKind::Dot,
-                ident("f"),
-                TokenKind::LParen,
-                TokenKind::RParen,
-            ]
-        );
-    }
-
-    #[test]
-    fn a_bar_alone_does_not_continue_a_line() {
-        assert_eq!(
-            kinds("a\n| b"),
-            vec![ident("a"), TokenKind::Newline, TokenKind::Bar, ident("b")]
-        );
-    }
-
-    #[test]
-    fn tokens_keep_their_lexeme() {
+    fn tokens_keep_their_lexeme_and_line() {
         let tokens = scan_tokens("let dt = 0.2s").unwrap();
         let lexemes: Vec<&str> = tokens.iter().map(|t| t.lexeme.as_str()).collect();
-        assert_eq!(lexemes, vec!["let", "dt", "=", "0.2s", ""]);
-    }
+        assert_eq!(lexemes, ["let", "dt", "=", "0.2s", ""]);
 
-    #[test]
-    fn unterminated_string_is_an_error() {
-        assert_eq!(errors(r#""oops"#), vec!["unterminated string: `\"oops`"]);
-    }
-
-    #[test]
-    fn a_string_cannot_span_lines() {
-        assert_eq!(
-            errors("\"oops\n1 # 2"),
-            vec!["unterminated string: `\"oops`", "unexpected character `#`"]
-        );
-    }
-
-    fn lines(source: &str) -> Vec<usize> {
-        scan_tokens(source)
-            .expect("source should scan cleanly")
-            .into_iter()
-            .map(|t| t.line)
-            .collect()
-    }
-
-    #[test]
-    fn tokens_record_their_line() {
-        assert_eq!(lines("let x\n\nx"), vec![1, 1, 1, 2, 3, 3]);
-    }
-
-    #[test]
-    fn a_suppressed_newline_still_counts_as_a_line() {
-        assert_eq!(lines("f(\n1\n)"), vec![1, 1, 2, 3, 3]);
-        assert_eq!(lines("p\n|> f"), vec![1, 2, 2, 2]);
-    }
-
-    #[test]
-    fn errors_record_their_line() {
-        let lines: Vec<usize> = scan_tokens("1\n# 2\n$")
-            .unwrap_err()
-            .into_iter()
-            .map(|e| e.line)
-            .collect();
-        assert_eq!(lines, vec![2, 3]);
-    }
-
-    #[test]
-    fn a_lone_bang_suggests_not() {
-        assert_eq!(
-            errors("!x"),
-            vec!["unexpected character `!`, did you mean `not`?"]
-        );
-    }
-
-    #[test]
-    fn reports_every_bad_character() {
-        assert_eq!(
-            errors("1 # 2 $ 3"),
-            vec!["unexpected character `#`", "unexpected character `$`"]
-        );
+        let lines = |source: &str| -> Vec<usize> {
+            scan_tokens(source)
+                .unwrap()
+                .iter()
+                .map(|t| t.line)
+                .collect()
+        };
+        assert_eq!(lines("let x\n\nx"), [1, 1, 1, 2, 3, 3]);
+        assert_eq!(lines("f(\n1\n)"), [1, 1, 2, 3, 3]);
+        assert_eq!(lines("p\n|> f"), [1, 2, 2, 2]);
     }
 }

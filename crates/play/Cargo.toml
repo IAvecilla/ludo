@@ -1,0 +1,8 @@
+[package]
+name = "ludo-play"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ludo-core = { path = "../core" }
+macroquad = "0.4"
