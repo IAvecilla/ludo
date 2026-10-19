@@ -1,9 +1,11 @@
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
+use ludo_core::compiler::compile;
 use ludo_core::interpreter::Interpreter;
 use ludo_core::parser::{parse, ParseError};
 use ludo_core::scanner::scan_tokens;
+use ludo_core::vm::Vm;
 use ludo_play::Game;
 
 const EX_USAGE: u8 = 64;
@@ -27,10 +29,12 @@ fn main() -> ExitCode {
         }
         ["run", path] => read(path).map_or_else(|code| code, |source| run_file(&source)),
         ["play", path] => read(path).map_or_else(|code| code, |source| play(path, &source)),
+        ["dis", path] => read(path).map_or_else(|code| code, |source| disassemble(&source)),
         _ => {
             eprintln!("usage: ludo              start the REPL");
             eprintln!("       ludo run FILE     run a program");
             eprintln!("       ludo play FILE    play a game file in a window");
+            eprintln!("       ludo dis FILE     compile to bytecode and trace it on the VM");
             ExitCode::from(EX_USAGE)
         }
     }
@@ -64,6 +68,49 @@ fn play(path: &str, source: &str) -> ExitCode {
             ExitCode::from(EX_DATAERR)
         }
     }
+}
+
+fn disassemble(source: &str) -> ExitCode {
+    let statements = match scan_tokens(source) {
+        Ok(tokens) => match parse(tokens) {
+            Ok(statements) => statements,
+            Err(errors) => {
+                report(&errors, true);
+                return ExitCode::from(EX_DATAERR);
+            }
+        },
+        Err(errors) => {
+            for error in &errors {
+                eprintln!("[line {}] Scanning Error: {}", error.line, error.message);
+            }
+            return ExitCode::from(EX_DATAERR);
+        }
+    };
+
+    let mut vm = Vm::new();
+    vm.trace = true;
+    for stmt in &statements {
+        let chunk = match compile(stmt) {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(EX_DATAERR);
+            }
+        };
+        println!("== {stmt} ==\n{chunk}");
+        match vm.run(&chunk) {
+            Ok(value) => println!("=> {value}\n"),
+            Err(error) => {
+                let line = error
+                    .line
+                    .map(|l| format!("[line {l}] "))
+                    .unwrap_or_default();
+                eprintln!("{line}Runtime Error: {}", error.message);
+                return ExitCode::from(EX_SOFTWARE);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn run_repl() {

@@ -145,7 +145,10 @@ impl Interpreter {
                     other.type_name()
                 ))),
             },
-            Expr::Unary(op, right) => self.unary(*op, right),
+            Expr::Unary(op, right) => {
+                let right = self.evaluate(right)?;
+                unary(*op, right)
+            }
             Expr::Binary(left, op @ (BinaryOp::And | BinaryOp::Or), right) => {
                 let stop = *op == BinaryOp::Or;
                 if self.boolean(left, *op)? == stop {
@@ -301,25 +304,6 @@ impl Interpreter {
             .or_else(|| self.globals.get(name))
     }
 
-    fn unary(&mut self, op: UnaryOp, right: &Expr) -> Result<Value, RuntimeError> {
-        match (op, self.evaluate(right)?) {
-            (UnaryOp::Neg, Value::Int(v)) => v
-                .checked_neg()
-                .map(Value::Int)
-                .ok_or_else(|| error("integer overflow in `-`")),
-            (UnaryOp::Neg, Value::Float(v)) => Ok(Value::Float(-v)),
-            (UnaryOp::Not, Value::Bool(v)) => Ok(Value::Bool(!v)),
-            (UnaryOp::Neg, v) => Err(error(format!(
-                "operand of `-` must be an Int or a Float, got {}",
-                v.type_name()
-            ))),
-            (UnaryOp::Not, v) => Err(error(format!(
-                "operand of `!` must be a Bool, got {}",
-                v.type_name()
-            ))),
-        }
-    }
-
     fn boolean(&mut self, expr: &Expr, op: BinaryOp) -> Result<bool, RuntimeError> {
         match self.evaluate(expr)? {
             Value::Bool(v) => Ok(v),
@@ -331,7 +315,26 @@ impl Interpreter {
     }
 }
 
-fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError> {
+pub(crate) fn unary(op: UnaryOp, right: Value) -> Result<Value, RuntimeError> {
+    match (op, right) {
+        (UnaryOp::Neg, Value::Int(v)) => v
+            .checked_neg()
+            .map(Value::Int)
+            .ok_or_else(|| error("integer overflow in `-`")),
+        (UnaryOp::Neg, Value::Float(v)) => Ok(Value::Float(-v)),
+        (UnaryOp::Not, Value::Bool(v)) => Ok(Value::Bool(!v)),
+        (UnaryOp::Neg, v) => Err(error(format!(
+            "operand of `-` must be an Int or a Float, got {}",
+            v.type_name()
+        ))),
+        (UnaryOp::Not, v) => Err(error(format!(
+            "operand of `!` must be a Bool, got {}",
+            v.type_name()
+        ))),
+    }
+}
+
+pub(crate) fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     use Value::{Bool, Float, Int, Str};
 
