@@ -91,7 +91,13 @@ again.
 ludo                    # start the REPL
 ludo run <file>         # run a program
 ludo play <file>        # play a game in a window
+ludo dis <file>         # show the bytecode of a program and trace it
 ```
+
+Programs compile to bytecode and run on a virtual machine. `ludo --interpreter`
+and `ludo run --interpreter <file>` run them on the tree-walking interpreter
+instead, to compare, and `ludo --trace` starts a REPL that shows the bytecode of
+each input and traces it as it runs.
 
 ### REPL mode
 
