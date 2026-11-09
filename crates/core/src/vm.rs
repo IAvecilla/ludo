@@ -4,10 +4,10 @@ use std::rc::Rc;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::chunk::{Function, Op, Shape, Test};
 use crate::interpreter::{
-    binary, check_arity, condition, enum_hint, error, field, logical, matches, no_match, passes,
-    unary, with_field, RuntimeError, MAX_CALL_DEPTH,
+    binary, check_arity, condition, contents, enum_hint, error, field, logical, matches, no_match,
+    passes, unary, with_field, RuntimeError, MAX_CALL_DEPTH,
 };
-use crate::prelude::NATIVES;
+use crate::prelude::{constants, NATIVES};
 use crate::value::{Caller, Instance, Value};
 
 /// A call in progress: the function, the next instruction it runs and where
@@ -79,10 +79,13 @@ impl Default for Vm {
 
 impl Vm {
     pub fn new() -> Self {
-        let globals = NATIVES
+        let natives = NATIVES
             .iter()
-            .map(|native| (native.name.to_string(), Value::Native(*native)))
-            .collect();
+            .map(|native| (native.name.to_string(), Value::Native(*native)));
+        let constants = constants()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value));
+        let globals = natives.chain(constants).collect();
         Vm {
             stack: Vec::new(),
             frames: Vec::new(),
@@ -378,6 +381,15 @@ impl Vm {
                     Ok(())
                 }
                 Op::NoMatch => Err(no_match(self.peek())),
+                Op::MatchVariant(variant) => {
+                    let value = self.pop();
+                    let matched = contents(variant, &value);
+                    if let Some(Some(held)) = &matched {
+                        self.push(held.clone());
+                    }
+                    self.push(Value::Bool(matched.is_some()));
+                    Ok(())
+                }
                 Op::GetField(index) => {
                     let target = self.pop();
                     field(&target, chunk.name(index)).map(|value| self.push(value))
@@ -1304,6 +1316,72 @@ mod tests {
             (
                 "State :: enum { :idle }\nState",
                 "[line 2] error: `State` is an enum, not a value: its values are its symbols, like `:idle`",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn builds_and_compares_options_and_results() {
+        runs(&[
+            (
+                "Some(1)\nNone\nOk(\"yes\")\nError(:nope)\n[Some(1), None]\nSome(Some(2))",
+                "Some(1)\nNone\nOk(\"yes\")\nError(:nope)\n[Some(1), None]\nSome(Some(2))",
+            ),
+            (
+                "Some(1) == Some(1)\nSome(1) == None\nOk(1) == Error(1)",
+                "true\nfalse\nfalse",
+            ),
+            // The constructors are functions.
+            ("range(0, 3) |> map(Some)\nSome", "[Some(0), Some(1), Some(2)]\n<fn Some>"),
+            (
+                "Some(1) + 1\nSome()\nSome(1) == Ok(1)",
+                "[line 1] error: operands of `+` must be two Ints, two Floats or two Strings, got Option and Int\n\
+                 [line 2] error: `Some` expects 1 argument, got 0\n\
+                 [line 3] error: operands of `==` must be two values of the same type, got Option and Result",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn case_reads_options_and_results() {
+        runs(&[
+            (
+                "describe :: (r: Result[Int, String]) -> String {\n  case r {\n    Ok(0) -> \"zero\"\n    Ok(n) when n < 0 -> \"negative\"\n    Ok(n) -> to_string(n)\n    Error(reason) -> \"error: \" + reason\n  }\n}\n\
+                 describe(Ok(0))\ndescribe(Ok(-1))\ndescribe(Ok(7))\ndescribe(Error(\"bad\"))",
+                "zero\nnegative\n7\nerror: bad",
+            ),
+            // Nested patterns, and a guard that fails after a binding.
+            (
+                "case Some(Ok(3)) { Some(Error(_)) -> 1, Some(Ok(n)) -> n, None -> 0 }",
+                "3",
+            ),
+            (
+                "case Some(5) { Some(x) when x > 10 -> :big, Some(x) -> x, None -> 0 }",
+                "5",
+            ),
+            ("case None { Some(x) when x > 1 -> 1, _ -> 2 }", "2"),
+            (
+                "case None {\n  Some(x) -> x\n}",
+                "[line 1] error: no branch of `case` matches None",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn natives_give_options_and_results() {
+        runs(&[
+            (
+                "big :: (n: Int) -> Bool { n > 5 }\nfind(range(0, 10), big)\nfind(range(0, 3), big)",
+                "Some(6)\nNone",
+            ),
+            (
+                "parse_int(\"42\")\nparse_int(\" -7 \")\nparse_int(\"4x\")",
+                "Ok(42)\nOk(-7)\nError(\"\\\"4x\\\" is not an Int\")",
+            ),
+            (
+                "find([1], abs)\nparse_int(4)",
+                "[line 1] error: `find` expects a function that returns a Bool, got Int\n\
+                 [line 2] error: `parse_int` expects a String, got Int",
             ),
         ]);
     }

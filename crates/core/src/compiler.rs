@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crate::ast::{
     Arm, BinaryOp, Expr, FnDecl, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind, UnaryOp,
+    Variant,
 };
 use crate::chunk::{Chunk, Function, Op, Shape, Test};
 use crate::value::Value;
@@ -304,47 +305,51 @@ impl Compiler {
             // with the value alone on the stack.
             self.height = slot + 1;
             self.begin_scope();
-            let mut fails = Vec::new();
-            match &arm.pattern {
-                Pattern::Wildcard => {}
-                Pattern::Bind(name) => {
-                    self.emit(Op::GetLocal(slot));
-                    self.locals.push(Local {
-                        name: name.clone(),
-                        depth: self.scope_depth,
-                        slot: self.height - 1,
-                    });
-                }
-                Pattern::Literal(literal) => {
-                    self.emit(Op::GetLocal(slot));
-                    let index = self.chunk.add_constant(Value::from(literal));
-                    self.emit(Op::MatchConstant(index));
-                    fails.push(self.emit_jump(Op::JumpIfFalse));
-                    self.emit(Op::Pop);
-                }
+            let mut mismatches = Vec::new();
+            if arm.pattern != Pattern::Wildcard {
+                self.emit(Op::GetLocal(slot));
+                self.pattern(&arm.pattern, &mut mismatches);
             }
             let bound = self.height - slot - 1;
+            let mut unmet = Vec::new();
             if let Some(guard) = &arm.guard {
                 self.expression(guard)?;
                 self.emit(Op::CheckBool(Test::When));
-                fails.push(self.emit_jump(Op::JumpIfFalse));
+                unmet.push(self.emit_jump(Op::JumpIfFalse));
                 self.emit(Op::Pop);
             }
             self.expression(&arm.body)?;
             self.end_scope();
             ends.push(self.emit_jump(Op::Jump));
 
-            // A pattern that does not match leaves no bindings, so every jump
-            // here has the same on the stack: what the pattern bound and the
-            // Bool that said no.
-            if !fails.is_empty() {
-                for fail in fails {
-                    self.patch_jump(fail);
+            // A guard that does not hold leaves the bindings and its Bool.
+            // With no bindings that is what a pattern that does not match
+            // leaves, the Bool alone, and both share the same `Pop`.
+            if bound == 0 {
+                mismatches.append(&mut unmet);
+            }
+            let mut skip = None;
+            if !unmet.is_empty() {
+                for jump in unmet {
+                    self.patch_jump(jump);
                 }
                 self.height = slot + bound + 2;
                 for _ in 0..=bound {
                     self.emit(Op::Pop);
                 }
+                if !mismatches.is_empty() {
+                    skip = Some(self.emit_jump(Op::Jump));
+                }
+            }
+            if !mismatches.is_empty() {
+                for jump in mismatches {
+                    self.patch_jump(jump);
+                }
+                self.height = slot + 2;
+                self.emit(Op::Pop);
+            }
+            if let Some(skip) = skip {
+                self.patch_jump(skip);
             }
         }
         self.line = line;
@@ -356,6 +361,36 @@ impl Compiler {
         self.height = slot + 2;
         self.emit(Op::PopBelow(1));
         Ok(())
+    }
+
+    /// Tests the value on top of the stack against a pattern, taking it. If
+    /// it matches, what the pattern binds stays on the stack as locals. Every
+    /// test that can fail adds its jump to `mismatches`, and leaves the stack
+    /// as it was below the value, with a false on top: a pattern binds at
+    /// most one name, at its innermost, so nothing is bound when a test fails.
+    fn pattern(&mut self, pattern: &Pattern, mismatches: &mut Vec<usize>) {
+        match pattern {
+            Pattern::Wildcard => self.emit(Op::Pop),
+            Pattern::Bind(name) => self.locals.push(Local {
+                name: name.clone(),
+                depth: self.scope_depth,
+                slot: self.height - 1,
+            }),
+            Pattern::Literal(literal) => {
+                let index = self.chunk.add_constant(Value::from(literal));
+                self.emit(Op::MatchConstant(index));
+                mismatches.push(self.emit_jump(Op::JumpIfFalse));
+                self.emit(Op::Pop);
+            }
+            Pattern::Variant(variant, inner) => {
+                self.emit(Op::MatchVariant(*variant));
+                mismatches.push(self.emit_jump(Op::JumpIfFalse));
+                self.emit(Op::Pop);
+                if let Some(inner) = inner {
+                    self.pattern(inner, mismatches);
+                }
+            }
+        }
     }
 
     /// Emits a jump whose target is not known yet, and returns where it is
@@ -564,6 +599,10 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
         }
         Op::DefineStruct(_) | Op::GetField(_) => 0,
         Op::DefineEnum(_) | Op::MatchConstant(_) | Op::NoMatch => 0,
+        // When it matches, a `Some`, `Ok` or `Error` leaves what it holds and
+        // the Bool; a `None` leaves only the Bool.
+        Op::MatchVariant(Variant::None) => 0,
+        Op::MatchVariant(_) => 1,
         Op::Start { argc, .. } => -(argc as isize),
         Op::Yield | Op::OverLoop { .. } | Op::End => 0,
         // It takes the duration and leaves the two counters.
@@ -811,6 +850,31 @@ mod tests {
              0022    | NoMatch\n\
              0023    | PopBelow            1\n\
              0024    | Return\n"
+        );
+    }
+
+    #[test]
+    fn a_nested_pattern_is_a_chain_of_tests() {
+        let chunk = compiled("case r { Ok(Some(n)) -> n, _ -> 0 }").unwrap();
+        assert_eq!(
+            chunk.to_string(),
+            "0000    1 GetGlobal           0 \"r\"\n\
+             0001    | GetLocal            0\n\
+             0002    | MatchVariant       Ok\n\
+             0003    | JumpIfFalse         7 -> 11\n\
+             0004    | Pop\n\
+             0005    | MatchVariant     Some\n\
+             0006    | JumpIfFalse         4 -> 11\n\
+             0007    | Pop\n\
+             0008    | GetLocal            1\n\
+             0009    | PopBelow            1\n\
+             0010    | Jump                4 -> 15\n\
+             0011    | Pop\n\
+             0012    | Constant            1 0\n\
+             0013    | Jump                1 -> 15\n\
+             0014    | NoMatch\n\
+             0015    | PopBelow            1\n\
+             0016    | Return\n"
         );
     }
 }

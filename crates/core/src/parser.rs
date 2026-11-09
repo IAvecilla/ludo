@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::ast::{
     Arm, BinaryOp, EnumDecl, Expr, FnDecl, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt,
-    StmtKind, StructDecl, TypeExpr, UnaryOp,
+    StmtKind, StructDecl, TypeExpr, UnaryOp, Variant,
 };
 use crate::token::{Token, TokenKind};
 
@@ -617,9 +617,26 @@ impl Parser {
             TokenKind::False => Pattern::Literal(Literal::Bool(false)),
             TokenKind::Ident(name) if name == "_" => Pattern::Wildcard,
             TokenKind::Ident(name) if !starts_uppercase(&name) => Pattern::Bind(name),
+            TokenKind::Ident(name) if name == "None" => Pattern::Variant(Variant::None, None),
+            TokenKind::Ident(name) if matches!(name.as_str(), "Some" | "Ok" | "Error") => {
+                let variant = match name.as_str() {
+                    "Some" => Variant::Some,
+                    "Ok" => Variant::Ok,
+                    _ => Variant::Error,
+                };
+                self.advance();
+                self.expect(
+                    TokenKind::LParen,
+                    &format!("`(` and a pattern after `{name}`"),
+                )?;
+                let inner = self.pattern()?;
+                self.expect(TokenKind::RParen, "`)` to close the pattern")?;
+                return Ok(Pattern::Variant(variant, Some(Box::new(inner))));
+            }
             _ => {
                 return Err(self.error(
-                    "expected a pattern: a symbol, a number, a String, a Bool, a name or `_`",
+                    "expected a pattern: a symbol, a number, a String, a Bool, a name, `_`, \
+                     `Some(...)`, `None`, `Ok(...)` or `Error(...)`",
                 ))
             }
         };
@@ -1132,23 +1149,58 @@ mod tests {
                 "state :: enum { :a }",
                 "an enum name starts with an uppercase letter, found `state`",
             ),
-            ("S :: enum { :a, :a }", "this symbol is already in the enum, found `:a`"),
-            ("S :: enum { a }", "expected a symbol, like `:idle`, found `a`"),
+            (
+                "S :: enum { :a, :a }",
+                "this symbol is already in the enum, found `:a`",
+            ),
+            (
+                "S :: enum { a }",
+                "expected a symbol, like `:idle`, found `a`",
+            ),
             ("S :: enum {}", "`S` needs at least one symbol"),
             (
                 "f :: () -> Int {\n  E :: enum { :a }\n  1\n}",
                 "enums can only be declared at the top level, found `E`",
             ),
             ("case x {}", "a `case` needs at least one branch"),
-            ("case x { :a 1 }", "expected `->` and the value of the branch, found `1`"),
             (
-                "case x { Some -> 1 }",
-                "expected a pattern: a symbol, a number, a String, a Bool, a name or `_`, found `Some`",
+                "case x { :a 1 }",
+                "expected `->` and the value of the branch, found `1`",
             ),
-            ("case x { -:a -> 1 }", "expected a number after `-`, found `:a`"),
+            (
+                "case x { Foo -> 1 }",
+                "expected a pattern: a symbol, a number, a String, a Bool, a name, `_`, \
+                 `Some(...)`, `None`, `Ok(...)` or `Error(...)`, found `Foo`",
+            ),
+            (
+                "case x { -:a -> 1 }",
+                "expected a number after `-`, found `:a`",
+            ),
             (
                 "case x { :a -> 1 :b -> 2 }",
                 "expected `,`, a new line or `}` after the branch, found `:b`",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn parses_option_and_result_patterns() {
+        parses(&[(
+            "case r {\n  Ok(Some(n)) -> n\n  Ok(None) -> 0\n  Error(_) -> -1\n}",
+            "(case r (Ok(Some(n)) -> n) (Ok(None) -> 0) (Error(_) -> (- 1)))",
+        )]);
+        rejects(&[
+            (
+                "case x { Some -> 1 }",
+                "expected `(` and a pattern after `Some`, found `->`",
+            ),
+            (
+                "case x { Ok(1 -> 1 }",
+                "expected `)` to close the pattern, found `->`",
+            ),
+            (
+                "case x { None(1) -> 1 }",
+                "expected `->` and the value of the branch, found `(`",
             ),
         ]);
     }

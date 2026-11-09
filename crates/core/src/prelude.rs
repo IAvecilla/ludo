@@ -7,9 +7,13 @@ use crate::value::{Caller, Native, Value};
 const MAX_RANGE: i64 = 1_000_000;
 
 pub const NATIVES: &[Native] = &[
+    native("Some", 1, some),
+    native("Ok", 1, ok),
+    native("Error", 1, error_value),
     native("print", 1, print),
     native("map", 2, map),
     native("filter", 2, filter),
+    native("find", 2, find),
     native("fold", 3, fold),
     native("range", 2, range),
     native("abs", 1, abs),
@@ -18,6 +22,7 @@ pub const NATIVES: &[Native] = &[
     native("to_float", 1, to_float),
     native("to_int", 1, to_int),
     native("to_string", 1, to_string),
+    native("parse_int", 1, parse_int),
     native("concat", 2, concat),
     native("contains", 2, contains),
 ];
@@ -28,6 +33,23 @@ const fn native(
     fun: fn(&mut dyn Caller, &[Value]) -> Result<Value, RuntimeError>,
 ) -> Native {
     Native { name, arity, fun }
+}
+
+/// The globals that are values rather than functions.
+pub fn constants() -> [(&'static str, Value); 1] {
+    [("None", Value::Option(None))]
+}
+
+fn some(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Option(Some(Rc::new(args[0].clone()))))
+}
+
+fn ok(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Result(Ok(Rc::new(args[0].clone()))))
+}
+
+fn error_value(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
+    Ok(Value::Result(Err(Rc::new(args[0].clone()))))
 }
 
 fn print(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -64,6 +86,26 @@ fn filter(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError
         }
     }
     Ok(Value::List(Rc::new(kept)))
+}
+
+/// The first item for which the function gives true, if any.
+fn find(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
+    let Value::List(items) = &args[0] else {
+        return Err(not_a_list("find", &args[0]));
+    };
+    for item in items.iter() {
+        match caller.call(args[1].clone(), vec![item.clone()])? {
+            Value::Bool(true) => return Ok(Value::Option(Some(Rc::new(item.clone())))),
+            Value::Bool(false) => {}
+            other => {
+                return Err(error(format!(
+                    "`find` expects a function that returns a Bool, got {}",
+                    other.type_name()
+                )))
+            }
+        }
+    }
+    Ok(Value::Option(None))
 }
 
 fn fold(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -155,6 +197,20 @@ fn to_int(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
 
 fn to_string(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Str(args[0].to_string()))
+}
+
+/// The Int a String spells, or an error that says it does not.
+fn parse_int(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
+    let Value::Str(text) = &args[0] else {
+        return Err(error(format!(
+            "`parse_int` expects a String, got {}",
+            args[0].type_name()
+        )));
+    };
+    Ok(Value::Result(match text.trim().parse::<i64>() {
+        Ok(n) => Ok(Rc::new(Value::Int(n))),
+        Err(_) => Err(Rc::new(Value::Str(format!("{text:?} is not an Int")))),
+    }))
 }
 
 fn concat(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::ast::Variant;
 use crate::value::Value;
 
 /// One instruction of the virtual machine. Operands live inside the variant
@@ -57,6 +58,10 @@ pub enum Op {
     /// Fails because no branch of a `case` matches the value on top of the
     /// stack.
     NoMatch,
+    /// Replaces the `Option` or `Result` on top of the stack with whether it
+    /// is this variant. If it is, what it holds goes below that Bool, for the
+    /// rest of the pattern to match.
+    MatchVariant(Variant),
     /// Declares the sequence on top of the stack under the name in this
     /// constant. Like structs, sequences are looked up by name.
     DefineSequence(usize),
@@ -249,6 +254,7 @@ impl Chunk {
                 )
             }
             Op::MatchConstant(index) => self.constant_op("MatchConstant", index),
+            Op::MatchVariant(variant) => format!("{:<16} {:>4}", "MatchVariant", variant.name()),
             Op::DefineSequence(index) => self.constant_op("DefineSequence", index),
             Op::Start { name, argc } => {
                 format!("{:<16} {argc:4} {:?}", "Start", self.name(name))

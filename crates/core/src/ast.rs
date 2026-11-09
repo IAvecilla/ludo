@@ -66,6 +66,29 @@ pub enum Pattern {
     Bind(String),
     /// A literal, which matches a value of its type equal to it.
     Literal(Literal),
+    /// `Some(p)`, `None`, `Ok(p)` or `Error(p)`, which match that variant
+    /// when what it holds, if anything, matches `p`.
+    Variant(Variant, Option<Box<Pattern>>),
+}
+
+/// The variants of the built-in `Option` and `Result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    Some,
+    None,
+    Ok,
+    Error,
+}
+
+impl Variant {
+    pub fn name(self) -> &'static str {
+        match self {
+            Variant::Some => "Some",
+            Variant::None => "None",
+            Variant::Ok => "Ok",
+            Variant::Error => "Error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -203,6 +226,8 @@ impl fmt::Display for Pattern {
             Pattern::Wildcard => f.write_str("_"),
             Pattern::Bind(name) => f.write_str(name),
             Pattern::Literal(literal) => write!(f, "{literal}"),
+            Pattern::Variant(variant, Some(inner)) => write!(f, "{}({inner})", variant.name()),
+            Pattern::Variant(variant, None) => f.write_str(variant.name()),
         }
     }
 }
