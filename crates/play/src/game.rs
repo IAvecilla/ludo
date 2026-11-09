@@ -1,5 +1,6 @@
 use std::rc::Rc;
 
+use ludo_core::checker::Checker;
 use ludo_core::compiler::compile;
 use ludo_core::interpreter::RuntimeError;
 use ludo_core::parser::parse;
@@ -154,8 +155,9 @@ impl Game {
 
 fn prepare(source: &str) -> Result<(Vm, Config), Vec<String>> {
     let mut vm = Vm::new();
-    run(&mut vm, HOST).expect("the host prelude is valid");
-    run(&mut vm, source)?;
+    let mut checker = Checker::new();
+    run(&mut vm, &mut checker, HOST).expect("the host prelude is valid");
+    run(&mut vm, &mut checker, source)?;
 
     let mut errors = Vec::new();
     for (name, arity, signature) in CONTRACT {
@@ -193,7 +195,8 @@ fn init(vm: &mut Vm) -> Result<Value, String> {
         .map_err(|e| runtime("init", e))
 }
 
-fn run(vm: &mut Vm, source: &str) -> Result<(), Vec<String>> {
+/// Checks the names of a program, after what `checker` has seen, and runs it.
+fn run(vm: &mut Vm, checker: &mut Checker, source: &str) -> Result<(), Vec<String>> {
     let tokens = scan_tokens(source).map_err(|errors| {
         errors
             .iter()
@@ -206,6 +209,9 @@ fn run(vm: &mut Vm, source: &str) -> Result<(), Vec<String>> {
             .map(|e| format!("[line {}] Parsing Error: {}", e.line, e.message))
             .collect::<Vec<_>>()
     })?;
+    checker
+        .check(&statements)
+        .map_err(|errors| errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())?;
     for stmt in &statements {
         let script = compile(stmt).map_err(|e| vec![e.to_string()])?;
         vm.run(script)

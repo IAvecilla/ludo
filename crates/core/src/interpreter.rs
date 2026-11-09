@@ -190,11 +190,9 @@ impl Interpreter {
             return Ok(value.clone());
         }
         let message = if self.structs.contains_key(name) {
-            format!("`{name}` is a struct, not a value: build one with `{name} {{ ... }}`")
+            struct_hint(name)
         } else if self.sequences.contains_key(name) {
-            format!(
-                "`{name}` is a sequence, not a function: it runs over time and cannot be called"
-            )
+            sequence_hint(name)
         } else if let Some(decl) = self.enums.get(name) {
             enum_hint(name, &decl.symbols[0])
         } else {
@@ -429,6 +427,14 @@ pub(crate) fn no_match(value: &Value) -> RuntimeError {
         v => v.to_string(),
     };
     error(format!("no branch of `case` matches {shown}"))
+}
+
+pub(crate) fn struct_hint(name: &str) -> String {
+    format!("`{name}` is a struct, not a value: build one with `{name} {{ ... }}`")
+}
+
+pub(crate) fn sequence_hint(name: &str) -> String {
+    format!("`{name}` is a sequence, not a function: it runs over time and cannot be called")
 }
 
 pub(crate) fn enum_hint(name: &str, symbol: &str) -> String {

@@ -44,9 +44,8 @@ and games in detail in [Games](#games).
 These are planned but not implemented yet.
 
 - Checking `case`: a `case` over an enum that misses one of its symbols is reported before the program runs.
-- Type checking Types are written but not checked yet. A checker will report a wrong type before the program runs.
+- Type checking Types are written but not checked yet. A checker will report a wrong type, or a field a struct does not have, before the program runs.
 - Vec2: A 2D vector with `+`, `-` and `*`, for positions and velocities.
-- Checking names before running: an undefined name, a call with the wrong number of arguments or a missing field is reported when the file loads, and a function can only use a top level `let` declared before it.
 - Accessing lists by index
 - Sound and sprites 
 
@@ -562,6 +561,32 @@ prints
 [line 2] Parsing Error: expected a name after `let`, found `2`
 [line 3] Parsing Error: there is no assignment: bind a new value with `let`, or change a field of the state of a sequence, found `=`
 ```
+
+Before it runs, a file is checked for names it does not declare, calls with the
+wrong number of arguments and structs built with fields they do not have or
+without one they need, and every such error is reported at once. The top level
+runs from top to bottom, so there a name must be declared before it is used. A
+function or sequence runs when it is called or started, so its body can use any
+function, struct, enum or sequence of the file, but a top level `let` only if it
+is declared before it. This program
+
+```
+Ball :: struct { x: Float, y: Float }
+move :: (b: Ball) -> Ball {
+    Ball { b | x: b.x + speed }
+}
+let speed = 2.0
+print(move(Ball { x: 1.0 }))
+```
+
+prints, without running anything,
+
+```
+[line 3] Name Error: `speed` is declared after this function, on line 5: a function can only use a top level `let` declared before it
+[line 6] Name Error: missing field `y` in `Ball`
+```
+
+The REPL checks each input the same way, after the ones before it.
 
 A runtime error stops the program at the line where it happened, even inside a
 function. This program

@@ -5,7 +5,7 @@ use crate::ast::{BinaryOp, UnaryOp};
 use crate::chunk::{Function, Op, Shape, Test};
 use crate::interpreter::{
     binary, check_arity, condition, contents, enum_hint, error, field, logical, matches, no_match,
-    passes, unary, with_field, RuntimeError, MAX_CALL_DEPTH,
+    passes, sequence_hint, struct_hint, unary, with_field, RuntimeError, MAX_CALL_DEPTH,
 };
 use crate::prelude::{constants, NATIVES};
 use crate::value::{Caller, Instance, Value};
@@ -292,12 +292,10 @@ impl Vm {
                             self.push(value);
                             Ok(())
                         }
-                        None if self.structs.contains_key(name) => Err(error(format!(
-                            "`{name}` is a struct, not a value: build one with `{name} {{ ... }}`"
-                        ))),
-                        None if self.sequences.contains_key(name) => Err(error(format!(
-                            "`{name}` is a sequence, not a function: it runs over time and cannot be called"
-                        ))),
+                        None if self.structs.contains_key(name) => Err(error(struct_hint(name))),
+                        None if self.sequences.contains_key(name) => {
+                            Err(error(sequence_hint(name)))
+                        }
                         None if self.enums.contains_key(name) => {
                             Err(error(enum_hint(name, &self.enums[name][0])))
                         }
