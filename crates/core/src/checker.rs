@@ -141,6 +141,7 @@ impl Checker {
             self.declared = pass.declared;
             self.types = pass.types;
             self.vars = pass.vars;
+            self.vars.commit();
             Ok(())
         } else {
             Err(pass.errors)
@@ -1091,10 +1092,10 @@ impl Pass {
     /// Runs a test of whether types fit, keeping what it finds about the
     /// variables only if they do.
     fn trial(&mut self, test: impl FnOnce(&mut Self) -> bool) -> bool {
-        let saved = self.vars.clone();
+        let snapshot = self.vars.snapshot();
         let fits = test(self);
         if !fits {
-            self.vars = saved;
+            self.vars.rollback(snapshot);
         }
         fits
     }
