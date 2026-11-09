@@ -8,7 +8,10 @@ use ludo_core::scanner::scan_tokens;
 use ludo_core::value::{Instance, Value};
 use ludo_core::vm::Vm;
 
-const HOST: &str = include_str!("host.ludo");
+/// What a game can use without declaring it: the input, the shapes it
+/// draws, the colors and the config. The CLI loads it too, so a game file
+/// runs and checks the same with `ludo run`.
+pub const HOST: &str = include_str!("host.ludo");
 
 const CONTRACT: [(&str, usize, &str); 3] = [
     ("init", 0, "init :: () -> World"),

@@ -7,5 +7,6 @@ pub mod parser;
 pub mod prelude;
 pub mod scanner;
 pub mod token;
+pub mod types;
 pub mod value;
 pub mod vm;

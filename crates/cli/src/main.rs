@@ -10,7 +10,7 @@ use ludo_core::parser::{parse, ParseError};
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::Value;
 use ludo_core::vm::Vm;
-use ludo_play::Game;
+use ludo_play::{Game, HOST};
 
 const EX_USAGE: u8 = 64;
 const EX_DATAERR: u8 = 65;
@@ -87,11 +87,11 @@ fn main() -> ExitCode {
 
     match (args.as_slice(), mode) {
         ([], Some(mode)) => {
-            run_repl(Backend::new(mode));
+            run_repl(mode);
             ExitCode::SUCCESS
         }
         (["run", path], Some(mode @ (Mode::Vm | Mode::Interpreter))) => {
-            read(path).map_or_else(|code| code, |source| run_file(&source, Backend::new(mode)))
+            read(path).map_or_else(|code| code, |source| run_file(&source, mode))
         }
         (["play", path], Some(Mode::Vm)) => {
             read(path).map_or_else(|code| code, |source| play(path, &source))
@@ -121,8 +121,20 @@ fn read(path: &str) -> Result<String, ExitCode> {
     })
 }
 
-fn run_file(source: &str, mut backend: Backend) -> ExitCode {
-    match run(source, &mut backend, &mut Checker::new(), true) {
+/// A backend and a checker with the host prelude loaded, so a game file sees
+/// what `play` gives it.
+fn prepared(mode: Mode) -> (Backend, Checker) {
+    let mut backend = Backend::new(mode);
+    let mut checker = Checker::new();
+    if run(HOST, &mut backend, &mut checker, true).is_err() {
+        unreachable!("the host prelude is valid");
+    }
+    (backend, checker)
+}
+
+fn run_file(source: &str, mode: Mode) -> ExitCode {
+    let (mut backend, mut checker) = prepared(mode);
+    match run(source, &mut backend, &mut checker, true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Static | Failure::Incomplete(_)) => ExitCode::from(EX_DATAERR),
         Err(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
@@ -161,14 +173,15 @@ fn disassemble(source: &str) -> ExitCode {
         }
     };
 
-    if let Err(errors) = Checker::new().check(&statements) {
+    let (Backend::Vm(mut vm), mut checker) = prepared(Mode::Vm) else {
+        unreachable!("`dis` runs on the VM")
+    };
+    if let Err(errors) = checker.check(&statements) {
         for error in &errors {
             eprintln!("{error}");
         }
         return ExitCode::from(EX_DATAERR);
     }
-
-    let mut vm = Vm::new();
     vm.trace = true;
     for stmt in &statements {
         let script = match compile(stmt) {
@@ -209,9 +222,9 @@ fn listing(stmt: &Stmt, script: &Function) {
 /// Each input is compiled and run on its own, on a backend that lives as
 /// long as the REPL, so what one input binds the next ones see. On the VM
 /// it is the REPL of clox, of Python and of Lua.
-fn run_repl(mut backend: Backend) {
+fn run_repl(mode: Mode) {
     let stdin = io::stdin();
-    let mut checker = Checker::new();
+    let (mut backend, mut checker) = prepared(mode);
     let mut source = String::new();
 
     loop {
@@ -278,7 +291,7 @@ fn run(
 
     if let Err(errors) = checker.check(&statements) {
         for error in &errors {
-            eprintln!("{}Name Error: {}", at(error.line), error.message);
+            eprintln!("{}{} Error: {}", at(error.line), error.kind, error.message);
         }
         return Err(Failure::Static);
     }

@@ -114,6 +114,8 @@ impl Interpreter {
                 self.enums.insert(decl.name.clone(), decl.clone());
                 Ok(None)
             }
+            // A union only tells the checker what a type can be.
+            StmtKind::Union(_) => Ok(None),
             StmtKind::Sequence(decl) => {
                 self.sequences.insert(decl.name.clone(), decl.clone());
                 Ok(None)
