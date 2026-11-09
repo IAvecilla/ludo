@@ -166,13 +166,10 @@ impl Interpreter {
                 let args = self.arguments(args)?;
                 self.call(callee, args)
             }
-            Expr::Field(target, field) => match self.evaluate(target)? {
-                Value::Struct(instance) => instance
-                    .get(field)
-                    .cloned()
-                    .ok_or_else(|| error(format!("`{}` has no field `{field}`", instance.name))),
-                other => Err(error(format!("{} has no fields", other.type_name()))),
-            },
+            Expr::Field(target, name) => {
+                let target = self.evaluate(target)?;
+                field(&target, name)
+            }
             Expr::Struct { name, base, fields } => self.construct(name, base.as_deref(), fields),
         }
     }
@@ -316,6 +313,17 @@ impl Caller for Interpreter {
                 other.type_name()
             ))),
         }
+    }
+}
+
+/// The value of a field of a struct.
+pub(crate) fn field(target: &Value, name: &str) -> Result<Value, RuntimeError> {
+    match target {
+        Value::Struct(instance) => instance
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("`{}` has no field `{name}`", instance.name))),
+        other => Err(error(format!("{} has no fields", other.type_name()))),
     }
 }
 

@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{BinaryOp, UnaryOp};
-use crate::chunk::{Function, Op, Test};
+use crate::chunk::{Function, Op, Shape, Test};
 use crate::interpreter::{
-    binary, check_arity, condition, error, logical, unary, RuntimeError, MAX_CALL_DEPTH,
+    binary, check_arity, condition, error, field, logical, unary, RuntimeError, MAX_CALL_DEPTH,
 };
 use crate::prelude::NATIVES;
-use crate::value::{Caller, Value};
+use crate::value::{Caller, Instance, Value};
 
 /// A call in progress: the function, the next instruction it runs and where
 /// its frame starts on the stack. clox keeps the function in slot 0; here,
@@ -28,6 +28,9 @@ pub struct Vm {
     /// Looked up by name each time they are used, as in clox, so a reloaded
     /// game sees the new definitions.
     globals: HashMap<String, Value>,
+    /// The fields of each declared struct, in order, looked up by name like
+    /// the globals.
+    structs: HashMap<String, Vec<String>>,
 
     pub trace: bool,
 }
@@ -48,6 +51,7 @@ impl Vm {
             stack: Vec::new(),
             frames: Vec::new(),
             globals,
+            structs: HashMap::new(),
             trace: false,
         }
     }
@@ -112,6 +116,9 @@ impl Vm {
                             self.push(value);
                             Ok(())
                         }
+                        None if self.structs.contains_key(name) => Err(error(format!(
+                            "`{name}` is a struct, not a value: build one with `{name} {{ ... }}`"
+                        ))),
                         None => Err(error(format!("undefined variable `{name}`"))),
                     }
                 }
@@ -162,6 +169,27 @@ impl Vm {
                 Op::LessEqual => self.binary(BinaryOp::Le),
                 Op::Greater => self.binary(BinaryOp::Gt),
                 Op::GreaterEqual => self.binary(BinaryOp::Ge),
+                Op::List(count) => {
+                    let items = self.stack.split_off(self.stack.len() - count);
+                    self.push(Value::List(Rc::new(items)));
+                    Ok(())
+                }
+                Op::DefineStruct(shape) => {
+                    let Shape { name, fields } = chunk.shapes[shape].clone();
+                    self.structs.insert(name, fields);
+                    Ok(())
+                }
+                Op::Struct { shape, base } => {
+                    let shape = &chunk.shapes[shape];
+                    let values = self.stack.split_off(self.stack.len() - shape.fields.len());
+                    let base = base.then(|| self.pop());
+                    self.build_struct(shape, base, values)
+                        .map(|instance| self.push(instance))
+                }
+                Op::GetField(index) => {
+                    let target = self.pop();
+                    field(&target, chunk.name(index)).map(|value| self.push(value))
+                }
                 Op::Call(argc) => {
                     let callee = self.stack[self.stack.len() - 1 - argc].clone();
                     self.call_value(callee, argc)
@@ -226,6 +254,60 @@ impl Vm {
                 other.type_name()
             ))),
         }
+    }
+
+    /// Builds a struct from a literal, with the same checks and errors as the
+    /// interpreter. They run once every value is on the stack, so when a
+    /// literal has two errors, like an unknown field whose value fails, the
+    /// VM reports the value first and the interpreter the field.
+    fn build_struct(
+        &self,
+        literal: &Shape,
+        base: Option<Value>,
+        values: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
+        let name = &literal.name;
+        let declared = self
+            .structs
+            .get(name)
+            .ok_or_else(|| error(format!("undefined struct `{name}`")))?;
+
+        let mut slots: Vec<Option<Value>> = match base {
+            Some(Value::Struct(instance)) if instance.name == *name => instance
+                .fields
+                .iter()
+                .map(|(_, value)| Some(value.clone()))
+                .collect(),
+            Some(other) => {
+                return Err(error(format!(
+                    "`{name} {{ x | ... }}` needs a {name} as `x`, got {}",
+                    other.type_name()
+                )))
+            }
+            None => vec![None; declared.len()],
+        };
+
+        for (field, value) in literal.fields.iter().zip(values) {
+            let index = declared
+                .iter()
+                .position(|f| f == field)
+                .ok_or_else(|| error(format!("`{name}` has no field `{field}`")))?;
+            slots[index] = Some(value);
+        }
+
+        let fields = declared
+            .iter()
+            .zip(slots)
+            .map(|(field, value)| {
+                let value =
+                    value.ok_or_else(|| error(format!("missing field `{field}` in `{name}`")))?;
+                Ok((field.clone(), value))
+            })
+            .collect::<Result<_, RuntimeError>>()?;
+        Ok(Value::Struct(Rc::new(Instance {
+            name: name.clone(),
+            fields,
+        })))
     }
 
     fn frame(&mut self) -> &mut CallFrame {
@@ -515,5 +597,79 @@ mod tests {
                  [line 7] error: `min` expects 2 arguments, got 1",
             ),
         ]);
+    }
+
+    #[test]
+    fn builds_lists() {
+        runs(&[
+            (
+                "[]\n[1, 2 + 3]\n[[1], [2, 3]]\n[1, 2] == [1, 2]",
+                "[]\n[1, 5]\n[[1], [2, 3]]\ntrue",
+            ),
+            (
+                "{\n  let a = 1\n  [a, a + 1] |> concat([:b, \"c\"])\n}",
+                "[1, 2, :b, \"c\"]",
+            ),
+            (
+                "[-1, 2] |> map(abs)\n[:a, :b] |> contains(:b)",
+                "[1, 2]\ntrue",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn builds_reads_and_updates_structs() {
+        let ball = "Ball :: struct { x: Float, y: Float }\n";
+        runs(&[
+            (
+                &format!("{ball}let b = Ball {{ y: 2.0, x: 1.0 }}\nb\nb.y\nBall {{ b | y: 5.0 }}\nb == Ball {{ x: 1.0, y: 2.0 }}"),
+                "Ball { x: 1.0, y: 2.0 }\n2.0\nBall { x: 1.0, y: 5.0 }\ntrue",
+            ),
+            (
+                "Label :: struct { text: String }\nLabel { text: \"hi\" }\nEmpty :: struct {}\nEmpty {}",
+                "Label { text: \"hi\" }\nEmpty {}",
+            ),
+            // A literal looks its struct up when it runs, so a function can
+            // build a struct declared after it.
+            (
+                "origin :: () -> P { P { x: 0, y: 0 } }\nP :: struct { x: Int, y: Int }\norigin()",
+                "P { x: 0, y: 0 }",
+            ),
+            // Nested structs read and updated inside a function, as games do.
+            (
+                &format!(
+                    "{ball}World :: struct {{ ball: Ball, score: Int }}\n\
+                     bounce :: (w: World) -> World {{\n  let b = w.ball\n  World {{ w | ball: Ball {{ b | x: -b.x }}, score: w.score + 1 }}\n}}\n\
+                     let w = World {{ ball: Ball {{ x: 3.0, y: 0.0 }}, score: 0 }}\nbounce(w)\nbounce(w).ball.x"
+                ),
+                "World { ball: Ball { x: -3.0, y: 0.0 }, score: 1 }\n-3.0",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn reports_errors_in_structs() {
+        let ball = "Ball :: struct { x: Float, y: Float }\n";
+        runs(&[(
+            &format!(
+                "{ball}Paddle :: struct {{ y: Float }}\nlet n = 1\n\
+                 Ball {{ x: 1.0, y: 2.0 }} == Paddle {{ y: 2.0 }}\n\
+                 Ball {{ x: 1.0 }}\n\
+                 Ball {{ x: 1.0, y: 2.0, z: 3.0 }}\n\
+                 Wall {{ y: 1.0 }}\n\
+                 Ball {{ 1 | x: 2.0 }}\n\
+                 n.x\n\
+                 Ball {{ x: 1.0, y: 2.0 }}.z\n\
+                 Ball"
+            ),
+            "[line 4] error: operands of `==` must be two values of the same type, got Ball and Paddle\n\
+             [line 5] error: missing field `y` in `Ball`\n\
+             [line 6] error: `Ball` has no field `z`\n\
+             [line 7] error: undefined struct `Wall`\n\
+             [line 8] error: `Ball { x | ... }` needs a Ball as `x`, got Int\n\
+             [line 9] error: Int has no fields\n\
+             [line 10] error: `Ball` has no field `z`\n\
+             [line 11] error: `Ball` is a struct, not a value: build one with `Ball { ... }`",
+        )]);
     }
 }
