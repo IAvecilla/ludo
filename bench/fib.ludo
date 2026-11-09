@@ -1,0 +1,7 @@
+// Recursive calls and arithmetic: almost all the time goes to calling.
+
+fib :: (n: Int) -> Int {
+    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+print(fib(28))

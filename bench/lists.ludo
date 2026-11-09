@@ -1,0 +1,7 @@
+// Natives that call back into ludo, over long lists.
+
+square :: (n: Int) -> Int { n * n }
+odd :: (n: Int) -> Bool { n % 2 == 1 }
+add :: (a: Int, b: Int) -> Int { a + b }
+
+print(range(0, 300000) |> map(square) |> filter(odd) |> fold(0, add))
