@@ -90,6 +90,16 @@ impl fmt::Display for Type {
 #[derive(Debug, Clone, Default)]
 pub struct Vars {
     slots: Vec<Slot>,
+    /// What each change replaced, newest last, so a test that fails can undo
+    /// its changes without copying every variable beforehand.
+    trail: Vec<(usize, Slot)>,
+}
+
+/// Where the variables were, to go back to it.
+#[derive(Debug, Clone, Copy)]
+pub struct Snapshot {
+    slots: usize,
+    trail: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +120,33 @@ impl Vars {
 
     pub fn is_numeric(&self, var: usize) -> bool {
         self.slots[var].numeric
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            slots: self.slots.len(),
+            trail: self.trail.len(),
+        }
+    }
+
+    /// Undoes every change since the snapshot, and drops the variables made
+    /// after it.
+    pub fn rollback(&mut self, snapshot: Snapshot) {
+        while self.trail.len() > snapshot.trail {
+            let (var, slot) = self.trail.pop().expect("the trail is longer");
+            self.slots[var] = slot;
+        }
+        self.slots.truncate(snapshot.slots);
+    }
+
+    /// Forgets how to undo the changes so far, once nothing will.
+    pub fn commit(&mut self) {
+        self.trail.clear();
+    }
+
+    fn set(&mut self, var: usize, slot: Slot) {
+        let before = std::mem::replace(&mut self.slots[var], slot);
+        self.trail.push((var, before));
     }
 
     /// A type with the variables found so far put in, all the way down.
@@ -148,23 +185,40 @@ impl Vars {
         match ty {
             Type::Var(other) if other == var => true,
             Type::Var(other) => {
-                if self.slots[var].numeric {
-                    self.slots[other].numeric = true;
+                if self.slots[var].numeric && !self.slots[other].numeric {
+                    self.set(
+                        other,
+                        Slot {
+                            bound: None,
+                            numeric: true,
+                        },
+                    );
                 }
-                self.slots[var].bound = Some(Type::Var(other));
+                self.bind_slot(var, Type::Var(other));
                 true
             }
             Type::Int | Type::Float | Type::Unknown => {
-                self.slots[var].bound = Some(ty);
+                self.bind_slot(var, ty);
                 true
             }
             _ if self.slots[var].numeric => false,
             _ if self.occurs(var, &ty) => false,
             _ => {
-                self.slots[var].bound = Some(ty);
+                self.bind_slot(var, ty);
                 true
             }
         }
+    }
+
+    fn bind_slot(&mut self, var: usize, ty: Type) {
+        let numeric = self.slots[var].numeric;
+        self.set(
+            var,
+            Slot {
+                bound: Some(ty),
+                numeric,
+            },
+        );
     }
 
     fn occurs(&self, var: usize, ty: &Type) -> bool {
