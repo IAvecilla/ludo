@@ -19,6 +19,10 @@ pub enum Value {
     Native(Native),
     Struct(Rc<Instance>),
     List(Rc<Vec<Value>>),
+    /// `Some(x)` or `None`.
+    Option(Option<Rc<Value>>),
+    /// `Ok(x)` or `Error(e)`.
+    Result(Result<Rc<Value>, Rc<Value>>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +68,8 @@ impl Value {
             Value::Function(_) | Value::Compiled(_) | Value::Native(_) => "Function",
             Value::Struct(instance) => &instance.name,
             Value::List(_) => "List",
+            Value::Option(_) => "Option",
+            Value::Result(_) => "Result",
         }
     }
 
@@ -119,6 +125,10 @@ impl fmt::Display for Value {
                     f.write_str(" }")
                 }
             }
+            Value::Option(Some(value)) => wrapped(f, "Some", value),
+            Value::Option(None) => f.write_str("None"),
+            Value::Result(Ok(value)) => wrapped(f, "Ok", value),
+            Value::Result(Err(value)) => wrapped(f, "Error", value),
             Value::List(items) => {
                 f.write_str("[")?;
                 for (i, item) in items.iter().enumerate() {
@@ -131,6 +141,12 @@ impl fmt::Display for Value {
             }
         }
     }
+}
+
+fn wrapped(f: &mut fmt::Formatter<'_>, variant: &str, value: &Value) -> fmt::Result {
+    write!(f, "{variant}(")?;
+    nested(f, value)?;
+    f.write_str(")")
 }
 
 fn nested(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {

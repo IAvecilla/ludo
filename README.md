@@ -45,8 +45,6 @@ These are planned but not implemented yet.
 
 - Checking `case`: a `case` over an enum that misses one of its symbols is reported before the program runs.
 - Type checking Types are written but not checked yet. A checker will report a wrong type before the program runs.
-- Option: `Some(x)` and `None` for a value that may be missing, instead of an error.
-- Errors as values, a function that can fail returns `Ok(value)` or `Error(reason)`, and the caller handles both with `case`. There are no exceptions.
 - Vec2: A 2D vector with `+`, `-` and `*`, for positions and velocities.
 - Checking names before running: an undefined name, a call with the wrong number of arguments or a missing field is reported when the file loads, and a function can only use a top level `let` declared before it.
 - Accessing lists by index
@@ -368,6 +366,30 @@ let sign = case n {
 }
 ```
 
+### Option and Result
+
+`Option` and `Result` are built in. An `Option` is `Some(x)`, a value that is
+there, or `None`, one that is missing. A `Result` is `Ok(x)`, a value, or
+`Error(e)`, the reason there is none: a function that can fail returns one
+instead of stopping the program. `case` reads them, and its patterns go inside
+them.
+
+```
+let name = case find(players, ready) {
+    Some(p) -> p.name
+    None -> "nobody"
+}
+
+let lives = case parse_int(text) {
+    Ok(n) when n > 0 -> n
+    Ok(_) -> 1
+    Error(_) -> 3
+}
+```
+
+`Some`, `Ok` and `Error` are functions, so they can be passed around, as in
+`range(0, 3) |> map(Some)`.
+
 ### Lists
 
 A list cannot be changed either, and operations return a new one. There are no
@@ -420,9 +442,10 @@ function. Sequences only run inside a game, see [Games](#games).
 | | |
 | --- | --- |
 | `print(x)` | writes `x` to the terminal and returns it |
-| `map`, `filter`, `fold`, `range`, `concat`, `contains` | lists |
+| `map`, `filter`, `find`, `fold`, `range`, `concat`, `contains` | lists |
 | `abs`, `min`, `clamp` | numbers |
-| `to_float`, `to_int`, `to_string` | conversions |
+| `to_float`, `to_int`, `to_string`, `parse_int` | conversions |
+| `Some`, `Ok`, `Error`, `None` | build an `Option` or a `Result` |
 
 ```
 abs(-3)             // 3
@@ -430,6 +453,7 @@ min(2.5, 1.0)       // 1.0
 clamp(15, 0, 10)    // 10
 to_int(2.9)         // 2
 to_string(42)       // "42"
+parse_int("42")     // Ok(42)
 ```
 
 ## Grammar
@@ -488,7 +512,8 @@ primary        → INT | FLOAT | STRING | SYMBOL | IDENTIFIER | "true" | "false"
 ifExpr         → "if" expression block "else" ( ifExpr | block ) ;
 caseExpr       → "case" expression "{" branch ( separator branch )* separator? "}" ;
 branch         → pattern ( "when" expression )? "->" expression ;
-pattern        → "-"? ( INT | FLOAT ) | STRING | SYMBOL | "true" | "false" | IDENTIFIER ;
+pattern        → "-"? ( INT | FLOAT ) | STRING | SYMBOL | "true" | "false" | IDENTIFIER
+               | ( "Some" | "Ok" | "Error" ) "(" pattern ")" | "None" ;
 block          → "{" ( statement NEWLINE )* expression "}" ;
 structLit      → IDENTIFIER "{" ( expression "|" )? ( fieldValue ( separator fieldValue )* separator? )? "}" ;
 list           → "[" ( expression ( "," expression )* ","? )? "]" ;

@@ -3,9 +3,9 @@ use std::rc::Rc;
 
 use crate::ast::{
     Arm, BinaryOp, EnumDecl, Expr, FnDecl, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
-    StructDecl, UnaryOp,
+    StructDecl, UnaryOp, Variant,
 };
-use crate::prelude::NATIVES;
+use crate::prelude::{constants, NATIVES};
 use crate::value::{Caller, Instance, Native, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +56,9 @@ impl Interpreter {
         };
         for native in NATIVES {
             interpreter.define(*native);
+        }
+        for (name, value) in constants() {
+            interpreter.globals.insert(name.to_string(), value);
         }
         interpreter
     }
@@ -312,12 +315,11 @@ impl Interpreter {
     /// The value of a branch of a `case`, if its pattern matches `value` and
     /// its guard holds.
     fn arm(&mut self, arm: &Arm, value: &Value) -> Result<Option<Value>, RuntimeError> {
-        match &arm.pattern {
-            Pattern::Wildcard => {}
-            Pattern::Bind(name) => self.locals.push((name.clone(), value.clone())),
-            Pattern::Literal(literal) if matches(value, &Value::from(literal)) => {}
-            Pattern::Literal(_) => return Ok(None),
+        let mut bindings = Vec::new();
+        if !bind(&arm.pattern, value, &mut bindings) {
+            return Ok(None);
         }
+        self.locals.append(&mut bindings);
         if let Some(guard) = &arm.guard {
             let holds = self.boolean(guard, |v| condition("when", v));
             if !holds.map_err(|e| e.at(arm.line))? {
@@ -388,6 +390,37 @@ pub(crate) fn condition(keyword: &str, value: &Value) -> Result<bool, RuntimeErr
 /// equal to it. A value of another type does not match; it is no error.
 pub(crate) fn matches(value: &Value, literal: &Value) -> bool {
     value.same_type(literal) && value == literal
+}
+
+/// Whether a value matches a pattern, adding what the pattern binds to
+/// `bindings`.
+fn bind(pattern: &Pattern, value: &Value, bindings: &mut Vec<(String, Value)>) -> bool {
+    match pattern {
+        Pattern::Wildcard => true,
+        Pattern::Bind(name) => {
+            bindings.push((name.clone(), value.clone()));
+            true
+        }
+        Pattern::Literal(literal) => matches(value, &Value::from(literal)),
+        Pattern::Variant(variant, inner) => match (contents(*variant, value), inner) {
+            (Some(Some(held)), Some(inner)) => bind(inner, &held, bindings),
+            (Some(None), None) => true,
+            _ => false,
+        },
+    }
+}
+
+/// What a value of an `Option` or a `Result` holds if it is this variant:
+/// `Some(Some(x))` for a match with `x` inside, `Some(None)` for `None`, and
+/// `None` for another variant or another type, which is no match.
+pub(crate) fn contents(variant: Variant, value: &Value) -> Option<Option<Value>> {
+    match (variant, value) {
+        (Variant::Some, Value::Option(Some(held))) => Some(Some((**held).clone())),
+        (Variant::None, Value::Option(None)) => Some(None),
+        (Variant::Ok, Value::Result(Ok(held))) => Some(Some((**held).clone())),
+        (Variant::Error, Value::Result(Err(held))) => Some(Some((**held).clone())),
+        _ => None,
+    }
 }
 
 pub(crate) fn no_match(value: &Value) -> RuntimeError {
