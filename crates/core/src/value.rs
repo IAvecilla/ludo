@@ -1,7 +1,7 @@
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ast::FnDecl;
+use crate::ast::{FnDecl, Literal};
 use crate::chunk::Function;
 use crate::interpreter::RuntimeError;
 
@@ -78,6 +78,19 @@ impl Value {
         match (self, other) {
             (Value::Struct(a), Value::Struct(b)) => a.name == b.name,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+/// The value a literal pattern of a `case` stands for.
+impl From<&Literal> for Value {
+    fn from(literal: &Literal) -> Self {
+        match literal {
+            Literal::Int(v) => Value::Int(*v),
+            Literal::Float(v) => Value::Float(*v),
+            Literal::Str(v) => Value::Str(v.clone()),
+            Literal::Symbol(v) => Value::Symbol(v.clone()),
+            Literal::Bool(v) => Value::Bool(*v),
         }
     }
 }

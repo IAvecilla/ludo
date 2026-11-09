@@ -44,6 +44,37 @@ pub enum Expr {
         base: Option<Box<Expr>>,
         fields: Vec<(String, Expr)>,
     },
+    /// `case value { pattern [when guard] -> body ... }`: the value of the
+    /// first branch whose pattern matches and whose guard holds.
+    Case(Box<Expr>, Vec<Arm>),
+}
+
+/// A branch of a `case`, with the line it starts on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Expr,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `_`, which matches anything.
+    Wildcard,
+    /// A name, which matches anything and binds it in the branch.
+    Bind(String),
+    /// A literal, which matches a value of its type equal to it.
+    Literal(Literal),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Symbol(String),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +101,13 @@ pub struct FnDecl {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<Param>,
+}
+
+/// `Name :: enum { :a, :b }`: a closed set of symbols.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub name: String,
+    pub symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +139,7 @@ pub enum StmtKind {
     Let(String, Expr),
     Fn(Rc<FnDecl>),
     Struct(Rc<StructDecl>),
+    Enum(Rc<EnumDecl>),
     Sequence(Rc<SeqDecl>),
     Start(String, Vec<Expr>),
     Expr(Expr),
@@ -124,6 +163,7 @@ impl fmt::Display for StmtKind {
             StmtKind::Let(name, value) => write!(f, "(let {name} {value})"),
             StmtKind::Fn(decl) => write!(f, "{decl}"),
             StmtKind::Struct(decl) => write!(f, "{decl}"),
+            StmtKind::Enum(decl) => write!(f, "{decl}"),
             StmtKind::Sequence(decl) => write!(f, "{decl}"),
             StmtKind::Start(name, args) => write!(f, "(start {name}{})", spaced(args)),
             StmtKind::Expr(expr) => write!(f, "{expr}"),
@@ -134,6 +174,48 @@ impl fmt::Display for StmtKind {
 impl fmt::Display for StructDecl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "(struct {} ({}))", self.name, params(&self.fields))
+    }
+}
+
+impl fmt::Display for EnumDecl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(enum {}", self.name)?;
+        for symbol in &self.symbols {
+            write!(f, " :{symbol}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl fmt::Display for Arm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}", self.pattern)?;
+        if let Some(guard) = &self.guard {
+            write!(f, " when {guard}")?;
+        }
+        write!(f, " -> {})", self.body)
+    }
+}
+
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pattern::Wildcard => f.write_str("_"),
+            Pattern::Bind(name) => f.write_str(name),
+            Pattern::Literal(literal) => write!(f, "{literal}"),
+        }
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Literal::Int(v) => write!(f, "{v}"),
+            Literal::Float(v) => write!(f, "{v:?}"),
+            Literal::Str(v) => write!(f, "{v:?}"),
+            Literal::Symbol(v) => write!(f, ":{v}"),
+            Literal::Bool(v) => write!(f, "{v}"),
+        }
     }
 }
 
@@ -259,6 +341,7 @@ impl fmt::Display for Expr {
                 f.write_str(")")
             }
             Expr::Call(callee, args) => write!(f, "(call {callee}{})", spaced(args)),
+            Expr::Case(value, arms) => write!(f, "(case {value}{})", spaced(arms)),
         }
     }
 }

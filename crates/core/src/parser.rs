@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use crate::ast::{
-    BinaryOp, Expr, FnDecl, Param, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, TypeExpr,
-    UnaryOp,
+    Arm, BinaryOp, EnumDecl, Expr, FnDecl, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt,
+    StmtKind, StructDecl, TypeExpr, UnaryOp,
 };
 use crate::token::{Token, TokenKind};
 
@@ -114,6 +114,9 @@ impl Parser {
             TokenKind::Struct => {
                 return Err(self.error("structs are declared as `Name :: struct { ... }`"))
             }
+            TokenKind::Enum => {
+                return Err(self.error("enums are declared as `Name :: enum { :a, :b }`"))
+            }
             TokenKind::Sequence => {
                 return Err(self
                     .error("sequences are declared as `name :: sequence (state: Type) { ... }`"))
@@ -141,16 +144,22 @@ impl Parser {
         let kind = self.kind_at(2).cloned();
         let what = match kind {
             Some(TokenKind::Struct) => "structs",
+            Some(TokenKind::Enum) => "enums",
             Some(TokenKind::Sequence) => "sequences",
             _ => "functions",
         };
         if self.blocks > 0 {
             return Err(self.error(format!("{what} can only be declared at the top level")));
         }
-        if kind == Some(TokenKind::Struct)
-            && matches!(self.peek(), TokenKind::Ident(name) if !starts_uppercase(name))
-        {
-            return Err(self.error("a struct name starts with an uppercase letter"));
+        let named = match kind {
+            Some(TokenKind::Struct) => Some("a struct"),
+            Some(TokenKind::Enum) => Some("an enum"),
+            _ => None,
+        };
+        if let Some(named) = named {
+            if matches!(self.peek(), TokenKind::Ident(name) if !starts_uppercase(name)) {
+                return Err(self.error(format!("{named} name starts with an uppercase letter")));
+            }
         }
 
         let name = self.expect_ident("a name")?;
@@ -159,6 +168,10 @@ impl Parser {
             TokenKind::Struct => {
                 self.advance();
                 self.struct_declaration(name)
+            }
+            TokenKind::Enum => {
+                self.advance();
+                self.enum_declaration(name, line)
             }
             TokenKind::Sequence => {
                 self.advance();
@@ -169,7 +182,7 @@ impl Parser {
                 self.fn_declaration(name)
             }
             _ => Err(self.error(
-                "expected `(`, `struct` or `sequence` after `::`; values are bound with `let`",
+                "expected `(`, `struct`, `enum` or `sequence` after `::`; values are bound with `let`",
             )),
         }
     }
@@ -215,7 +228,7 @@ impl Parser {
     fn struct_declaration(&mut self, name: String) -> Result<StmtKind, ParseError> {
         self.expect(TokenKind::LBrace, "`{` after `struct`")?;
         let mut seen = Vec::new();
-        let fields = self.lines(true, "expected `}` to close the struct", |p| {
+        let fields = self.lines(true, "expected `}` to close the struct", "the field", |p| {
             let name = p.field_name(&mut seen, "this field is already declared")?;
             p.expect(TokenKind::Colon, "`:` and a type after the field name")?;
             Ok(Param {
@@ -224,6 +237,35 @@ impl Parser {
             })
         })?;
         Ok(StmtKind::Struct(Rc::new(StructDecl { name, fields })))
+    }
+
+    fn enum_declaration(&mut self, name: String, line: usize) -> Result<StmtKind, ParseError> {
+        self.expect(TokenKind::LBrace, "`{` after `enum`")?;
+        let mut symbols: Vec<String> = Vec::new();
+        let listed = self.lines(
+            true,
+            "expected `}` to close the enum",
+            "the symbol",
+            |p| match p.peek().clone() {
+                TokenKind::Symbol(symbol) if symbols.contains(&symbol) => {
+                    Err(p.error("this symbol is already in the enum"))
+                }
+                TokenKind::Symbol(symbol) => {
+                    p.advance();
+                    symbols.push(symbol);
+                    Ok(())
+                }
+                _ => Err(p.error("expected a symbol, like `:idle`")),
+            },
+        );
+        listed?;
+        if symbols.is_empty() {
+            return Err(ParseError::at(
+                line,
+                format!("`{name}` needs at least one symbol"),
+            ));
+        }
+        Ok(StmtKind::Enum(Rc::new(EnumDecl { name, symbols })))
     }
 
     fn sequence_declaration(&mut self, name: String, line: usize) -> Result<StmtKind, ParseError> {
@@ -239,9 +281,12 @@ impl Parser {
         };
         self.expect(TokenKind::LBrace, "`{` to start the sequence body")?;
         self.state = Some(state);
-        let body = self.lines(false, "expected `}` to close the sequence", |p| {
-            p.step(false)
-        });
+        let body = self.lines(
+            false,
+            "expected `}` to close the sequence",
+            "the statement",
+            |p| p.step(false),
+        );
         self.state = None;
         Ok(StmtKind::Sequence(Rc::new(SeqDecl {
             name,
@@ -274,9 +319,12 @@ impl Parser {
                     false => None,
                 };
                 self.expect(TokenKind::LBrace, "`{` to start the body of `over`")?;
-                let body = self.lines(false, "expected `}` to close the body of `over`", |p| {
-                    p.step(true)
-                })?;
+                let body = self.lines(
+                    false,
+                    "expected `}` to close the body of `over`",
+                    "the statement",
+                    |p| p.step(true),
+                )?;
                 StepKind::Over {
                     duration,
                     var,
@@ -452,6 +500,7 @@ impl Parser {
             }
             TokenKind::LBrace => return self.block(),
             TokenKind::If => return self.if_expression(),
+            TokenKind::Case => return self.case_expression(),
             TokenKind::Wait | TokenKind::Over => {
                 return Err(
                     self.error("`wait` and `over` only go directly in the body of a sequence")
@@ -471,7 +520,12 @@ impl Parser {
     fn block(&mut self) -> Result<Expr, ParseError> {
         let open_line = self.advance().line;
         let mut statements = self.with_structs(true, |p| {
-            p.lines(false, "expected `}` to close the block", Self::statement)
+            p.lines(
+                false,
+                "expected `}` to close the block",
+                "the statement",
+                Self::statement,
+            )
         })?;
         match statements.pop() {
             Some(Stmt {
@@ -517,6 +571,62 @@ impl Parser {
         ))
     }
 
+    fn case_expression(&mut self) -> Result<Expr, ParseError> {
+        let line = self.advance().line;
+        let value = self.condition()?;
+        self.expect(TokenKind::LBrace, "`{` after the value of `case`")?;
+        let arms = self.with_structs(true, |p| {
+            p.lines(
+                true,
+                "expected `}` to close the `case`",
+                "the branch",
+                Self::arm,
+            )
+        })?;
+        if arms.is_empty() {
+            return Err(ParseError::at(line, "a `case` needs at least one branch"));
+        }
+        Ok(Expr::Case(Box::new(value), arms))
+    }
+
+    fn arm(&mut self) -> Result<Arm, ParseError> {
+        let line = self.line();
+        let pattern = self.pattern()?;
+        let guard = match self.matches(&[TokenKind::When]) {
+            true => Some(self.expression()?),
+            false => None,
+        };
+        self.expect(TokenKind::Arrow, "`->` and the value of the branch")?;
+        Ok(Arm {
+            pattern,
+            guard,
+            body: self.expression()?,
+            line,
+        })
+    }
+
+    fn pattern(&mut self) -> Result<Pattern, ParseError> {
+        let negative = self.matches(&[TokenKind::Minus]);
+        let pattern = match self.peek().clone() {
+            TokenKind::Int(v) => Pattern::Literal(Literal::Int(if negative { -v } else { v })),
+            TokenKind::Float(v) => Pattern::Literal(Literal::Float(if negative { -v } else { v })),
+            _ if negative => return Err(self.error("expected a number after `-`")),
+            TokenKind::Str(v) => Pattern::Literal(Literal::Str(v)),
+            TokenKind::Symbol(v) => Pattern::Literal(Literal::Symbol(v)),
+            TokenKind::True => Pattern::Literal(Literal::Bool(true)),
+            TokenKind::False => Pattern::Literal(Literal::Bool(false)),
+            TokenKind::Ident(name) if name == "_" => Pattern::Wildcard,
+            TokenKind::Ident(name) if !starts_uppercase(&name) => Pattern::Bind(name),
+            _ => {
+                return Err(self.error(
+                    "expected a pattern: a symbol, a number, a String, a Bool, a name or `_`",
+                ))
+            }
+        };
+        self.advance();
+        Ok(pattern)
+    }
+
     fn condition(&mut self) -> Result<Expr, ParseError> {
         self.with_structs(false, Self::expression)
     }
@@ -535,7 +645,7 @@ impl Parser {
         };
 
         let mut seen = Vec::new();
-        let fields = self.lines(true, "expected `}` to close the struct", |p| {
+        let fields = self.lines(true, "expected `}` to close the struct", "the field", |p| {
             let field = p.field_name(&mut seen, "this field is already given")?;
             p.expect(TokenKind::Colon, "`:` after the field name")?;
             Ok((field, p.expression()?))
@@ -568,6 +678,7 @@ impl Parser {
         &mut self,
         commas: bool,
         closing: &str,
+        after: &str,
         mut item: impl FnMut(&mut Self) -> Result<T, ParseError>,
     ) -> Result<Vec<T>, ParseError> {
         self.blocks += 1;
@@ -588,9 +699,9 @@ impl Parser {
                 || (commas && self.matches(&[TokenKind::Comma]));
             if !separated && self.peek() != &TokenKind::RBrace {
                 return Err(self.error(if commas {
-                    "expected `,`, a new line or `}` after the field"
+                    format!("expected `,`, a new line or `}}` after {after}")
                 } else {
-                    "expected a new line or `}` after the statement"
+                    format!("expected a new line or `}}` after {after}")
                 }));
             }
         }
@@ -871,7 +982,7 @@ mod tests {
             ("{\n  f :: () -> Int { 1 }\n  1\n}", "functions can only be declared at the top level, found `f`"),
             (
                 "speed :: 320.0",
-                "expected `(`, `struct` or `sequence` after `::`; values are bound with `let`, found `320.0`",
+                "expected `(`, `struct`, `enum` or `sequence` after `::`; values are bound with `let`, found `320.0`",
             ),
         ]);
     }
@@ -990,6 +1101,54 @@ mod tests {
             (
                 "let x = start s(w)",
                 "`start` is a statement, not a value: it goes on its own line, found `start`",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn parses_enums_and_case() {
+        parses(&[
+            (
+                "State :: enum { :idle, :serving }\nDir :: enum {\n  :left\n  :right,\n}",
+                "(enum State :idle :serving)\n(enum Dir :left :right)",
+            ),
+            (
+                "case s {\n  :idle -> 1\n  :serving when ready -> 2\n  _ -> 3\n}",
+                "(case s (:idle -> 1) (:serving when ready -> 2) (_ -> 3))",
+            ),
+            (
+                "case n { 0 -> \"zero\", -1 -> \"minus\", 1.5 -> :x, true -> :t, m -> { m * 2 } }",
+                "(case n (0 -> \"zero\") (-1 -> \"minus\") (1.5 -> :x) (true -> :t) (m -> (block (* m 2))))",
+            ),
+            // The braces after the value are the branches, not a struct.
+            ("case State { :a -> 1 }", "(case State (:a -> 1))"),
+        ]);
+        rejects(&[
+            (
+                "enum State { :a }",
+                "enums are declared as `Name :: enum { :a, :b }`, found `enum`",
+            ),
+            (
+                "state :: enum { :a }",
+                "an enum name starts with an uppercase letter, found `state`",
+            ),
+            ("S :: enum { :a, :a }", "this symbol is already in the enum, found `:a`"),
+            ("S :: enum { a }", "expected a symbol, like `:idle`, found `a`"),
+            ("S :: enum {}", "`S` needs at least one symbol"),
+            (
+                "f :: () -> Int {\n  E :: enum { :a }\n  1\n}",
+                "enums can only be declared at the top level, found `E`",
+            ),
+            ("case x {}", "a `case` needs at least one branch"),
+            ("case x { :a 1 }", "expected `->` and the value of the branch, found `1`"),
+            (
+                "case x { Some -> 1 }",
+                "expected a pattern: a symbol, a number, a String, a Bool, a name or `_`, found `Some`",
+            ),
+            ("case x { -:a -> 1 }", "expected a number after `-`, found `:a`"),
+            (
+                "case x { :a -> 1 :b -> 2 }",
+                "expected `,`, a new line or `}` after the branch, found `:b`",
             ),
         ]);
     }
