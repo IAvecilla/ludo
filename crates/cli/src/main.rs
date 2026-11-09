@@ -99,7 +99,8 @@ fn disassemble(source: &str) -> ExitCode {
         };
         println!("== {stmt} ==\n{chunk}");
         match vm.run(&chunk) {
-            Ok(value) => println!("=> {value}\n"),
+            Ok(Some(value)) => println!("=> {value}\n"),
+            Ok(None) => println!(),
             Err(error) => {
                 let line = error
                     .line

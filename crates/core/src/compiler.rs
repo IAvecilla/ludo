@@ -17,14 +17,20 @@ impl fmt::Display for CompileError {
     }
 }
 
-/// Compiles an expression statement into a chunk that leaves its value on
-/// the stack and returns it.
+/// Compiles a top-level statement into a chunk. An expression returns its
+/// value; a `let` binds a global and returns nothing. The VM keeps the
+/// globals from one chunk to the next.
 pub fn compile(stmt: &Stmt) -> Result<Chunk, CompileError> {
     let mut compiler = Compiler {
         chunk: Chunk::default(),
         line: stmt.line,
     };
     match &stmt.kind {
+        StmtKind::Let(name, value) => {
+            let global = compiler.identifier_constant(name);
+            compiler.expression(value)?;
+            compiler.emit(Op::DefineGlobal(global));
+        }
         StmtKind::Expr(expr) => compiler.expression(expr)?,
         _ => return Err(compiler.unsupported(&format!("`{}`", kind(&stmt.kind)))),
     }
@@ -45,6 +51,12 @@ impl Compiler {
     fn constant(&mut self, value: Value) {
         let index = self.chunk.add_constant(value);
         self.emit(Op::Constant(index));
+    }
+
+    /// Stores a global's name as a string constant, for the instructions
+    /// that look it up when they run.
+    fn identifier_constant(&mut self, name: &str) -> usize {
+        self.chunk.add_constant(Value::Str(name.to_string()))
     }
 
     fn expression(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -71,7 +83,8 @@ impl Compiler {
                 self.emit(binary(*op));
             }
             Expr::Ident(name) => {
-                return Err(self.unsupported(&format!("the variable `{name}`")));
+                let global = self.identifier_constant(name);
+                self.emit(Op::GetGlobal(global));
             }
             Expr::Call(..) => return Err(self.unsupported("a call")),
             Expr::Field(..) => return Err(self.unsupported("a field access")),
@@ -162,6 +175,19 @@ mod tests {
              0003    | Constant            2 \"ab\"\n\
              0004    | Equal\n\
              0005    | Return\n"
+        );
+    }
+
+    #[test]
+    fn names_globals_with_string_constants() {
+        let chunk = compiled("let speed = 2 * dt").unwrap();
+        assert_eq!(
+            chunk.to_string(),
+            "0000    1 Constant            1 2\n\
+             0001    | GetGlobal           2 \"dt\"\n\
+             0002    | Mul\n\
+             0003    | DefineGlobal        0 \"speed\"\n\
+             0004    | Return\n"
         );
     }
 }

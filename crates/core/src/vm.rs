@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::chunk::{Chunk, Op};
-use crate::interpreter::{binary, unary, RuntimeError};
+use crate::interpreter::{binary, error, unary, RuntimeError};
 use crate::value::Value;
 
 /// A stack machine that runs a chunk. The operators share their meaning with
@@ -8,6 +10,9 @@ use crate::value::Value;
 #[derive(Default)]
 pub struct Vm {
     stack: Vec<Value>,
+    /// Looked up by name each time they are used, as in clox, so a reloaded
+    /// game sees the new definitions.
+    globals: HashMap<String, Value>,
 
     pub trace: bool,
 }
@@ -17,7 +22,8 @@ impl Vm {
         Self::default()
     }
 
-    pub fn run(&mut self, chunk: &Chunk) -> Result<Value, RuntimeError> {
+    /// Runs a chunk and returns the value its statement left, if any.
+    pub fn run(&mut self, chunk: &Chunk) -> Result<Option<Value>, RuntimeError> {
         self.stack.clear();
         let mut ip = 0;
         loop {
@@ -42,6 +48,21 @@ impl Vm {
                     self.push(Value::Bool(false));
                     Ok(())
                 }
+                Op::DefineGlobal(index) => {
+                    let value = self.pop();
+                    self.globals.insert(chunk.name(index).to_string(), value);
+                    Ok(())
+                }
+                Op::GetGlobal(index) => {
+                    let name = chunk.name(index);
+                    match self.globals.get(name).cloned() {
+                        Some(value) => {
+                            self.push(value);
+                            Ok(())
+                        }
+                        None => Err(error(format!("undefined variable `{name}`"))),
+                    }
+                }
                 Op::Negate => self.unary(UnaryOp::Neg),
                 Op::Not => self.unary(UnaryOp::Not),
                 Op::Add => self.binary(BinaryOp::Add),
@@ -55,7 +76,7 @@ impl Vm {
                 Op::LessEqual => self.binary(BinaryOp::Le),
                 Op::Greater => self.binary(BinaryOp::Gt),
                 Op::GreaterEqual => self.binary(BinaryOp::Ge),
-                Op::Return => return Ok(self.pop()),
+                Op::Return => return Ok(self.stack.pop()),
             };
             result.map_err(|e| RuntimeError {
                 line: Some(chunk.lines[ip - 1]),
@@ -85,5 +106,66 @@ impl Vm {
         let left = self.pop();
         self.push(binary(op, left, right)?);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::compile;
+    use crate::interpreter::Interpreter;
+    use crate::parser::parse;
+    use crate::scanner::scan_tokens;
+
+    /// Runs `source` one statement at a time on the VM and on the
+    /// interpreter, which must agree, and shows what each statement gave as
+    /// the REPL does.
+    fn outputs(source: &str) -> String {
+        let tokens = scan_tokens(source).expect("source should scan cleanly");
+        let statements = parse(tokens).expect("source should parse cleanly");
+        let mut vm = Vm::new();
+        let mut interpreter = Interpreter::new();
+        let mut lines = Vec::new();
+        for stmt in &statements {
+            let chunk = compile(stmt).unwrap_or_else(|e| panic!("{e}"));
+            let result = vm.run(&chunk);
+            assert_eq!(
+                result,
+                interpreter.execute(stmt),
+                "the VM and the interpreter disagree on `{stmt}`"
+            );
+            match result {
+                Ok(value) => lines.extend(value.map(|v| v.to_string())),
+                Err(e) => lines.push(format!("[line {}] error: {}", e.line.unwrap(), e.message)),
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn runs(cases: &[(&str, &str)]) {
+        for (source, expected) in cases {
+            assert_eq!(outputs(source), *expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn evaluates_expressions() {
+        runs(&[
+            ("1 + 2 * 3\n-(7 % 4)\n7.0 / 2.0", "7\n-3\n3.5"),
+            ("\"a\" + \"b\" == \"ab\"\n!(1 < 2)", "true\nfalse"),
+            ("1\n1 / 0", "1\n[line 2] error: division by zero"),
+        ]);
+    }
+
+    #[test]
+    fn globals_are_bound_and_looked_up_by_name() {
+        runs(&[
+            ("let a = 2\nlet b = a * 3\na + b", "8"),
+            ("let a = 1\nlet a = a + 1\na", "2"),
+            (
+                "x\nlet x = 1\nx\nlet y = z",
+                "[line 1] error: undefined variable `x`\n1\n[line 4] error: undefined variable `z`",
+            ),
+        ]);
     }
 }
