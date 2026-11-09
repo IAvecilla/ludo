@@ -1,10 +1,23 @@
 use std::rc::Rc;
 
 use crate::ast::{
-    BinaryOp, Expr, FnDecl, Param, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, TypeExpr,
-    UnaryOp,
+    Expr, FnDecl, Param, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, TypeExpr,
 };
 use crate::token::{Token, TokenKind};
+
+mod ladder;
+mod pratt;
+
+/// How expressions are parsed. Both build the same tree; the ladder stays to
+/// compare against Pratt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExprParser {
+    /// One loop driven by a table of precedences, as in clox.
+    #[default]
+    Pratt,
+    /// One function per level of precedence, as in jlox.
+    Ladder,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -24,7 +37,11 @@ impl ParseError {
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, Vec<ParseError>> {
-    let mut parser = Parser::new(tokens);
+    parse_with(tokens, ExprParser::default())
+}
+
+pub fn parse_with(tokens: Vec<Token>, exprs: ExprParser) -> Result<Vec<Stmt>, Vec<ParseError>> {
+    let mut parser = Parser::new(tokens, exprs);
     let mut statements = Vec::new();
     let mut errors = Vec::new();
 
@@ -50,7 +67,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, Vec<ParseError>> {
 }
 
 pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(tokens, ExprParser::default());
     let expr = parser.expression()?;
     if !parser.is_at_end() {
         return Err(parser.error("unexpected trailing input"));
@@ -64,16 +81,18 @@ struct Parser {
     blocks: usize,
     struct_ok: bool,
     state: Option<String>,
+    exprs: ExprParser,
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
+    fn new(tokens: Vec<Token>, exprs: ExprParser) -> Self {
         Self {
             tokens,
             current: 0,
             blocks: 0,
             struct_ok: true,
             state: None,
+            exprs,
         }
     }
 
@@ -308,111 +327,22 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
-        self.or()
-    }
-
-    fn or(&mut self) -> Result<Expr, ParseError> {
-        self.binary(Self::and, &[(TokenKind::Or, BinaryOp::Or)])
-    }
-
-    fn and(&mut self) -> Result<Expr, ParseError> {
-        self.binary(Self::equality, &[(TokenKind::And, BinaryOp::And)])
-    }
-
-    fn equality(&mut self) -> Result<Expr, ParseError> {
-        self.binary(
-            Self::comparison,
-            &[
-                (TokenKind::EqEq, BinaryOp::Eq),
-                (TokenKind::BangEq, BinaryOp::Ne),
-            ],
-        )
-    }
-
-    fn comparison(&mut self) -> Result<Expr, ParseError> {
-        self.binary(
-            Self::pipe,
-            &[
-                (TokenKind::Less, BinaryOp::Lt),
-                (TokenKind::LessEq, BinaryOp::Le),
-                (TokenKind::Greater, BinaryOp::Gt),
-                (TokenKind::GreaterEq, BinaryOp::Ge),
-            ],
-        )
-    }
-
-    fn pipe(&mut self) -> Result<Expr, ParseError> {
-        let mut left = self.term()?;
-        while self.matches(&[TokenKind::PipeGt]) {
-            let line = self.tokens[self.current - 1].line;
-            let right = self.term()?;
-            left = pipe_into(left, right, line)?;
+        match self.exprs {
+            ExprParser::Pratt => self.pratt_expression(),
+            ExprParser::Ladder => self.ladder_expression(),
         }
-        Ok(left)
     }
 
-    fn term(&mut self) -> Result<Expr, ParseError> {
-        self.binary(
-            Self::factor,
-            &[
-                (TokenKind::Plus, BinaryOp::Add),
-                (TokenKind::Minus, BinaryOp::Sub),
-            ],
-        )
-    }
-
-    fn factor(&mut self) -> Result<Expr, ParseError> {
-        self.binary(
-            Self::unary,
-            &[
-                (TokenKind::Star, BinaryOp::Mul),
-                (TokenKind::Slash, BinaryOp::Div),
-                (TokenKind::Percent, BinaryOp::Rem),
-            ],
-        )
-    }
-
-    fn binary(
-        &mut self,
-        operand: fn(&mut Self) -> Result<Expr, ParseError>,
-        ops: &[(TokenKind, BinaryOp)],
-    ) -> Result<Expr, ParseError> {
-        let mut left = operand(self)?;
-        while let Some(&(_, op)) = ops.iter().find(|(kind, _)| kind == self.peek()) {
-            self.advance();
-            let right = operand(self)?;
-            left = Expr::Binary(Box::new(left), op, Box::new(right));
-        }
-        Ok(left)
-    }
-
-    fn unary(&mut self) -> Result<Expr, ParseError> {
-        let op = match self.peek() {
-            TokenKind::Minus => UnaryOp::Neg,
-            TokenKind::Bang => UnaryOp::Not,
-            _ => return self.postfix(),
-        };
-        self.advance();
-        Ok(Expr::Unary(op, Box::new(self.unary()?)))
-    }
-
-    fn postfix(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.primary()?;
-        loop {
-            if self.matches(&[TokenKind::LParen]) {
-                expr = Expr::Call(Box::new(expr), self.arguments()?);
-            } else if self.matches(&[TokenKind::Dot]) {
-                let name = self.expect_ident("a field or method name after `.`")?;
-                if self.matches(&[TokenKind::LParen]) {
-                    let mut args = vec![expr];
-                    args.extend(self.arguments()?);
-                    expr = Expr::Call(Box::new(Expr::Ident(name)), args);
-                } else {
-                    expr = Expr::Field(Box::new(expr), name);
-                }
-            } else {
-                return Ok(expr);
-            }
+    /// What follows a `.`: a field of `receiver`, or a method call that
+    /// passes it as the first argument.
+    fn dot(&mut self, receiver: Expr) -> Result<Expr, ParseError> {
+        let name = self.expect_ident("a field or method name after `.`")?;
+        if self.matches(&[TokenKind::LParen]) {
+            let mut args = vec![receiver];
+            args.extend(self.arguments()?);
+            Ok(Expr::Call(Box::new(Expr::Ident(name)), args))
+        } else {
+            Ok(Expr::Field(Box::new(receiver), name))
         }
     }
 
@@ -722,9 +652,27 @@ mod tests {
     use super::*;
     use crate::scanner::scan_tokens;
 
+    /// Parses with Pratt and with the ladder, which must agree on every tree
+    /// and every error.
+    fn both(source: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
+        let run = |exprs| {
+            parse_with(
+                scan_tokens(source).expect("source should scan cleanly"),
+                exprs,
+            )
+        };
+        let pratt = run(ExprParser::Pratt);
+        assert_eq!(
+            run(ExprParser::Ladder),
+            pratt,
+            "the ladder and Pratt disagree on {source:?}"
+        );
+        pratt
+    }
+
     fn tree(source: &str) -> Result<String, String> {
         let join = |lines: Vec<String>| lines.join("\n");
-        match parse(scan_tokens(source).expect("source should scan cleanly")) {
+        match both(source) {
             Ok(statements) => Ok(join(statements.iter().map(|s| s.to_string()).collect())),
             Err(errors) => Err(join(errors.into_iter().map(|e| e.message).collect())),
         }
@@ -743,15 +691,20 @@ mod tests {
     }
 
     #[test]
-    fn expressions_follow_the_precedence_ladder() {
+    fn expressions_follow_precedence_and_associativity() {
         parses(&[
             (
                 "1\n0.2s\n\"hi\"\n:jump\ntrue",
                 "1\n0.2\n\"hi\"\n:jump\ntrue",
             ),
-            ("1 - 2 - 3", "(- (- 1 2) 3)"),
+            ("1 - 2 - 3\na < b < c", "(- (- 1 2) 3)\n(< (< a b) c)"),
+            ("1 + 2 * 3\n1 * 2 + 3", "(+ 1 (* 2 3))\n(+ (* 1 2) 3)"),
             ("(1 + 2) * 3", "(* (+ 1 2) 3)"),
             ("-1 * 2\n!!a", "(* (- 1) 2)\n(! (! a))"),
+            (
+                "-f(x).y * -a\n!a == b",
+                "(* (- (. (call f x) y)) (- a))\n(== (! a) b)",
+            ),
             (
                 "a or b and c == d < e + f * g",
                 "(or a (and b (== c (< d (+ e (* f g))))))",
@@ -818,7 +771,7 @@ mod tests {
 
     #[test]
     fn errors_know_their_line_and_whether_the_input_ended() {
-        let errors = |source: &str| parse(scan_tokens(source).unwrap()).unwrap_err();
+        let errors = |source: &str| both(source).unwrap_err();
         let lines: Vec<usize> = errors("let ok = 1\nlet 1 = 2\n\nlet x")
             .iter()
             .map(|e| e.line)
@@ -992,5 +945,15 @@ mod tests {
                 "`start` is a statement, not a value: it goes on its own line, found `start`",
             ),
         ]);
+    }
+
+    #[test]
+    fn the_examples_parse_the_same_both_ways() {
+        for source in [
+            include_str!("../../../examples/pong.ludo"),
+            include_str!("../../../examples/square.ludo"),
+        ] {
+            assert!(both(source).is_ok());
+        }
     }
 }
