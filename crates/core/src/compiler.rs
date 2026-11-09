@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
-use crate::chunk::{Chunk, Op};
+use crate::chunk::{Chunk, Op, Test};
 use crate::value::Value;
 
 /// A construct the compiler cannot turn into bytecode yet.
@@ -120,6 +120,22 @@ impl Compiler {
         }
     }
 
+    /// Emits a jump whose target is not known yet, and returns where it is
+    /// so `patch_jump` can fill it in.
+    fn emit_jump(&mut self, jump: fn(usize) -> Op) -> usize {
+        self.emit(jump(usize::MAX));
+        self.chunk.code.len() - 1
+    }
+
+    /// Points the jump at `at` to the next instruction to be emitted.
+    fn patch_jump(&mut self, at: usize) {
+        let distance = self.chunk.code.len() - at - 1;
+        match &mut self.chunk.code[at] {
+            Op::Jump(target) | Op::JumpIfFalse(target) => *target = distance,
+            op => unreachable!("only jumps are patched, got {op:?}"),
+        }
+    }
+
     /// The slot of the innermost local with this name. Without one, the name
     /// is a global.
     fn resolve_local(&self, name: &str) -> Option<usize> {
@@ -156,8 +172,29 @@ impl Compiler {
                     UnaryOp::Not => Op::Not,
                 });
             }
-            Expr::Binary(_, op @ (BinaryOp::And | BinaryOp::Or), _) => {
-                return Err(self.unsupported(&format!("`{op}`, which needs jumps,")));
+            // If the left side is false, so is the whole `and`: it stays as
+            // the value and the right side is skipped.
+            Expr::Binary(left, BinaryOp::And, right) => {
+                self.expression(left)?;
+                self.emit(Op::CheckBool(Test::And));
+                let end = self.emit_jump(Op::JumpIfFalse);
+                self.emit(Op::Pop);
+                self.expression(right)?;
+                self.emit(Op::CheckBool(Test::And));
+                self.patch_jump(end);
+            }
+            // If the left side is true, so is the whole `or`. clox has no
+            // jump on true, so a false one jumps over a jump to the end.
+            Expr::Binary(left, BinaryOp::Or, right) => {
+                self.expression(left)?;
+                self.emit(Op::CheckBool(Test::Or));
+                let else_jump = self.emit_jump(Op::JumpIfFalse);
+                let end = self.emit_jump(Op::Jump);
+                self.patch_jump(else_jump);
+                self.emit(Op::Pop);
+                self.expression(right)?;
+                self.emit(Op::CheckBool(Test::Or));
+                self.patch_jump(end);
             }
             Expr::Binary(left, op, right) => {
                 self.expression(left)?;
@@ -183,7 +220,21 @@ impl Compiler {
             }
             Expr::Call(..) => return Err(self.unsupported("a call")),
             Expr::Field(..) => return Err(self.unsupported("a field access")),
-            Expr::If(..) => return Err(self.unsupported("`if`")),
+            // Each branch pops the condition and leaves its own value. Both
+            // paths reach the end with the stack one value higher, so the
+            // height the compiler counts holds after the jumps too.
+            Expr::If(cond, then, otherwise) => {
+                self.expression(cond)?;
+                self.emit(Op::CheckBool(Test::If));
+                let then_jump = self.emit_jump(Op::JumpIfFalse);
+                self.emit(Op::Pop);
+                self.expression(then)?;
+                let else_jump = self.emit_jump(Op::Jump);
+                self.patch_jump(then_jump);
+                self.emit(Op::Pop);
+                self.expression(otherwise)?;
+                self.patch_jump(else_jump);
+            }
             Expr::List(..) => return Err(self.unsupported("a list")),
             Expr::Struct { .. } => return Err(self.unsupported("a struct")),
         }
@@ -220,7 +271,9 @@ fn stack_effect(op: Op) -> isize {
     match op {
         Op::Constant(_) | Op::True | Op::False | Op::GetGlobal(_) | Op::GetLocal(_) => 1,
         // `Return` ends the chunk, so nothing after it counts the stack.
-        Op::Negate | Op::Not | Op::Return => 0,
+        Op::Negate | Op::Not | Op::CheckBool(_) | Op::Jump(_) | Op::JumpIfFalse(_) | Op::Return => {
+            0
+        }
         Op::PopBelow(count) => -(count as isize),
         Op::DefineGlobal(_)
         | Op::Pop
@@ -322,6 +375,39 @@ mod tests {
              0006    1 Add\n\
              0007    | DefineGlobal        0 \"r\"\n\
              0008    | Return\n"
+        );
+    }
+
+    #[test]
+    fn if_jumps_over_the_branch_it_does_not_take() {
+        let chunk = compiled("if c { 1 } else { 2 }").unwrap();
+        assert_eq!(
+            chunk.to_string(),
+            "0000    1 GetGlobal           0 \"c\"\n\
+             0001    | CheckBool          if\n\
+             0002    | JumpIfFalse         3 -> 6\n\
+             0003    | Pop\n\
+             0004    | Constant            1 1\n\
+             0005    | Jump                2 -> 8\n\
+             0006    | Pop\n\
+             0007    | Constant            2 2\n\
+             0008    | Return\n"
+        );
+    }
+
+    #[test]
+    fn or_jumps_to_the_end_when_the_left_side_is_true() {
+        let chunk = compiled("a or b").unwrap();
+        assert_eq!(
+            chunk.to_string(),
+            "0000    1 GetGlobal           0 \"a\"\n\
+             0001    | CheckBool          or\n\
+             0002    | JumpIfFalse         1 -> 4\n\
+             0003    | Jump                3 -> 7\n\
+             0004    | Pop\n\
+             0005    | GetGlobal           1 \"b\"\n\
+             0006    | CheckBool          or\n\
+             0007    | Return\n"
         );
     }
 }

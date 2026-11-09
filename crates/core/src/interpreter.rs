@@ -137,24 +137,24 @@ impl Interpreter {
                 self.locals.truncate(outer);
                 result
             }
-            Expr::If(cond, then, otherwise) => match self.evaluate(cond)? {
-                Value::Bool(true) => self.evaluate(then),
-                Value::Bool(false) => self.evaluate(otherwise),
-                other => Err(error(format!(
-                    "the condition of `if` must be a Bool, got {}",
-                    other.type_name()
-                ))),
-            },
+            Expr::If(cond, then, otherwise) => {
+                if self.boolean(cond, condition)? {
+                    self.evaluate(then)
+                } else {
+                    self.evaluate(otherwise)
+                }
+            }
             Expr::Unary(op, right) => {
                 let right = self.evaluate(right)?;
                 unary(*op, right)
             }
             Expr::Binary(left, op @ (BinaryOp::And | BinaryOp::Or), right) => {
                 let stop = *op == BinaryOp::Or;
-                if self.boolean(left, *op)? == stop {
+                let operand = |value: &Value| logical(*op, value);
+                if self.boolean(left, operand)? == stop {
                     return Ok(Value::Bool(stop));
                 }
-                Ok(Value::Bool(self.boolean(right, *op)?))
+                Ok(Value::Bool(self.boolean(right, operand)?))
             }
             Expr::Binary(left, op, right) => {
                 let left = self.evaluate(left)?;
@@ -304,14 +304,37 @@ impl Interpreter {
             .or_else(|| self.globals.get(name))
     }
 
-    fn boolean(&mut self, expr: &Expr, op: BinaryOp) -> Result<bool, RuntimeError> {
-        match self.evaluate(expr)? {
-            Value::Bool(v) => Ok(v),
-            v => Err(error(format!(
-                "operands of `{op}` must be Bool, got {}",
-                v.type_name()
-            ))),
-        }
+    /// Evaluates an expression that must give a Bool. It runs in a frame of
+    /// its own so that its temporaries do not grow the frame of `evaluate`,
+    /// which deep recursion stacks up.
+    fn boolean(
+        &mut self,
+        expr: &Expr,
+        check: impl Fn(&Value) -> Result<bool, RuntimeError>,
+    ) -> Result<bool, RuntimeError> {
+        check(&self.evaluate(expr)?)
+    }
+}
+
+/// The condition of an `if`, which must be a Bool: ludo has no truthiness.
+pub(crate) fn condition(value: &Value) -> Result<bool, RuntimeError> {
+    match value {
+        Value::Bool(v) => Ok(*v),
+        v => Err(error(format!(
+            "the condition of `if` must be a Bool, got {}",
+            v.type_name()
+        ))),
+    }
+}
+
+/// An operand of `and` or `or`, which must be a Bool.
+pub(crate) fn logical(op: BinaryOp, value: &Value) -> Result<bool, RuntimeError> {
+    match value {
+        Value::Bool(v) => Ok(*v),
+        v => Err(error(format!(
+            "operands of `{op}` must be Bool, got {}",
+            v.type_name()
+        ))),
     }
 }
 
