@@ -34,6 +34,21 @@ pub enum Op {
     /// Calls the value below this many arguments on top of the stack, and
     /// leaves the result in place of the call.
     Call(usize),
+    /// Builds a list from this many values on top of the stack.
+    List(usize),
+    /// Declares the struct in this shape. Literals look it up by name when
+    /// they run, as globals are, so a struct can be declared after a
+    /// function that builds it.
+    DefineStruct(usize),
+    /// Builds a struct from the values of the fields its shape lists, on top
+    /// of the stack, and, if `base`, the struct it updates right below them.
+    Struct {
+        shape: usize,
+        base: bool,
+    },
+    /// Replaces the struct on top of the stack with its field named by this
+    /// constant.
+    GetField(usize),
     Negate,
     Not,
     Add,
@@ -96,13 +111,30 @@ impl fmt::Display for Test {
     }
 }
 
+/// A struct as an instruction names it: the struct and some of its fields. A
+/// declaration lists all of them in order; a literal lists the ones it
+/// gives, in the order they are written. clox has no such thing, since its
+/// instances get their fields one at a time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shape {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+impl fmt::Display for Shape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {{ {} }}", self.name, self.fields.join(", "))
+    }
+}
+
 /// A compiled piece of code: the instructions, the line each one came from
-/// and the constants they refer to.
+/// and the constants and struct shapes they refer to.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Chunk {
     pub code: Vec<Op>,
     pub lines: Vec<usize>,
     pub constants: Vec<Value>,
+    pub shapes: Vec<Shape>,
 }
 
 impl Chunk {
@@ -114,6 +146,11 @@ impl Chunk {
     pub fn add_constant(&mut self, value: Value) -> usize {
         self.constants.push(value);
         self.constants.len() - 1
+    }
+
+    pub fn add_shape(&mut self, shape: Shape) -> usize {
+        self.shapes.push(shape);
+        self.shapes.len() - 1
     }
 
     /// The name of a global, which instructions refer to by the index of a
@@ -138,6 +175,20 @@ impl Chunk {
             Op::GetLocal(slot) => format!("{:<16} {slot:4}", "GetLocal"),
             Op::PopBelow(count) => format!("{:<16} {count:4}", "PopBelow"),
             Op::Call(argc) => format!("{:<16} {argc:4}", "Call"),
+            Op::List(count) => format!("{:<16} {count:4}", "List"),
+            Op::DefineStruct(shape) => {
+                format!("{:<16} {shape:4} {}", "DefineStruct", self.shapes[shape])
+            }
+            Op::Struct { shape, base } => {
+                let shown = &self.shapes[shape];
+                let base = if base { "_ | " } else { "" };
+                let fields = shown.fields.join(", ");
+                format!(
+                    "{:<16} {shape:4} {} {{ {base}{fields} }}",
+                    "Struct", shown.name
+                )
+            }
+            Op::GetField(index) => self.constant_op("GetField", index),
             Op::CheckBool(test) => format!("{:<16} {test:>4}", "CheckBool"),
             Op::Jump(jump) => format!("{:<16} {jump:4} -> {}", "Jump", offset + 1 + jump),
             Op::JumpIfFalse(jump) => {

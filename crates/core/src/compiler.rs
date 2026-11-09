@@ -2,7 +2,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{BinaryOp, Expr, FnDecl, Stmt, StmtKind, UnaryOp};
-use crate::chunk::{Chunk, Function, Op, Test};
+use crate::chunk::{Chunk, Function, Op, Shape, Test};
 use crate::value::Value;
 
 /// A construct the compiler cannot turn into bytecode yet.
@@ -98,7 +98,7 @@ impl Compiler {
         self.chunk.write(op, self.line);
         self.height = self
             .height
-            .checked_add_signed(stack_effect(op))
+            .checked_add_signed(stack_effect(op, &self.chunk))
             .expect("the compiler never pops an empty stack");
     }
 
@@ -129,6 +129,15 @@ impl Compiler {
             }
             // The parser only lets functions be declared at the top level, so
             // they are always globals.
+            // Only the names of the fields matter when the program runs; their
+            // types are for the checker to come.
+            StmtKind::Struct(decl) => {
+                let shape = self.chunk.add_shape(Shape {
+                    name: decl.name.clone(),
+                    fields: decl.fields.iter().map(|f| f.name.clone()).collect(),
+                });
+                self.emit(Op::DefineStruct(shape));
+            }
             StmtKind::Fn(decl) => {
                 let global = self.identifier_constant(&decl.name);
                 let function = Compiler::function(decl, stmt.line)?;
@@ -268,7 +277,11 @@ impl Compiler {
                 }
                 self.emit(Op::Call(args.len()));
             }
-            Expr::Field(..) => return Err(self.unsupported("a field access")),
+            Expr::Field(target, name) => {
+                self.expression(target)?;
+                let field = self.identifier_constant(name);
+                self.emit(Op::GetField(field));
+            }
             // Each branch pops the condition and leaves its own value. Both
             // paths reach the end with the stack one value higher, so the
             // height the compiler counts holds after the jumps too.
@@ -284,8 +297,31 @@ impl Compiler {
                 self.expression(otherwise)?;
                 self.patch_jump(else_jump);
             }
-            Expr::List(..) => return Err(self.unsupported("a list")),
-            Expr::Struct { .. } => return Err(self.unsupported("a struct")),
+            Expr::List(items) => {
+                for item in items {
+                    self.expression(item)?;
+                }
+                self.emit(Op::List(items.len()));
+            }
+            // The struct being updated goes first and the fields above it, in
+            // the order they are written. Checking them against the
+            // declaration waits until `Struct` runs.
+            Expr::Struct { name, base, fields } => {
+                if let Some(base) = base {
+                    self.expression(base)?;
+                }
+                for (_, value) in fields {
+                    self.expression(value)?;
+                }
+                let shape = self.chunk.add_shape(Shape {
+                    name: name.clone(),
+                    fields: fields.iter().map(|(field, _)| field.clone()).collect(),
+                });
+                self.emit(Op::Struct {
+                    shape,
+                    base: base.is_some(),
+                });
+            }
         }
         Ok(())
     }
@@ -316,7 +352,7 @@ fn binary(op: BinaryOp) -> Op {
 }
 
 /// How many values an instruction pushes minus how many it pops.
-fn stack_effect(op: Op) -> isize {
+fn stack_effect(op: Op, chunk: &Chunk) -> isize {
     match op {
         Op::Constant(_) | Op::True | Op::False | Op::GetGlobal(_) | Op::GetLocal(_) => 1,
         // `Return` ends the chunk, so nothing after it counts the stack.
@@ -326,6 +362,11 @@ fn stack_effect(op: Op) -> isize {
         Op::PopBelow(count) => -(count as isize),
         // It takes the callee and its arguments, and leaves the result.
         Op::Call(argc) => -(argc as isize),
+        Op::List(count) => 1 - count as isize,
+        Op::Struct { shape, base } => {
+            1 - chunk.shapes[shape].fields.len() as isize - isize::from(base)
+        }
+        Op::DefineStruct(_) | Op::GetField(_) => 0,
         Op::DefineGlobal(_)
         | Op::Pop
         | Op::Add
@@ -489,5 +530,34 @@ mod tests {
              0003    | Call                2\n\
              0004    | Return\n"
         );
+    }
+
+    #[test]
+    fn a_struct_literal_puts_its_values_on_the_stack_before_building_it() {
+        assert_eq!(
+            compiled("Ball :: struct { x: Float, y: Float }")
+                .unwrap()
+                .to_string(),
+            "0000    1 DefineStruct        0 Ball { x, y }\n\
+             0001    | Return\n"
+        );
+        assert_eq!(
+            compiled("Ball { b | y: b.y + 1.0 }").unwrap().to_string(),
+            "0000    1 GetGlobal           0 \"b\"\n\
+             0001    | GetGlobal           1 \"b\"\n\
+             0002    | GetField            2 \"y\"\n\
+             0003    | Constant            3 1.0\n\
+             0004    | Add\n\
+             0005    | Struct              0 Ball { _ | y }\n\
+             0006    | Return\n"
+        );
+    }
+
+    #[test]
+    fn compiles_the_square_example() {
+        let source = include_str!("../../../examples/square.ludo");
+        for stmt in parse(scan_tokens(source).unwrap()).unwrap() {
+            compile(&stmt).unwrap_or_else(|e| panic!("{e}"));
+        }
     }
 }
