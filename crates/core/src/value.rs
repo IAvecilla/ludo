@@ -2,7 +2,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::FnDecl;
-use crate::interpreter::{Interpreter, RuntimeError};
+use crate::chunk::Function;
+use crate::interpreter::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -11,7 +12,10 @@ pub enum Value {
     Bool(bool),
     Str(String),
     Symbol(String),
+    /// A function as the interpreter runs it, straight from the tree.
     Function(Rc<FnDecl>),
+    /// A function as the VM runs it, compiled to bytecode.
+    Compiled(Rc<Function>),
     Native(Native),
     Struct(Rc<Instance>),
     List(Rc<Vec<Value>>),
@@ -29,11 +33,18 @@ impl Instance {
     }
 }
 
+/// What a native gets to call back into ludo with, as `map` does with the
+/// function it is given. Both backends implement it, so they share the
+/// natives and their errors.
+pub trait Caller {
+    fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RuntimeError>;
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Native {
     pub name: &'static str,
     pub arity: usize,
-    pub fun: fn(&mut Interpreter, &[Value]) -> Result<Value, RuntimeError>,
+    pub fun: fn(&mut dyn Caller, &[Value]) -> Result<Value, RuntimeError>,
 }
 
 impl PartialEq for Native {
@@ -50,10 +61,17 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Str(_) => "String",
             Value::Symbol(_) => "Symbol",
-            Value::Function(_) | Value::Native(_) => "Function",
+            Value::Function(_) | Value::Compiled(_) | Value::Native(_) => "Function",
             Value::Struct(instance) => &instance.name,
             Value::List(_) => "List",
         }
+    }
+
+    pub fn is_function(&self) -> bool {
+        matches!(
+            self,
+            Value::Function(_) | Value::Compiled(_) | Value::Native(_)
+        )
     }
 
     pub fn same_type(&self, other: &Value) -> bool {
@@ -73,6 +91,7 @@ impl fmt::Display for Value {
             Value::Str(v) => write!(f, "{v}"),
             Value::Symbol(v) => write!(f, ":{v}"),
             Value::Function(decl) => write!(f, "<fn {}>", decl.name),
+            Value::Compiled(function) => write!(f, "{function}"),
             Value::Native(native) => write!(f, "<fn {}>", native.name),
             Value::Struct(instance) => {
                 write!(f, "{} {{", instance.name)?;

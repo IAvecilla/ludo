@@ -1,15 +1,30 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::{BinaryOp, UnaryOp};
-use crate::chunk::{Chunk, Op, Test};
-use crate::interpreter::{binary, condition, error, logical, unary, RuntimeError};
-use crate::value::Value;
+use crate::chunk::{Function, Op, Test};
+use crate::interpreter::{
+    binary, check_arity, condition, error, logical, unary, RuntimeError, MAX_CALL_DEPTH,
+};
+use crate::prelude::NATIVES;
+use crate::value::{Caller, Value};
 
-/// A stack machine that runs a chunk. The operators share their meaning with
-/// the tree-walking interpreter, so both give the same values and errors.
-#[derive(Default)]
+/// A call in progress: the function, the next instruction it runs and where
+/// its frame starts on the stack. clox keeps the function in slot 0; here,
+/// as in ploxb, the frame starts at the first argument and the function sits
+/// right below it, since ludo has no methods that would need it there.
+struct CallFrame {
+    function: Rc<Function>,
+    ip: usize,
+    base: usize,
+}
+
+/// A stack machine that runs compiled functions. The operators share their
+/// meaning with the tree-walking interpreter, so both give the same values
+/// and errors.
 pub struct Vm {
     stack: Vec<Value>,
+    frames: Vec<CallFrame>,
     /// Looked up by name each time they are used, as in clox, so a reloaded
     /// game sees the new definitions.
     globals: HashMap<String, Value>,
@@ -17,25 +32,62 @@ pub struct Vm {
     pub trace: bool,
 }
 
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Vm {
     pub fn new() -> Self {
-        Self::default()
+        let globals = NATIVES
+            .iter()
+            .map(|native| (native.name.to_string(), Value::Native(*native)))
+            .collect();
+        Vm {
+            stack: Vec::new(),
+            frames: Vec::new(),
+            globals,
+            trace: false,
+        }
     }
 
-    /// Runs a chunk and returns the value its statement left, if any.
-    pub fn run(&mut self, chunk: &Chunk) -> Result<Option<Value>, RuntimeError> {
+    /// Runs a compiled top-level statement and returns the value it left,
+    /// if any.
+    pub fn run(&mut self, script: Function) -> Result<Option<Value>, RuntimeError> {
         self.stack.clear();
-        let mut ip = 0;
+        self.frames.clear();
+        // As in clox, the script sits on the stack like a called function.
+        let script = Rc::new(script);
+        self.push(Value::Compiled(Rc::clone(&script)));
+        self.frames.push(CallFrame {
+            function: script,
+            ip: 0,
+            base: 1,
+        });
+        self.execute(0)
+    }
+
+    /// Runs instructions until the frame that sits on top of `entry` others
+    /// returns, and gives back its result. A top-level statement runs from no
+    /// frames; a native that calls back into ludo runs from wherever the VM
+    /// was.
+    fn execute(&mut self, entry: usize) -> Result<Option<Value>, RuntimeError> {
         loop {
+            let frame = self.frame();
+            let function = Rc::clone(&frame.function);
+            let (ip, base) = (frame.ip, frame.base);
+            frame.ip += 1;
+            let chunk = &function.chunk;
+
             if self.trace {
+                let indent = "    ".repeat(self.frames.len() - 1);
                 let stack: Vec<String> = self.stack.iter().map(|v| format!("[ {v} ]")).collect();
-                println!("          {}", stack.join(""));
-                println!("{}", chunk.disassemble_op(ip));
+                println!("{indent}          {}", stack.join(""));
+                println!("{indent}{}", chunk.disassemble_op(ip));
             }
 
-            let op = chunk.code[ip];
-            ip += 1;
-            let result = match op {
+            let result = match chunk.code[ip] {
                 Op::Constant(index) => {
                     self.push(chunk.constants[index].clone());
                     Ok(())
@@ -64,7 +116,7 @@ impl Vm {
                     }
                 }
                 Op::GetLocal(slot) => {
-                    let value = self.stack[slot].clone();
+                    let value = self.stack[base + slot].clone();
                     self.push(value);
                     Ok(())
                 }
@@ -88,12 +140,12 @@ impl Vm {
                     .map(drop)
                 }
                 Op::Jump(distance) => {
-                    ip += distance;
+                    self.frame().ip += distance;
                     Ok(())
                 }
                 Op::JumpIfFalse(distance) => {
                     if *self.peek() == Value::Bool(false) {
-                        ip += distance;
+                        self.frame().ip += distance;
                     }
                     Ok(())
                 }
@@ -110,13 +162,76 @@ impl Vm {
                 Op::LessEqual => self.binary(BinaryOp::Le),
                 Op::Greater => self.binary(BinaryOp::Gt),
                 Op::GreaterEqual => self.binary(BinaryOp::Ge),
-                Op::Return => return Ok(self.stack.pop()),
+                Op::Call(argc) => {
+                    let callee = self.stack[self.stack.len() - 1 - argc].clone();
+                    self.call_value(callee, argc)
+                }
+                Op::Return => {
+                    let frame = self.frames.pop().expect("a frame runs until it returns");
+                    // ploxb checks that the stack ends as the compiler counted
+                    // it: a function leaves just its result above its
+                    // parameters, and a script its value or nothing.
+                    let above = self.stack.len() - frame.base - frame.function.arity;
+                    debug_assert!(
+                        above == 1 || (above == 0 && frame.function.name.is_none()),
+                        "inconsistent stack height: {above} values above the parameters of {}",
+                        frame.function
+                    );
+                    let result = (above == 1).then(|| self.pop());
+                    self.stack.truncate(frame.base - 1);
+                    if self.frames.len() == entry {
+                        return Ok(result);
+                    }
+                    self.push(result.expect("a function always returns a value"));
+                    Ok(())
+                }
             };
-            result.map_err(|e| RuntimeError {
-                line: Some(chunk.lines[ip - 1]),
-                ..e
-            })?;
+            // An error from deeper calls keeps the line it already has.
+            result.map_err(|e| e.at(chunk.lines[ip]))?;
         }
+    }
+
+    /// Calls the value below the `argc` arguments on top of the stack, as
+    /// clox's `callValue`. A compiled function gets a frame that runs next;
+    /// a native runs right away and leaves its result in place of the call.
+    fn call_value(&mut self, callee: Value, argc: usize) -> Result<(), RuntimeError> {
+        match callee {
+            Value::Compiled(function) => {
+                check_arity(function.name(), function.arity, argc)?;
+                // The script's frame sits under the calls, so this allows as
+                // many nested calls as the interpreter does.
+                if self.frames.len() > MAX_CALL_DEPTH {
+                    return Err(error(format!(
+                        "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
+                    )));
+                }
+                let base = self.stack.len() - argc;
+                self.frames.push(CallFrame {
+                    function,
+                    ip: 0,
+                    base,
+                });
+                Ok(())
+            }
+            Value::Native(native) => {
+                check_arity(native.name, native.arity, argc)?;
+                let args = self.stack.split_off(self.stack.len() - argc);
+                self.pop();
+                let result = (native.fun)(self, &args)?;
+                self.push(result);
+                Ok(())
+            }
+            other => Err(error(format!(
+                "can only call functions, got {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn frame(&mut self) -> &mut CallFrame {
+        self.frames
+            .last_mut()
+            .expect("the VM only runs inside a frame")
     }
 
     fn push(&mut self, value: Value) {
@@ -149,6 +264,25 @@ impl Vm {
     }
 }
 
+/// How a native like `map` calls back into ludo: the call goes on the stack
+/// as if the bytecode made it, and the VM runs until it returns.
+impl Caller for Vm {
+    fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        let entry = self.frames.len();
+        let argc = args.len();
+        self.push(callee.clone());
+        self.stack.extend(args);
+        self.call_value(callee, argc)?;
+        if self.frames.len() == entry {
+            // A native already left its result.
+            return Ok(self.pop());
+        }
+        Ok(self
+            .execute(entry)?
+            .expect("a function always returns a value"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,19 +301,25 @@ mod tests {
         let mut interpreter = Interpreter::new();
         let mut lines = Vec::new();
         for stmt in &statements {
-            let chunk = compile(stmt).unwrap_or_else(|e| panic!("{e}"));
-            let result = vm.run(&chunk);
+            let script = compile(stmt).unwrap_or_else(|e| panic!("{e}"));
+            let shown = show(vm.run(script));
+            // A function is a tree in one backend and bytecode in the other,
+            // so they are compared as they are shown.
             assert_eq!(
-                result,
-                interpreter.execute(stmt),
+                shown,
+                show(interpreter.execute(stmt)),
                 "the VM and the interpreter disagree on `{stmt}`"
             );
-            match result {
-                Ok(value) => lines.extend(value.map(|v| v.to_string())),
-                Err(e) => lines.push(format!("[line {}] error: {}", e.line.unwrap(), e.message)),
-            }
+            lines.extend(shown);
         }
         lines.join("\n")
+    }
+
+    fn show(result: Result<Option<Value>, RuntimeError>) -> Option<String> {
+        match result {
+            Ok(value) => value.map(|v| v.to_string()),
+            Err(e) => Some(format!("[line {}] error: {}", e.line.unwrap(), e.message)),
+        }
     }
 
     fn runs(cases: &[(&str, &str)]) {
@@ -285,6 +425,94 @@ mod tests {
                 "[line 1] error: operands of `and` must be Bool, got Int\n\
                  [line 2] error: operands of `and` must be Bool, got Int\n\
                  [line 3] error: operands of `or` must be Bool, got Symbol",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn calls_functions() {
+        let add = "add :: (a: Int, b: Int) -> Int { a + b }\n";
+        let parity = "is_even :: (n: Int) -> Bool { n == 0 or is_odd(n - 1) }\n\
+                      is_odd :: (n: Int) -> Bool { n != 0 and is_even(n - 1) }\n";
+        runs(&[
+            (
+                &format!("{add}add(2, 3)\n2 |> add(3)\n2.add(3)\n1 + add(2, 3) * 2"),
+                "5\n5\n5\n11",
+            ),
+            (&format!("{parity}is_even(10)\nis_odd(7)"), "true\ntrue"),
+            // Globals are looked up when the function runs.
+            (
+                "scaled :: (x: Int) -> Int { x * SCALE }\nlet SCALE = 10\nscaled(3)",
+                "30",
+            ),
+            (
+                "fact :: (n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }\nfact(10)",
+                "3628800",
+            ),
+            // A function's locals sit above its parameters, and it does not
+            // see the locals of its caller.
+            (
+                "f :: (x: Int) -> Int {\n  let y = x * 2\n  y + 1\n}\n{\n  let a = 3\n  f(a) + a\n}",
+                "10",
+            ),
+            (
+                "peek :: () -> Int { secret }\n{\n  let secret = 1\n  peek()\n}",
+                "[line 1] error: undefined variable `secret`",
+            ),
+            ("let x = 100\nid :: (x: Int) -> Int { x }\nid(1)\nx", "1\n100"),
+            (
+                "double :: (x: Int) -> Int { x * 2 }\ntwice :: (f: Fn, x: Int) -> Int { f(f(x)) }\ntwice(double, 3)\ndouble",
+                "12\n<fn double>",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn reports_errors_in_calls() {
+        let add = "add :: (a: Int, b: Int) -> Int { a + b }\n";
+        runs(&[
+            (
+                &format!("{add}id :: (x: Int) -> Int {{ x }}\nadd(1)\nid(1, 2)\nlet n = 1\nn(2)\nid == id"),
+                "[line 3] error: `add` expects 2 arguments, got 1\n\
+                 [line 4] error: `id` expects 1 argument, got 2\n\
+                 [line 6] error: can only call functions, got Int\n\
+                 [line 7] error: functions cannot be compared",
+            ),
+            // An error inside a function keeps its own line, even when it
+            // comes back through a native.
+            (
+                "boom :: (x: Int) -> Int {\n  1 / x\n}\nboom(0)\nrange(0, 1) |> map(boom)",
+                "[line 2] error: division by zero\n[line 2] error: division by zero",
+            ),
+            (
+                "loop_forever :: (n: Int) -> Int { loop_forever(n + 1) }\nloop_forever(0)",
+                "[line 1] error: stack overflow: more than 200 nested calls",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn natives_call_back_into_ludo() {
+        let fns = "double :: (x: Int) -> Int { x * 2 }\n\
+                   even :: (x: Int) -> Bool { x % 2 == 0 }\n\
+                   add :: (a: Int, b: Int) -> Int { a + b }\n";
+        runs(&[
+            (
+                "abs(-3)\nmin(2.0, 1.5)\nclamp(5, 0, 3)\nto_string(3) + \"!\"\n3 |> print |> abs",
+                "3\n1.5\n3\n3!\n3",
+            ),
+            ("abs\nlet abs = 1\nabs + 1", "<fn abs>\n2"),
+            (
+                &format!("{fns}range(0, 10) |> filter(even) |> map(double) |> fold(0, add)\nrange(0, 3) |> map(double)"),
+                "40\n[0, 2, 4]",
+            ),
+            (&format!("{fns}range(1, 1001) |> fold(0, add)"), "500500"),
+            (
+                &format!("{fns}range(0, 3) |> filter(double)\nrange(0, 3) |> map(add)\nabs(true)\nmin(1)"),
+                "[line 4] error: `filter` expects a function that returns a Bool, got Int\n\
+                 [line 5] error: `add` expects 2 arguments, got 1\n\
+                 [line 6] error: `abs` expects an Int or a Float, got Bool\n\
+                 [line 7] error: `min` expects 2 arguments, got 1",
             ),
         ]);
     }

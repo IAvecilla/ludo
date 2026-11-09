@@ -1,7 +1,8 @@
 use std::fmt;
+use std::rc::Rc;
 
-use crate::ast::{BinaryOp, Expr, Stmt, StmtKind, UnaryOp};
-use crate::chunk::{Chunk, Op, Test};
+use crate::ast::{BinaryOp, Expr, FnDecl, Stmt, StmtKind, UnaryOp};
+use crate::chunk::{Chunk, Function, Op, Test};
 use crate::value::Value;
 
 /// A construct the compiler cannot turn into bytecode yet.
@@ -17,23 +18,22 @@ impl fmt::Display for CompileError {
     }
 }
 
-/// Compiles a top-level statement into a chunk. An expression returns its
-/// value; a `let` binds a global and returns nothing. The VM keeps the
-/// globals from one chunk to the next.
-pub fn compile(stmt: &Stmt) -> Result<Chunk, CompileError> {
-    let mut compiler = Compiler {
-        chunk: Chunk::default(),
-        line: stmt.line,
-        locals: Vec::new(),
-        scope_depth: 0,
-        height: 0,
-    };
+/// Compiles a top-level statement into a function with no name, the script
+/// that runs it. An expression returns its value; a `let` or a declaration
+/// binds a global and returns nothing. The VM keeps the globals from one
+/// script to the next.
+pub fn compile(stmt: &Stmt) -> Result<Function, CompileError> {
+    let mut compiler = Compiler::new(stmt.line);
     match &stmt.kind {
         StmtKind::Expr(expr) => compiler.expression(expr)?,
         _ => compiler.statement(stmt)?,
     }
     compiler.emit(Op::Return);
-    Ok(compiler.chunk)
+    Ok(Function {
+        name: None,
+        arity: 0,
+        chunk: compiler.chunk,
+    })
 }
 
 /// A local variable while its block is being compiled.
@@ -61,6 +61,39 @@ struct Compiler {
 }
 
 impl Compiler {
+    fn new(line: usize) -> Self {
+        Compiler {
+            chunk: Chunk::default(),
+            line,
+            locals: Vec::new(),
+            scope_depth: 0,
+            height: 0,
+        }
+    }
+
+    /// Compiles a function with a compiler of its own, as clox does. Its
+    /// parameters are its first locals, from slot 0 up: the frame starts at
+    /// the first argument, as in ploxb, and the function sits right below.
+    fn function(decl: &FnDecl, line: usize) -> Result<Function, CompileError> {
+        let mut compiler = Compiler::new(line);
+        compiler.scope_depth = 1;
+        for param in &decl.params {
+            compiler.locals.push(Local {
+                name: param.name.clone(),
+                depth: 1,
+                slot: compiler.height,
+            });
+            compiler.height += 1;
+        }
+        compiler.expression(&decl.body)?;
+        compiler.emit(Op::Return);
+        Ok(Function {
+            name: Some(decl.name.clone()),
+            arity: decl.params.len(),
+            chunk: compiler.chunk,
+        })
+    }
+
     fn emit(&mut self, op: Op) {
         self.chunk.write(op, self.line);
         self.height = self
@@ -93,6 +126,14 @@ impl Compiler {
             StmtKind::Expr(expr) => {
                 self.expression(expr)?;
                 self.emit(Op::Pop);
+            }
+            // The parser only lets functions be declared at the top level, so
+            // they are always globals.
+            StmtKind::Fn(decl) => {
+                let global = self.identifier_constant(&decl.name);
+                let function = Compiler::function(decl, stmt.line)?;
+                self.constant(Value::Compiled(Rc::new(function)));
+                self.emit(Op::DefineGlobal(global));
             }
             other => return Err(self.unsupported(&format!("`{}`", kind(other)))),
         }
@@ -218,7 +259,15 @@ impl Compiler {
                 self.end_scope();
                 self.line = outer;
             }
-            Expr::Call(..) => return Err(self.unsupported("a call")),
+            // The callee goes first, then its arguments above it, so the frame
+            // of the call starts at the first argument.
+            Expr::Call(callee, args) => {
+                self.expression(callee)?;
+                for arg in args {
+                    self.expression(arg)?;
+                }
+                self.emit(Op::Call(args.len()));
+            }
             Expr::Field(..) => return Err(self.unsupported("a field access")),
             // Each branch pops the condition and leaves its own value. Both
             // paths reach the end with the stack one value higher, so the
@@ -275,6 +324,8 @@ fn stack_effect(op: Op) -> isize {
             0
         }
         Op::PopBelow(count) => -(count as isize),
+        // It takes the callee and its arguments, and leaves the result.
+        Op::Call(argc) => -(argc as isize),
         Op::DefineGlobal(_)
         | Op::Pop
         | Op::Add
@@ -310,7 +361,7 @@ mod tests {
 
     fn compiled(source: &str) -> Result<Chunk, CompileError> {
         let statements = parse(scan_tokens(source).unwrap()).unwrap();
-        compile(&statements[0])
+        compile(&statements[0]).map(|script| script.chunk)
     }
 
     #[test]
@@ -408,6 +459,35 @@ mod tests {
              0005    | GetGlobal           1 \"b\"\n\
              0006    | CheckBool          or\n\
              0007    | Return\n"
+        );
+    }
+
+    #[test]
+    fn a_function_has_its_own_chunk_with_its_parameters_from_slot_0() {
+        let script = compiled("add :: (a: Int, b: Int) -> Int { a + b }").unwrap();
+        assert_eq!(
+            script.to_string(),
+            "0000    1 Constant            1 <fn add>\n\
+             0001    | DefineGlobal        0 \"add\"\n\
+             0002    | Return\n"
+        );
+        let Value::Compiled(add) = &script.constants[1] else {
+            panic!("the function should be a constant of the script");
+        };
+        assert_eq!(
+            add.chunk.to_string(),
+            "0000    1 GetLocal            0\n\
+             0001    | GetLocal            1\n\
+             0002    | Add\n\
+             0003    | Return\n"
+        );
+        assert_eq!(
+            compiled("add(1, 2)").unwrap().to_string(),
+            "0000    1 GetGlobal           0 \"add\"\n\
+             0001    | Constant            1 1\n\
+             0002    | Constant            2 2\n\
+             0003    | Call                2\n\
+             0004    | Return\n"
         );
     }
 }
