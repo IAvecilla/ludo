@@ -61,6 +61,10 @@ pub struct Vm {
     /// `over`, and how long the frame is.
     spent: bool,
     dt: f64,
+    /// How many frames under the calls are not calls themselves: the script
+    /// of a statement or a running sequence, which the interpreter does not
+    /// count either, or none when the host calls a function directly.
+    root: usize,
 
     pub trace: bool,
 }
@@ -86,6 +90,7 @@ impl Vm {
             runs: Vec::new(),
             spent: false,
             dt: 0.0,
+            root: 0,
             trace: false,
         }
     }
@@ -96,6 +101,7 @@ impl Vm {
         self.stack.clear();
         self.frames.clear();
         // As in clox, the script sits on the stack like a called function.
+        self.root = 1;
         let script = Rc::new(script);
         self.push(Value::Compiled(Rc::clone(&script)));
         self.frames.push(CallFrame {
@@ -134,6 +140,55 @@ impl Vm {
         result.map(|()| world)
     }
 
+    /// Calls a global function from the host, as `play` does with `init`,
+    /// `update` and `draw`.
+    pub fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        let callee = self
+            .globals
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("undefined function `{name}`")))?;
+        self.stack.clear();
+        self.frames.clear();
+        self.root = 0;
+        self.call(callee, args)
+    }
+
+    /// How many arguments the global function with this name takes, if it
+    /// is one.
+    pub fn arity(&self, name: &str) -> Option<usize> {
+        match self.globals.get(name)? {
+            Value::Compiled(function) => Some(function.arity),
+            Value::Native(native) => Some(native.arity),
+            _ => None,
+        }
+    }
+
+    /// The fields of every declared struct, for `play` to tell whether a
+    /// reload changed the shape of the world.
+    pub fn struct_shapes(&self) -> HashMap<String, Vec<String>> {
+        self.structs.clone()
+    }
+
+    /// Takes over the sequences running in `from`, the VM of the code before
+    /// a reload, except those this one already started. They keep the code
+    /// they started with, and look globals up by name in this VM.
+    pub fn adopt_sequences(&mut self, from: &mut Vm) {
+        let mut runs = std::mem::take(&mut from.runs);
+        runs.retain(|run| {
+            !self
+                .runs
+                .iter()
+                .any(|own| own.function.name == run.function.name)
+        });
+        runs.append(&mut self.runs);
+        self.runs = runs;
+    }
+
+    pub fn stop_sequences(&mut self) {
+        self.runs.clear();
+    }
+
     /// Puts a sequence back on the stack and runs it until it waits for the
     /// next frame or ends, then takes it off again. If it fails it stays as
     /// it was, and the next frame tries again from where it last stopped.
@@ -149,6 +204,7 @@ impl Vm {
         });
         self.spent = false;
         self.dt = dt;
+        self.root = 1;
 
         let exit = self.execute(0)?;
         let frame = self
@@ -404,9 +460,7 @@ impl Vm {
         match callee {
             Value::Compiled(function) => {
                 check_arity(function.name(), function.arity, argc)?;
-                // The script's frame sits under the calls, so this allows as
-                // many nested calls as the interpreter does.
-                if self.frames.len() > MAX_CALL_DEPTH {
+                if self.frames.len() - self.root >= MAX_CALL_DEPTH {
                     return Err(error(format!(
                         "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
                     )));
@@ -1107,5 +1161,87 @@ mod tests {
         // The state, `from` and the two counters of the `over` halfway through.
         assert_eq!(both.vm.runs[0].slots.len(), 4);
         assert!(both.vm.stack.is_empty() && both.vm.frames.is_empty());
+    }
+
+    /// Runs `test` on a thread with room for the interpreter's 200 nested
+    /// calls, which in a debug build need more than the 2 MiB a test thread
+    /// gets. The VM keeps its calls in a `Vec` and needs no room.
+    fn with_room(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn the_host_calls_functions() {
+        with_room(the_host_calls_functions_with_room);
+    }
+
+    fn the_host_calls_functions_with_room() {
+        let mut both = Both::new(
+            "add :: (a: Int, b: Int) -> Int { a + b }\nlet n = 1\n\
+             count :: (n: Int) -> Int { if n == 0 { 0 } else { 1 + count(n - 1) } }",
+        );
+        let mut call = |name: &str, args: Vec<Value>| {
+            let result = both.vm.call_function(name, args.clone());
+            assert_eq!(result, both.interpreter.call_function(name, args), "{name}");
+            result.map_err(|e| e.message)
+        };
+        assert_eq!(
+            call("add", vec![Value::Int(2), Value::Int(3)]),
+            Ok(Value::Int(5))
+        );
+        assert_eq!(call("abs", vec![Value::Int(-4)]), Ok(Value::Int(4)));
+        assert_eq!(
+            call("n", vec![]),
+            Err("can only call functions, got Int".into())
+        );
+        assert_eq!(
+            call("nope", vec![]),
+            Err("undefined function `nope`".into())
+        );
+        // With no script below, the host's call is the first nested one.
+        assert_eq!(call("count", vec![Value::Int(199)]), Ok(Value::Int(199)));
+        assert_eq!(
+            call("count", vec![Value::Int(200)]),
+            Err("stack overflow: more than 200 nested calls".into())
+        );
+
+        for name in ["add", "abs", "n", "nope"] {
+            assert_eq!(both.vm.arity(name), both.interpreter.arity(name), "{name}");
+        }
+        assert_eq!(both.vm.arity("add"), Some(2));
+        assert_eq!(both.vm.struct_shapes(), both.interpreter.struct_shapes());
+    }
+
+    #[test]
+    fn a_reload_keeps_running_sequences_with_their_code_and_the_new_globals() {
+        let source = |step: &str, times: &str| {
+            format!(
+                "step :: () -> Float {{ {step} }}\n\
+                 s :: sequence (b: Ball) {{\n  over 1.0s {{\n    b.x = b.x + step() * {times}\n  }}\n}}\n"
+            )
+        };
+        let mut old = Both::new(&format!(
+            "{}start s(Ball {{ x: 0.0, y: 0.0 }})",
+            source("1.0", "1.0")
+        ));
+        assert_eq!(old.frames(ball(0.0), 0.25, 1), "1.0");
+
+        // The running `s` keeps adding `step()` once, as its old code says,
+        // but `step` is the new one.
+        let mut new = Both::new(&source("10.0", "2.0"));
+        new.vm.adopt_sequences(&mut old.vm);
+        new.interpreter.adopt_sequences(&mut old.interpreter);
+        assert!(old.vm.running().is_empty());
+        assert_eq!(new.frames(ball(1.0), 0.25, 3), "11.0, 21.0, 31.0 done");
+
+        new.run("start s(Ball { x: 0.0, y: 0.0 })");
+        new.vm.stop_sequences();
+        new.interpreter.stop_sequences();
+        assert_eq!(new.frames(ball(0.0), 0.25, 1), "0.0 done");
     }
 }
