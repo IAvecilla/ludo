@@ -2,6 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use ludo_core::ast::Stmt;
+use ludo_core::checker::Checker;
 use ludo_core::chunk::Function;
 use ludo_core::compiler::{compile, CompileError};
 use ludo_core::interpreter::{Interpreter, RuntimeError};
@@ -121,7 +122,7 @@ fn read(path: &str) -> Result<String, ExitCode> {
 }
 
 fn run_file(source: &str, mut backend: Backend) -> ExitCode {
-    match run(source, &mut backend, true) {
+    match run(source, &mut backend, &mut Checker::new(), true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Static | Failure::Incomplete(_)) => ExitCode::from(EX_DATAERR),
         Err(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
@@ -159,6 +160,13 @@ fn disassemble(source: &str) -> ExitCode {
             return ExitCode::from(EX_DATAERR);
         }
     };
+
+    if let Err(errors) = Checker::new().check(&statements) {
+        for error in &errors {
+            eprintln!("{error}");
+        }
+        return ExitCode::from(EX_DATAERR);
+    }
 
     let mut vm = Vm::new();
     vm.trace = true;
@@ -203,6 +211,7 @@ fn listing(stmt: &Stmt, script: &Function) {
 /// it is the REPL of clox, of Python and of Lua.
 fn run_repl(mut backend: Backend) {
     let stdin = io::stdin();
+    let mut checker = Checker::new();
     let mut source = String::new();
 
     loop {
@@ -223,7 +232,7 @@ fn run_repl(mut backend: Backend) {
         let blank = line.trim().is_empty();
         source.push_str(&line);
 
-        match run(&source, &mut backend, false) {
+        match run(&source, &mut backend, &mut checker, false) {
             Err(Failure::Incomplete(_)) if !blank => continue,
             Err(Failure::Incomplete(errors)) => report(&errors, false),
             _ => {}
@@ -232,7 +241,12 @@ fn run_repl(mut backend: Backend) {
     }
 }
 
-fn run(source: &str, backend: &mut Backend, file: bool) -> Result<(), Failure> {
+fn run(
+    source: &str,
+    backend: &mut Backend,
+    checker: &mut Checker,
+    file: bool,
+) -> Result<(), Failure> {
     let at = |line: usize| {
         if file {
             format!("[line {line}] ")
@@ -261,6 +275,13 @@ fn run(source: &str, backend: &mut Backend, file: bool) -> Result<(), Failure> {
             return Err(Failure::Static);
         }
     };
+
+    if let Err(errors) = checker.check(&statements) {
+        for error in &errors {
+            eprintln!("{}Name Error: {}", at(error.line), error.message);
+        }
+        return Err(Failure::Static);
+    }
 
     for stmt in &statements {
         match backend.execute(stmt) {
