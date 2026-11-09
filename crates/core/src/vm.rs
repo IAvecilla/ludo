@@ -4,7 +4,8 @@ use std::rc::Rc;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::chunk::{Function, Op, Shape, Test};
 use crate::interpreter::{
-    binary, check_arity, condition, error, field, logical, unary, RuntimeError, MAX_CALL_DEPTH,
+    binary, check_arity, condition, error, field, logical, passes, unary, with_field, RuntimeError,
+    MAX_CALL_DEPTH,
 };
 use crate::prelude::NATIVES;
 use crate::value::{Caller, Instance, Value};
@@ -19,6 +20,27 @@ struct CallFrame {
     base: usize,
 }
 
+/// A sequence that is running: the next instruction it runs and the values
+/// it keeps on the stack between frames of the game, from its state in slot
+/// 0 to the counters of an `over` halfway through. It is how a coroutine
+/// keeps its place.
+struct Run {
+    function: Rc<Function>,
+    ip: usize,
+    slots: Vec<Value>,
+    done: bool,
+}
+
+/// How `execute` stops.
+enum Exit {
+    /// The frame it started from returned, with its result if it has one.
+    Return(Option<Value>),
+    /// A sequence waits for the next frame of the game.
+    Yield,
+    /// A sequence ran its last step.
+    End,
+}
+
 /// A stack machine that runs compiled functions. The operators share their
 /// meaning with the tree-walking interpreter, so both give the same values
 /// and errors.
@@ -31,6 +53,14 @@ pub struct Vm {
     /// The fields of each declared struct, in order, looked up by name like
     /// the globals.
     structs: HashMap<String, Vec<String>>,
+    /// Looked up by name like the structs.
+    sequences: HashMap<String, Rc<Function>>,
+    /// The sequences that are running, in the order they were started.
+    runs: Vec<Run>,
+    /// While a sequence runs a frame: whether it already made a pass of an
+    /// `over`, and how long the frame is.
+    spent: bool,
+    dt: f64,
 
     pub trace: bool,
 }
@@ -52,6 +82,10 @@ impl Vm {
             frames: Vec::new(),
             globals,
             structs: HashMap::new(),
+            sequences: HashMap::new(),
+            runs: Vec::new(),
+            spent: false,
+            dt: 0.0,
             trace: false,
         }
     }
@@ -69,14 +103,94 @@ impl Vm {
             ip: 0,
             base: 1,
         });
-        self.execute(0)
+        match self.execute(0)? {
+            Exit::Return(result) => Ok(result),
+            Exit::Yield | Exit::End => unreachable!("only sequences stop, from `run_sequences`"),
+        }
+    }
+
+    /// Runs one frame of every sequence over the world, in the order they
+    /// were started, each over what the one before left. Sequences started
+    /// on the way join at the end, replacing any with the same name. It
+    /// gives back the world as the last one left it.
+    pub fn run_sequences(&mut self, world: Value, dt: f64) -> Result<Value, RuntimeError> {
+        let mut runs = std::mem::take(&mut self.runs);
+        let mut world = world;
+        let mut result = Ok(());
+        for run in &mut runs {
+            run.slots[0] = world;
+            result = self.resume(run, dt);
+            world = run.slots[0].clone();
+            if result.is_err() {
+                break;
+            }
+        }
+
+        runs.retain(|run| !run.done);
+        for run in std::mem::take(&mut self.runs) {
+            replace(&mut runs, run);
+        }
+        self.runs = runs;
+        result.map(|()| world)
+    }
+
+    /// Puts a sequence back on the stack and runs it until it waits for the
+    /// next frame or ends, then takes it off again. If it fails it stays as
+    /// it was, and the next frame tries again from where it last stopped.
+    fn resume(&mut self, run: &mut Run, dt: f64) -> Result<(), RuntimeError> {
+        self.stack.clear();
+        self.frames.clear();
+        self.push(Value::Compiled(Rc::clone(&run.function)));
+        self.stack.extend(run.slots.iter().cloned());
+        self.frames.push(CallFrame {
+            function: Rc::clone(&run.function),
+            ip: run.ip,
+            base: 1,
+        });
+        self.spent = false;
+        self.dt = dt;
+
+        let exit = self.execute(0)?;
+        let frame = self
+            .frames
+            .pop()
+            .expect("a sequence stops in its own frame");
+        run.ip = frame.ip;
+        run.slots = self.stack.split_off(frame.base);
+        run.done = matches!(exit, Exit::End);
+        self.stack.clear();
+        Ok(())
+    }
+
+    /// Starts a sequence for `start`, replacing one with the same name.
+    fn start(&mut self, name: &str, args: Vec<Value>) -> Result<(), RuntimeError> {
+        let function = self
+            .sequences
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("undefined sequence `{name}`")))?;
+        check_arity(function.name(), function.arity, args.len())?;
+        let run = Run {
+            function,
+            ip: 0,
+            slots: args,
+            done: false,
+        };
+        replace(&mut self.runs, run);
+        Ok(())
+    }
+
+    /// The names of the sequences that are running, in the order they run.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> Vec<&str> {
+        self.runs.iter().map(|run| run.function.name()).collect()
     }
 
     /// Runs instructions until the frame that sits on top of `entry` others
     /// returns, and gives back its result. A top-level statement runs from no
     /// frames; a native that calls back into ludo runs from wherever the VM
     /// was.
-    fn execute(&mut self, entry: usize) -> Result<Option<Value>, RuntimeError> {
+    fn execute(&mut self, entry: usize) -> Result<Exit, RuntimeError> {
         loop {
             let frame = self.frame();
             let function = Rc::clone(&frame.function);
@@ -118,6 +232,9 @@ impl Vm {
                         }
                         None if self.structs.contains_key(name) => Err(error(format!(
                             "`{name}` is a struct, not a value: build one with `{name} {{ ... }}`"
+                        ))),
+                        None if self.sequences.contains_key(name) => Err(error(format!(
+                            "`{name}` is a sequence, not a function: it runs over time and cannot be called"
                         ))),
                         None => Err(error(format!("undefined variable `{name}`"))),
                     }
@@ -190,6 +307,67 @@ impl Vm {
                     let target = self.pop();
                     field(&target, chunk.name(index)).map(|value| self.push(value))
                 }
+                Op::DefineSequence(index) => {
+                    let Value::Compiled(sequence) = self.pop() else {
+                        unreachable!("a sequence compiles to a function")
+                    };
+                    self.sequences
+                        .insert(chunk.name(index).to_string(), sequence);
+                    Ok(())
+                }
+                Op::Start { name, argc } => {
+                    let args = self.stack.split_off(self.stack.len() - argc);
+                    self.start(chunk.name(name), args)
+                }
+                // Running the same instruction again next frame is what
+                // makes it wait.
+                Op::Yield if self.spent => {
+                    self.frame().ip = ip;
+                    return Ok(Exit::Yield);
+                }
+                Op::Yield => Ok(()),
+                Op::OverStart => {
+                    let duration = self.pop();
+                    passes(Ok(duration), self.dt).map(|passes| {
+                        self.push(Value::Int(passes as i64));
+                        self.push(Value::Int(0));
+                    })
+                }
+                Op::OverPass(_) if self.spent => {
+                    self.frame().ip = ip;
+                    return Ok(Exit::Yield);
+                }
+                Op::OverPass(counters) => {
+                    self.spent = true;
+                    let (passes, pass) = self.counters(base + counters);
+                    let pass = pass + 1;
+                    self.stack[base + counters + 1] = Value::Int(pass);
+                    let t = if pass == passes {
+                        1.0
+                    } else {
+                        pass as f64 / passes as f64
+                    };
+                    self.push(Value::Float(t));
+                    Ok(())
+                }
+                Op::OverLoop { counters, distance } => {
+                    let (passes, pass) = self.counters(base + counters);
+                    if pass < passes {
+                        self.frame().ip -= distance;
+                    }
+                    Ok(())
+                }
+                Op::SetField { state, field } => {
+                    let value = self.pop();
+                    let target = chunk.name(state);
+                    with_field(target, &self.stack[base], chunk.name(field), value)
+                        .map(|updated| self.stack[base] = updated)
+                }
+                Op::SetState => {
+                    self.stack[base] = self.pop();
+                    Ok(())
+                }
+                Op::End => return Ok(Exit::End),
                 Op::Call(argc) => {
                     let callee = self.stack[self.stack.len() - 1 - argc].clone();
                     self.call_value(callee, argc)
@@ -208,7 +386,7 @@ impl Vm {
                     let result = (above == 1).then(|| self.pop());
                     self.stack.truncate(frame.base - 1);
                     if self.frames.len() == entry {
-                        return Ok(result);
+                        return Ok(Exit::Return(result));
                     }
                     self.push(result.expect("a function always returns a value"));
                     Ok(())
@@ -310,6 +488,15 @@ impl Vm {
         })))
     }
 
+    /// How many passes the `over` running makes and how many it made, from
+    /// the two hidden locals that start at `slot`.
+    fn counters(&self, slot: usize) -> (i64, i64) {
+        match (&self.stack[slot], &self.stack[slot + 1]) {
+            (Value::Int(passes), Value::Int(pass)) => (*passes, *pass),
+            _ => unreachable!("`OverStart` leaves two Ints"),
+        }
+    }
+
     fn frame(&mut self) -> &mut CallFrame {
         self.frames
             .last_mut()
@@ -359,10 +546,16 @@ impl Caller for Vm {
             // A native already left its result.
             return Ok(self.pop());
         }
-        Ok(self
-            .execute(entry)?
-            .expect("a function always returns a value"))
+        match self.execute(entry)? {
+            Exit::Return(Some(result)) => Ok(result),
+            _ => unreachable!("a function returns a value, and never waits or ends"),
+        }
     }
+}
+
+fn replace(runs: &mut Vec<Run>, run: Run) {
+    runs.retain(|r| r.function.name != run.function.name);
+    runs.push(run);
 }
 
 #[cfg(test)]
@@ -671,5 +864,248 @@ mod tests {
              [line 10] error: `Ball` has no field `z`\n\
              [line 11] error: `Ball` is a struct, not a value: build one with `Ball { ... }`",
         )]);
+    }
+
+    const BALL: &str = "Ball :: struct { x: Float, y: Float }\n";
+
+    fn ball(x: f64) -> Value {
+        Value::Struct(Rc::new(Instance {
+            name: "Ball".into(),
+            fields: vec![
+                ("x".into(), Value::Float(x)),
+                ("y".into(), Value::Float(0.0)),
+            ],
+        }))
+    }
+
+    fn x(world: &Value) -> String {
+        match world {
+            Value::Struct(ball) => ball.fields[0].1.to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The VM and the interpreter side by side, to check they agree after
+    /// every statement and every frame of the game.
+    struct Both {
+        vm: Vm,
+        interpreter: Interpreter,
+    }
+
+    impl Both {
+        /// Both backends with `Ball` and `source` loaded.
+        fn new(source: &str) -> Self {
+            let mut both = Both {
+                vm: Vm::new(),
+                interpreter: Interpreter::new(),
+            };
+            both.run(&format!("{BALL}{source}"));
+            both
+        }
+
+        fn run(&mut self, source: &str) {
+            for stmt in parse(scan_tokens(source).unwrap()).unwrap() {
+                let ran = show(self.vm.run(compile(&stmt).unwrap()));
+                assert_eq!(
+                    ran,
+                    show(self.interpreter.execute(&stmt)),
+                    "the VM and the interpreter disagree on `{stmt}`"
+                );
+            }
+        }
+
+        /// Runs `count` frames of `dt`, the first over `world` and each next
+        /// one over what the last left, as `play` does. Shows the `x` of the
+        /// world after each frame, with `done` once no sequence is running,
+        /// or the error a frame stops at.
+        fn frames(&mut self, world: Value, dt: f64, count: usize) -> String {
+            let mut world = world;
+            let mut shown = Vec::new();
+            for _ in 0..count {
+                let result = self.vm.run_sequences(world.clone(), dt);
+                assert_eq!(
+                    result,
+                    self.interpreter.run_sequences(world.clone(), dt),
+                    "the VM and the interpreter disagree on a frame"
+                );
+                assert_eq!(self.vm.running(), self.interpreter.running());
+                match result {
+                    Ok(next) => {
+                        let done = if self.vm.running().is_empty() {
+                            " done"
+                        } else {
+                            ""
+                        };
+                        shown.push(format!("{}{done}", x(&next)));
+                        world = next;
+                    }
+                    Err(e) => {
+                        shown.push(format!("[line {}] error: {}", e.line.unwrap(), e.message));
+                        break;
+                    }
+                }
+            }
+            shown.join(", ")
+        }
+    }
+
+    #[test]
+    fn wait_and_over_take_whole_frames() {
+        let cases = [
+            ("b.x = 1.0\n  b.x = b.x + 1.0", 1, "2.0 done"),
+            ("wait 1.0s\n  b.x = 5.0", 4, "0.0, 0.0, 0.0, 5.0 done"),
+            (
+                "over 1.0s as t {\n    b.x = t\n  }",
+                4,
+                "0.25, 0.5, 0.75, 1.0 done",
+            ),
+            ("over 0.3s as t {\n    b.x = t\n  }", 2, "0.5, 1.0 done"),
+            ("wait 0.0s\n  b.x = 1.0", 1, "1.0 done"),
+            (
+                "b.x = 1.0\n  wait 0.5s\n  b.x = 2.0\n  wait 0.25s\n  b.x = 3.0",
+                3,
+                "1.0, 2.0, 3.0 done",
+            ),
+            ("b.x = b.x + 1.0", 3, "1.0 done, 1.0 done, 1.0 done"),
+            (
+                "over 0.5s as t {\n    b.x = half(t) |> min(0.3)\n  }",
+                2,
+                "0.25, 0.3 done",
+            ),
+        ];
+        for (body, count, expected) in cases {
+            let mut both = Both::new(&format!(
+                "half :: (x: Float) -> Float {{ x / 2.0 }}\ns :: sequence (b: Ball) {{\n  {body}\n}}\nstart s(Ball {{ x: 0.0, y: 0.0 }})"
+            ));
+            assert_eq!(both.frames(ball(0.0), 0.25, count), expected, "{body:?}");
+        }
+
+        let mut both = Both::new(
+            "s :: sequence (b: Ball) {\n  over 0.1s as t {\n    b.x = t\n  }\n}\nstart s(Ball { x: 0.0, y: 0.0 })",
+        );
+        let at_60 = both.frames(ball(0.0), 1.0 / 60.0, 6);
+        assert!(at_60.ends_with("0.8333333333333334, 1.0 done"), "{at_60}");
+
+        // Locals of the sequence last between frames; those of the body of
+        // `over` last a pass.
+        let mut both = Both::new(
+            "s :: sequence (b: Ball, to: Float) {\n  let from = b.x\n  over 0.5s as t {\n    let d = to - from\n    b.x = from + d * t\n  }\n}\nstart s(Ball { x: 10.0, y: 0.0 }, 20.0)",
+        );
+        assert_eq!(both.frames(ball(10.0), 0.25, 2), "15.0, 20.0 done");
+    }
+
+    #[test]
+    fn running_sequences_step_over_the_current_world() {
+        let mut both = Both::new(
+            "push :: sequence (b: Ball, by: Float) {\n  wait 0.5s\n  b.x = b.x + by\n}\nkick :: (b: Ball) -> Ball {\n  start push(b, 10.0)\n  b\n}\nkick(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(both.vm.running(), ["push"]);
+        assert_eq!(both.frames(ball(1.0), 0.25, 2), "1.0, 11.0 done");
+
+        let mut both = Both::new(
+            "s :: sequence (b: Ball) {\n  over 1.0s {\n    b.x = b.x + 1.0\n  }\n}\nstart s(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(
+            both.frames(ball(100.0), 0.25, 4),
+            "101.0, 102.0, 103.0, 104.0 done"
+        );
+
+        let mut both = Both::new(
+            "double :: sequence (b: Ball) {\n  b.x = b.x * 2.0\n}\ninc :: sequence (b: Ball) {\n  b.x = b.x + 1.0\n}\nstart double(Ball { x: 0.0, y: 0.0 })\nstart inc(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(both.frames(ball(3.0), 0.25, 1), "7.0 done");
+
+        // A sequence started by another one joins after it, from the next
+        // frame on.
+        let mut both = Both::new(
+            "second :: sequence (b: Ball) {\n  b.x = b.x + 10.0\n}\nfirst :: sequence (b: Ball) {\n  b.x = 1.0\n  start second(b)\n}\nstart first(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(both.frames(ball(0.0), 0.25, 2), "1.0, 11.0 done");
+    }
+
+    #[test]
+    fn the_duration_is_read_on_the_frame_of_the_first_pass() {
+        // `grow` runs first, so `pause` reads `b.x` for its second `over`
+        // on the next frame, 0.5 and two passes, not on the first, 0.25.
+        let mut both = Both::new(
+            "grow :: sequence (b: Ball) {\n  over 1.0s {\n    b.x = b.x + 0.25\n  }\n}\n\
+             pause :: sequence (b: Ball) {\n  wait 0.25s\n  over b.x {}\n  b.x = 100.0\n}\n\
+             start grow(Ball { x: 0.0, y: 0.0 })\nstart pause(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(
+            both.frames(ball(0.0), 0.25, 4),
+            "0.25, 0.5, 100.0, 100.25 done"
+        );
+    }
+
+    #[test]
+    fn starting_a_running_sequence_replaces_it() {
+        let mut both = Both::new(
+            "mark :: sequence (b: Ball, to: Float) {\n  wait 0.5s\n  b.x = to\n}\nstart mark(Ball { x: 0.0, y: 0.0 }, 1.0)",
+        );
+        assert_eq!(both.frames(ball(0.0), 0.25, 1), "0.0");
+        both.run("start mark(Ball { x: 0.0, y: 0.0 }, 2.0)");
+        assert_eq!(both.vm.running(), ["mark"]);
+        assert_eq!(both.frames(ball(0.0), 0.25, 2), "0.0, 2.0 done");
+    }
+
+    #[test]
+    fn binding_the_state_again_replaces_it() {
+        let mut both = Both::new(
+            "s :: sequence (b: Ball) {\n  let b = Ball { x: 5.0, y: 0.0 }\n  b.x = b.x + 1.0\n  over 0.5s {\n    let b = Ball { b | x: b.x * 2.0 }\n  }\n}\nstart s(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(both.frames(ball(0.0), 0.25, 2), "12.0, 24.0 done");
+    }
+
+    #[test]
+    fn reports_errors_in_sequences() {
+        let cases = [
+            (
+                "b: Ball",
+                "wait 1",
+                ball(0.0),
+                "a duration must be a Float in seconds, got Int",
+            ),
+            (
+                "b: Ball",
+                "wait -1.0s",
+                ball(0.0),
+                "a duration must be a finite number of seconds, at least 0s, got -1.0",
+            ),
+            ("b: Ball", "b.z = 1.0", ball(0.0), "`Ball` has no field `z`"),
+            (
+                "b: Int",
+                "b.z = 1.0",
+                Value::Int(1),
+                "`b.z = ...` needs `b` to be a struct, got Int",
+            ),
+        ];
+        for (param, body, world, message) in cases {
+            let mut both = Both::new(&format!(
+                "s :: sequence ({param}) {{\n  {body}\n}}\nstart s(1)"
+            ));
+            assert_eq!(
+                both.frames(world, 0.25, 1),
+                format!("[line 3] error: {message}")
+            );
+        }
+
+        assert_eq!(
+            outputs("s :: sequence (n: Int) {}\nstart s()\nstart t(1)\ns(1)"),
+            "[line 2] error: `s` expects 1 argument, got 0\n\
+             [line 3] error: undefined sequence `t`\n\
+             [line 4] error: `s` is a sequence, not a function: it runs over time and cannot be called"
+        );
+    }
+
+    #[test]
+    fn a_sequence_keeps_only_its_own_slots_between_frames() {
+        let mut both = Both::new(
+            "drift :: sequence (b: Ball) {\n  let from = b.x\n  over 10.0s {\n    b.x = b.x + 1.0\n  }\n}\nstart drift(Ball { x: 0.0, y: 0.0 })",
+        );
+        both.frames(ball(0.0), 0.25, 20);
+        // The state, `from` and the two counters of the `over` halfway through.
+        assert_eq!(both.vm.runs[0].slots.len(), 4);
+        assert!(both.vm.stack.is_empty() && both.vm.frames.is_empty());
     }
 }

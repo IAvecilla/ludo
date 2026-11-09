@@ -49,6 +49,45 @@ pub enum Op {
     /// Replaces the struct on top of the stack with its field named by this
     /// constant.
     GetField(usize),
+    /// Declares the sequence on top of the stack under the name in this
+    /// constant. Like structs, sequences are looked up by name.
+    DefineSequence(usize),
+    /// Starts the sequence named by a constant with this many arguments on
+    /// top of the stack. It runs from the next frame of the game on,
+    /// replacing one with the same name that is already running.
+    Start {
+        name: usize,
+        argc: usize,
+    },
+    /// Suspends the sequence until the next frame of the game if it already
+    /// made a pass of an `over` in this one, and runs again then. None of
+    /// the book's chapters stop a function halfway and resume it later.
+    Yield,
+    /// Turns the duration on top of the stack into how many passes the
+    /// `over` makes, one per frame, and leaves that count and the passes
+    /// made so far, zero, as two hidden locals.
+    OverStart,
+    /// Makes a pass of the `over` whose counters start at this slot and
+    /// pushes how far along it is, `t`. Like `Yield`, it first waits for
+    /// the next frame if this one already had a pass.
+    OverPass(usize),
+    /// Jumps back this many instructions for another pass while the `over`
+    /// whose counters start at `counters` has passes left: clox's
+    /// `OP_LOOP` with a condition, and the only backward jump in ludo.
+    OverLoop {
+        counters: usize,
+        distance: usize,
+    },
+    /// Replaces the field named by `field` in the state of the sequence,
+    /// named by `state`, with the value on top of the stack.
+    SetField {
+        state: usize,
+        field: usize,
+    },
+    /// Replaces the state of the sequence with the value on top of the stack.
+    SetState,
+    /// Ends a sequence, leaving its state for the game.
+    End,
     Negate,
     Not,
     Add,
@@ -189,6 +228,23 @@ impl Chunk {
                 )
             }
             Op::GetField(index) => self.constant_op("GetField", index),
+            Op::DefineSequence(index) => self.constant_op("DefineSequence", index),
+            Op::Start { name, argc } => {
+                format!("{:<16} {argc:4} {:?}", "Start", self.name(name))
+            }
+            Op::OverPass(counters) => format!("{:<16} {counters:4}", "OverPass"),
+            Op::OverLoop { counters, distance } => {
+                let target = offset + 1 - distance;
+                format!("{:<16} {counters:4} -> {target}", "OverLoop")
+            }
+            Op::SetField { state, field } => {
+                format!(
+                    "{:<16} {}.{}",
+                    "SetField",
+                    self.name(state),
+                    self.name(field)
+                )
+            }
             Op::CheckBool(test) => format!("{:<16} {test:>4}", "CheckBool"),
             Op::Jump(jump) => format!("{:<16} {jump:4} -> {}", "Jump", offset + 1 + jump),
             Op::JumpIfFalse(jump) => {
