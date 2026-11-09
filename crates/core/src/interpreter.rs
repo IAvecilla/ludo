@@ -5,7 +5,7 @@ use crate::ast::{
     BinaryOp, Expr, FnDecl, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, UnaryOp,
 };
 use crate::prelude::NATIVES;
-use crate::value::{Instance, Native, Value};
+use crate::value::{Caller, Instance, Native, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -14,13 +14,13 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
-    fn at(mut self, line: usize) -> Self {
+    pub(crate) fn at(mut self, line: usize) -> Self {
         self.line.get_or_insert(line);
         self
     }
 }
 
-const MAX_CALL_DEPTH: usize = 200;
+pub(crate) const MAX_CALL_DEPTH: usize = 200;
 
 pub struct Interpreter {
     locals: Vec<(String, Value)>,
@@ -245,23 +245,6 @@ impl Interpreter {
         })))
     }
 
-    pub(crate) fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RuntimeError> {
-        match callee {
-            Value::Function(decl) => {
-                check_arity(&decl.name, decl.params.len(), args.len())?;
-                self.invoke(&decl, args)
-            }
-            Value::Native(native) => {
-                check_arity(native.name, native.arity, args.len())?;
-                (native.fun)(self, &args)
-            }
-            other => Err(error(format!(
-                "can only call functions, got {}",
-                other.type_name()
-            ))),
-        }
-    }
-
     fn invoke(&mut self, decl: &FnDecl, args: Vec<Value>) -> Result<Value, RuntimeError> {
         if self.depth == MAX_CALL_DEPTH {
             return Err(error(format!(
@@ -313,6 +296,26 @@ impl Interpreter {
         check: impl Fn(&Value) -> Result<bool, RuntimeError>,
     ) -> Result<bool, RuntimeError> {
         check(&self.evaluate(expr)?)
+    }
+}
+
+impl Caller for Interpreter {
+    fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        match callee {
+            Value::Function(decl) => {
+                check_arity(&decl.name, decl.params.len(), args.len())?;
+                self.invoke(&decl, args)
+            }
+            Value::Native(native) => {
+                check_arity(native.name, native.arity, args.len())?;
+                (native.fun)(self, &args)
+            }
+            Value::Compiled(_) => unreachable!("only the VM makes compiled functions"),
+            other => Err(error(format!(
+                "can only call functions, got {}",
+                other.type_name()
+            ))),
+        }
     }
 }
 
@@ -388,7 +391,7 @@ pub(crate) fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, R
         (Gt, Float(a), Float(b)) => Ok(Bool(a > b)),
         (Ge, Float(a), Float(b)) => Ok(Bool(a >= b)),
 
-        (Eq | Ne, Value::Function(_) | Value::Native(_), Value::Function(_) | Value::Native(_)) => {
+        (Eq | Ne, a, b) if a.is_function() && b.is_function() => {
             Err(error("functions cannot be compared"))
         }
 
@@ -410,7 +413,7 @@ pub(crate) fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, R
     }
 }
 
-fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RuntimeError> {
+pub(crate) fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RuntimeError> {
     if expected == got {
         return Ok(());
     }
@@ -878,7 +881,7 @@ mod tests {
 
     #[test]
     fn the_host_calls_and_adds_functions() {
-        fn twice(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+        fn twice(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
             match &args[0] {
                 Value::Int(n) => Ok(Value::Int(n * 2)),
                 other => Ok(other.clone()),

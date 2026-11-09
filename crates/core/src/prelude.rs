@@ -1,8 +1,8 @@
 /// This module defines the standard native functions available in the ludo language.
 use std::rc::Rc;
 
-use crate::interpreter::{error, Interpreter, RuntimeError};
-use crate::value::{Native, Value};
+use crate::interpreter::{error, RuntimeError};
+use crate::value::{Caller, Native, Value};
 
 const MAX_RANGE: i64 = 1_000_000;
 
@@ -25,34 +25,34 @@ pub const NATIVES: &[Native] = &[
 const fn native(
     name: &'static str,
     arity: usize,
-    fun: fn(&mut Interpreter, &[Value]) -> Result<Value, RuntimeError>,
+    fun: fn(&mut dyn Caller, &[Value]) -> Result<Value, RuntimeError>,
 ) -> Native {
     Native { name, arity, fun }
 }
 
-fn print(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn print(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     println!("{}", args[0]);
     Ok(args[0].clone())
 }
 
-fn map(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn map(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     let Value::List(items) = &args[0] else {
         return Err(not_a_list("map", &args[0]));
     };
     let mapped = items
         .iter()
-        .map(|item| interpreter.call(args[1].clone(), vec![item.clone()]))
+        .map(|item| caller.call(args[1].clone(), vec![item.clone()]))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Value::List(Rc::new(mapped)))
 }
 
-fn filter(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn filter(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     let Value::List(items) = &args[0] else {
         return Err(not_a_list("filter", &args[0]));
     };
     let mut kept = Vec::new();
     for item in items.iter() {
-        match interpreter.call(args[1].clone(), vec![item.clone()])? {
+        match caller.call(args[1].clone(), vec![item.clone()])? {
             Value::Bool(true) => kept.push(item.clone()),
             Value::Bool(false) => {}
             other => {
@@ -66,16 +66,16 @@ fn filter(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, Runtim
     Ok(Value::List(Rc::new(kept)))
 }
 
-fn fold(interpreter: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn fold(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     let Value::List(items) = &args[0] else {
         return Err(not_a_list("fold", &args[0]));
     };
     items.iter().try_fold(args[1].clone(), |acc, item| {
-        interpreter.call(args[2].clone(), vec![acc, item.clone()])
+        caller.call(args[2].clone(), vec![acc, item.clone()])
     })
 }
 
-fn range(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn range(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match (&args[0], &args[1]) {
         (Value::Int(from), Value::Int(to)) if to - from > MAX_RANGE => Err(error(format!(
             "`range` can make at most {MAX_RANGE} numbers, got {}",
@@ -92,7 +92,7 @@ fn range(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn abs(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn abs(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match &args[0] {
         Value::Int(v) => v
             .checked_abs()
@@ -106,7 +106,7 @@ fn abs(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn min(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn min(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match (&args[0], &args[1]) {
         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(*a.min(b))),
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.min(*b))),
@@ -114,7 +114,7 @@ fn min(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn clamp(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn clamp(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match (&args[0], &args[1], &args[2]) {
         (Value::Int(x), Value::Int(lo), Value::Int(hi)) if lo <= hi => {
             Ok(Value::Int(*x.clamp(lo, hi)))
@@ -130,7 +130,7 @@ fn clamp(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn to_float(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn to_float(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match &args[0] {
         Value::Int(v) => Ok(Value::Float(*v as f64)),
         v => Err(error(format!(
@@ -140,7 +140,7 @@ fn to_float(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> 
     }
 }
 
-fn to_int(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn to_int(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match &args[0] {
         Value::Float(v) if v.is_finite() && v.abs() < i64::MAX as f64 => {
             Ok(Value::Int(v.trunc() as i64))
@@ -153,11 +153,11 @@ fn to_int(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn to_string(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn to_string(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Str(args[0].to_string()))
 }
 
-fn concat(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn concat(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match (&args[0], &args[1]) {
         (Value::List(a), Value::List(b)) => {
             let mut items = Vec::with_capacity(a.len() + b.len());
@@ -173,7 +173,7 @@ fn concat(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
     }
 }
 
-fn contains(_: &mut Interpreter, args: &[Value]) -> Result<Value, RuntimeError> {
+fn contains(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     let Value::List(items) = &args[0] else {
         return Err(not_a_list("contains", &args[0]));
     };

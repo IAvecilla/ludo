@@ -31,6 +31,9 @@ pub enum Op {
     /// Skips this many instructions forward if the Bool on top of the stack
     /// is false, and leaves it there, as in clox.
     JumpIfFalse(usize),
+    /// Calls the value below this many arguments on top of the stack, and
+    /// leaves the result in place of the call.
+    Call(usize),
     Negate,
     Not,
     Add,
@@ -44,9 +47,35 @@ pub enum Op {
     LessEqual,
     Greater,
     GreaterEqual,
-    /// Ends the chunk with the value on top of the stack, if the statement
-    /// left one: an expression does, a `let` does not.
+    /// Ends the function and leaves its result in place of the call. A
+    /// function body always leaves a result; a top-level `let` or
+    /// declaration leaves none.
     Return,
+}
+
+/// A function compiled to bytecode, clox's `ObjFunction`. A top-level
+/// statement compiles into one too, with no name, as clox does with the
+/// whole script.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Function {
+    pub name: Option<String>,
+    pub arity: usize,
+    pub chunk: Chunk,
+}
+
+impl Function {
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or("script")
+    }
+}
+
+impl fmt::Display for Function {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "<fn {name}>"),
+            None => f.write_str("<script>"),
+        }
+    }
 }
 
 /// What needs the Bool that `CheckBool` checks, for its error.
@@ -108,6 +137,7 @@ impl Chunk {
             Op::GetGlobal(index) => self.constant_op("GetGlobal", index),
             Op::GetLocal(slot) => format!("{:<16} {slot:4}", "GetLocal"),
             Op::PopBelow(count) => format!("{:<16} {count:4}", "PopBelow"),
+            Op::Call(argc) => format!("{:<16} {argc:4}", "Call"),
             Op::CheckBool(test) => format!("{:<16} {test:>4}", "CheckBool"),
             Op::Jump(jump) => format!("{:<16} {jump:4} -> {}", "Jump", offset + 1 + jump),
             Op::JumpIfFalse(jump) => {

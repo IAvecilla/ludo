@@ -5,6 +5,7 @@ use ludo_core::compiler::compile;
 use ludo_core::interpreter::Interpreter;
 use ludo_core::parser::{parse, ParseError};
 use ludo_core::scanner::scan_tokens;
+use ludo_core::value::Value;
 use ludo_core::vm::Vm;
 use ludo_play::Game;
 
@@ -90,15 +91,20 @@ fn disassemble(source: &str) -> ExitCode {
     let mut vm = Vm::new();
     vm.trace = true;
     for stmt in &statements {
-        let chunk = match compile(stmt) {
-            Ok(chunk) => chunk,
+        let script = match compile(stmt) {
+            Ok(script) => script,
             Err(error) => {
                 eprintln!("{error}");
                 return ExitCode::from(EX_DATAERR);
             }
         };
-        println!("== {stmt} ==\n{chunk}");
-        match vm.run(&chunk) {
+        println!("== {stmt} ==\n{}", script.chunk);
+        for constant in &script.chunk.constants {
+            if let Value::Compiled(function) = constant {
+                println!("== {function} ==\n{}", function.chunk);
+            }
+        }
+        match vm.run(script) {
             Ok(Some(value)) => println!("=> {value}\n"),
             Ok(None) => println!(),
             Err(error) => {
