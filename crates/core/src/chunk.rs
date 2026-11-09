@@ -22,6 +22,15 @@ pub enum Op {
     /// that ends, below the value of the block. clox has no such instruction
     /// because its blocks are statements and leave no value.
     PopBelow(usize),
+    /// Fails unless the value on top of the stack is a Bool, which it leaves
+    /// there. clox lets any value be false; ludo has no truthiness, so `if`,
+    /// `and` and `or` check their values before a jump reads them.
+    CheckBool(Test),
+    /// Skips this many instructions forward.
+    Jump(usize),
+    /// Skips this many instructions forward if the Bool on top of the stack
+    /// is false, and leaves it there, as in clox.
+    JumpIfFalse(usize),
     Negate,
     Not,
     Add,
@@ -38,6 +47,24 @@ pub enum Op {
     /// Ends the chunk with the value on top of the stack, if the statement
     /// left one: an expression does, a `let` does not.
     Return,
+}
+
+/// What needs the Bool that `CheckBool` checks, for its error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Test {
+    If,
+    And,
+    Or,
+}
+
+impl fmt::Display for Test {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Test::If => "if",
+            Test::And => "and",
+            Test::Or => "or",
+        })
+    }
 }
 
 /// A compiled piece of code: the instructions, the line each one came from
@@ -81,6 +108,11 @@ impl Chunk {
             Op::GetGlobal(index) => self.constant_op("GetGlobal", index),
             Op::GetLocal(slot) => format!("{:<16} {slot:4}", "GetLocal"),
             Op::PopBelow(count) => format!("{:<16} {count:4}", "PopBelow"),
+            Op::CheckBool(test) => format!("{:<16} {test:>4}", "CheckBool"),
+            Op::Jump(jump) => format!("{:<16} {jump:4} -> {}", "Jump", offset + 1 + jump),
+            Op::JumpIfFalse(jump) => {
+                format!("{:<16} {jump:4} -> {}", "JumpIfFalse", offset + 1 + jump)
+            }
             op => format!("{op:?}"),
         };
         format!("{offset:04} {line} {op}")

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{BinaryOp, UnaryOp};
-use crate::chunk::{Chunk, Op};
-use crate::interpreter::{binary, error, unary, RuntimeError};
+use crate::chunk::{Chunk, Op, Test};
+use crate::interpreter::{binary, condition, error, logical, unary, RuntimeError};
 use crate::value::Value;
 
 /// A stack machine that runs a chunk. The operators share their meaning with
@@ -78,6 +78,25 @@ impl Vm {
                     self.push(top);
                     Ok(())
                 }
+                Op::CheckBool(test) => {
+                    let value = self.peek();
+                    match test {
+                        Test::If => condition(value),
+                        Test::And => logical(BinaryOp::And, value),
+                        Test::Or => logical(BinaryOp::Or, value),
+                    }
+                    .map(drop)
+                }
+                Op::Jump(distance) => {
+                    ip += distance;
+                    Ok(())
+                }
+                Op::JumpIfFalse(distance) => {
+                    if *self.peek() == Value::Bool(false) {
+                        ip += distance;
+                    }
+                    Ok(())
+                }
                 Op::Negate => self.unary(UnaryOp::Neg),
                 Op::Not => self.unary(UnaryOp::Not),
                 Op::Add => self.binary(BinaryOp::Add),
@@ -108,6 +127,12 @@ impl Vm {
         self.stack
             .pop()
             .expect("the compiler never pops an empty stack")
+    }
+
+    fn peek(&self) -> &Value {
+        self.stack
+            .last()
+            .expect("the compiler never reads an empty stack")
     }
 
     fn unary(&mut self, op: UnaryOp) -> Result<(), RuntimeError> {
@@ -219,6 +244,48 @@ mod tests {
                 "[line 4] error: division by zero\n1",
             ),
             ("{\n  1\n} + true\n", "[line 1] error: operands of `+` must be two Ints, two Floats or two Strings, got Int and Bool"),
+        ]);
+    }
+
+    #[test]
+    fn if_runs_only_the_branch_it_takes() {
+        runs(&[
+            (
+                "if 1 < 2 { :yes } else { 1 / 0 }\nif false { 1 / 0 } else { :no }",
+                ":yes\n:no",
+            ),
+            (
+                "let n = 0\nif n < 0 { :neg } else if n == 0 { :zero } else { :pos }",
+                ":zero",
+            ),
+            ("1 + if true { 2 } else { 3 }", "3"),
+            // Locals inside a branch sit above the outer ones and the
+            // condition is gone by then.
+            (
+                "let x = 10\n{\n  let a = 1\n  if a > 0 {\n    let b = a + x\n    b * 2\n  } else {\n    0\n  }\n}",
+                "22",
+            ),
+            (
+                "if 1 { 2 } else { 3 }",
+                "[line 1] error: the condition of `if` must be a Bool, got Int",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn and_and_or_short_circuit_on_bools() {
+        runs(&[
+            (
+                "true and false\nfalse or true\n1 < 2 and 2 < 3 or false",
+                "false\ntrue\ntrue",
+            ),
+            ("false and 1 / 0\ntrue or 1 / 0", "false\ntrue"),
+            (
+                "1 and true\ntrue and 1\nfalse or :no",
+                "[line 1] error: operands of `and` must be Bool, got Int\n\
+                 [line 2] error: operands of `and` must be Bool, got Int\n\
+                 [line 3] error: operands of `or` must be Bool, got Symbol",
+            ),
         ]);
     }
 }
