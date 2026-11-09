@@ -1,11 +1,12 @@
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ast::{BinaryOp, Expr, FnDecl, Stmt, StmtKind, UnaryOp};
+use crate::ast::{BinaryOp, Expr, FnDecl, Param, SeqDecl, Step, StepKind, Stmt, StmtKind, UnaryOp};
 use crate::chunk::{Chunk, Function, Op, Shape, Test};
 use crate::value::Value;
 
-/// A construct the compiler cannot turn into bytecode yet.
+/// An error found while compiling. Every construct of ludo compiles now, so
+/// none is reported yet; the checks planned before running will report here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompileError {
     pub message: String,
@@ -58,6 +59,9 @@ struct Compiler {
     /// expression and can start above temporaries, like the `1` in
     /// `1 + { let a = 2 ... }`, so a local's slot comes from this height.
     height: usize,
+    /// While compiling a sequence, the name of its state, its first
+    /// parameter.
+    state: Option<String>,
 }
 
 impl Compiler {
@@ -68,6 +72,7 @@ impl Compiler {
             locals: Vec::new(),
             scope_depth: 0,
             height: 0,
+            state: None,
         }
     }
 
@@ -76,15 +81,7 @@ impl Compiler {
     /// the first argument, as in ploxb, and the function sits right below.
     fn function(decl: &FnDecl, line: usize) -> Result<Function, CompileError> {
         let mut compiler = Compiler::new(line);
-        compiler.scope_depth = 1;
-        for param in &decl.params {
-            compiler.locals.push(Local {
-                name: param.name.clone(),
-                depth: 1,
-                slot: compiler.height,
-            });
-            compiler.height += 1;
-        }
+        compiler.parameters(&decl.params);
         compiler.expression(&decl.body)?;
         compiler.emit(Op::Return);
         Ok(Function {
@@ -92,6 +89,104 @@ impl Compiler {
             arity: decl.params.len(),
             chunk: compiler.chunk,
         })
+    }
+
+    /// Compiles a sequence like a function whose body is its steps. Its
+    /// state, the first parameter, sits in slot 0, where the VM puts the
+    /// world before each frame and reads it back after. It ends with `End`
+    /// instead of `Return`, so the state stays for the VM to read.
+    fn sequence(decl: &SeqDecl, line: usize) -> Result<Function, CompileError> {
+        let mut compiler = Compiler::new(line);
+        compiler.parameters(&decl.params);
+        compiler.state = decl.params.first().map(|param| param.name.clone());
+        for step in &decl.body {
+            compiler.step(step)?;
+        }
+        compiler.emit(Op::End);
+        Ok(Function {
+            name: Some(decl.name.clone()),
+            arity: decl.params.len(),
+            chunk: compiler.chunk,
+        })
+    }
+
+    fn parameters(&mut self, params: &[Param]) {
+        self.scope_depth = 1;
+        for param in params {
+            self.locals.push(Local {
+                name: param.name.clone(),
+                depth: 1,
+                slot: self.height,
+            });
+            self.height += 1;
+        }
+    }
+
+    /// Compiles a step of a sequence, which, like a statement, leaves the
+    /// stack as it found it except for a new local.
+    fn step(&mut self, step: &Step) -> Result<(), CompileError> {
+        let outer = std::mem::replace(&mut self.line, step.line);
+        match &step.kind {
+            // Binding the state's name again replaces the state, as in the
+            // interpreter, where the newest binding is what the game gets.
+            StepKind::Stmt(Stmt {
+                kind: StmtKind::Let(name, value),
+                ..
+            }) if self.state.as_ref() == Some(name) => {
+                self.expression(value)?;
+                self.emit(Op::SetState);
+            }
+            StepKind::Stmt(stmt) => self.statement(stmt)?,
+            StepKind::Set(target, field, value) => {
+                self.expression(value)?;
+                let state = self.identifier_constant(target);
+                let field = self.identifier_constant(field);
+                self.emit(Op::SetField { state, field });
+            }
+            StepKind::Over {
+                duration,
+                var,
+                body,
+            } => self.over(duration, var.as_deref(), body)?,
+        }
+        self.line = outer;
+        Ok(())
+    }
+
+    /// Compiles an `over`, or a `wait`, which is an `over` with no body, into
+    /// a loop of passes, one per frame of the game.
+    fn over(
+        &mut self,
+        duration: &Expr,
+        var: Option<&str>,
+        body: &[Step],
+    ) -> Result<(), CompileError> {
+        // If this frame already had a pass, the duration waits for the next
+        // one too, as the interpreter evaluates it at the first pass.
+        self.emit(Op::Yield);
+        self.expression(duration)?;
+        self.emit(Op::OverStart);
+        let counters = self.height - 2;
+
+        let top = self.chunk.code.len();
+        self.begin_scope();
+        self.emit(Op::OverPass(counters));
+        // `t` is a local of the body, with no name when there is no `as`.
+        self.locals.push(Local {
+            name: var.unwrap_or_default().to_string(),
+            depth: self.scope_depth,
+            slot: self.height - 1,
+        });
+        for step in body {
+            self.step(step)?;
+        }
+        self.drop_scope();
+        let distance = self.chunk.code.len() + 1 - top;
+        self.emit(Op::OverLoop { counters, distance });
+
+        self.emit(Op::Pop);
+        self.emit(Op::Pop);
+        Ok(())
     }
 
     fn emit(&mut self, op: Op) {
@@ -144,7 +239,22 @@ impl Compiler {
                 self.constant(Value::Compiled(Rc::new(function)));
                 self.emit(Op::DefineGlobal(global));
             }
-            other => return Err(self.unsupported(&format!("`{}`", kind(other)))),
+            StmtKind::Sequence(decl) => {
+                let name = self.identifier_constant(&decl.name);
+                let sequence = Compiler::sequence(decl, stmt.line)?;
+                self.constant(Value::Compiled(Rc::new(sequence)));
+                self.emit(Op::DefineSequence(name));
+            }
+            StmtKind::Start(name, args) => {
+                for arg in args {
+                    self.expression(arg)?;
+                }
+                let name = self.identifier_constant(name);
+                self.emit(Op::Start {
+                    name,
+                    argc: args.len(),
+                });
+            }
         }
         self.line = outer;
         Ok(())
@@ -183,6 +293,20 @@ impl Compiler {
         match &mut self.chunk.code[at] {
             Op::Jump(target) | Op::JumpIfFalse(target) => *target = distance,
             op => unreachable!("only jumps are patched, got {op:?}"),
+        }
+    }
+
+    /// Drops the locals of a scope that leaves no value, like the body of an
+    /// `over`, with a `Pop` each as clox does.
+    fn drop_scope(&mut self) {
+        self.scope_depth -= 1;
+        while self
+            .locals
+            .last()
+            .is_some_and(|local| local.depth > self.scope_depth)
+        {
+            self.locals.pop();
+            self.emit(Op::Pop);
         }
     }
 
@@ -325,13 +449,6 @@ impl Compiler {
         }
         Ok(())
     }
-
-    fn unsupported(&self, what: &str) -> CompileError {
-        CompileError {
-            message: format!("{what} cannot be compiled to bytecode yet"),
-            line: self.line,
-        }
-    }
 }
 
 fn binary(op: BinaryOp) -> Op {
@@ -367,6 +484,12 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
             1 - chunk.shapes[shape].fields.len() as isize - isize::from(base)
         }
         Op::DefineStruct(_) | Op::GetField(_) => 0,
+        Op::Start { argc, .. } => -(argc as isize),
+        Op::Yield | Op::OverLoop { .. } | Op::End => 0,
+        // It takes the duration and leaves the two counters.
+        Op::OverStart => 1,
+        Op::OverPass(_) => 1,
+        Op::DefineSequence(_) | Op::SetField { .. } | Op::SetState => -1,
         Op::DefineGlobal(_)
         | Op::Pop
         | Op::Add
@@ -380,17 +503,6 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
         | Op::LessEqual
         | Op::Greater
         | Op::GreaterEqual => -1,
-    }
-}
-
-fn kind(kind: &StmtKind) -> &'static str {
-    match kind {
-        StmtKind::Let(..) => "let",
-        StmtKind::Fn(..) => "fn",
-        StmtKind::Struct(..) => "struct",
-        StmtKind::Sequence(..) => "sequence",
-        StmtKind::Start(..) => "start",
-        StmtKind::Expr(..) => "expression",
     }
 }
 
@@ -554,10 +666,37 @@ mod tests {
     }
 
     #[test]
-    fn compiles_the_square_example() {
-        let source = include_str!("../../../examples/square.ludo");
-        for stmt in parse(scan_tokens(source).unwrap()).unwrap() {
-            compile(&stmt).unwrap_or_else(|e| panic!("{e}"));
+    fn a_sequence_loops_over_its_passes() {
+        let script =
+            compiled("s :: sequence (b: Ball) {\n  over 0.5s as t {\n    b.x = t\n  }\n}").unwrap();
+        let Value::Compiled(sequence) = &script.constants[1] else {
+            panic!("the sequence should be a constant of the script");
+        };
+        assert_eq!(
+            sequence.chunk.to_string(),
+            "0000    2 Yield\n\
+             0001    | Constant            0 0.5\n\
+             0002    | OverStart\n\
+             0003    | OverPass            1\n\
+             0004    3 GetLocal            3\n\
+             0005    | SetField         b.x\n\
+             0006    2 Pop\n\
+             0007    | OverLoop            1 -> 3\n\
+             0008    | Pop\n\
+             0009    | Pop\n\
+             0010    1 End\n"
+        );
+    }
+
+    #[test]
+    fn compiles_the_examples() {
+        for source in [
+            include_str!("../../../examples/square.ludo"),
+            include_str!("../../../examples/pong.ludo"),
+        ] {
+            for stmt in parse(scan_tokens(source).unwrap()).unwrap() {
+                compile(&stmt).unwrap_or_else(|e| panic!("{e}"));
+            }
         }
     }
 }

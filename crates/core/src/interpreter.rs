@@ -619,23 +619,43 @@ impl Interpreter {
 
     fn set_field(&mut self, target: &str, field: &str, expr: &Expr) -> Result<(), RuntimeError> {
         let value = self.evaluate(expr)?;
-        let mut instance = match self.lookup(target) {
-            Some(Value::Struct(instance)) => (**instance).clone(),
-            Some(other) => {
-                return Err(error(format!(
-                    "`{target}.{field} = ...` needs `{target}` to be a struct, got {}",
-                    other.type_name()
-                )))
-            }
-            None => unreachable!("a running sequence always has its state"),
-        };
-        match instance.fields.iter_mut().find(|(f, _)| f == field) {
-            Some((_, slot)) => *slot = value,
-            None => return Err(error(format!("`{}` has no field `{field}`", instance.name))),
-        }
-        self.bind(target.to_string(), Value::Struct(Rc::new(instance)));
+        let state = self
+            .lookup(target)
+            .expect("a running sequence always has its state");
+        let updated = with_field(target, state, field, value)?;
+        self.bind(target.to_string(), updated);
         Ok(())
     }
+
+    /// The names of the sequences that are running, in the order they run.
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> Vec<&str> {
+        self.runs.iter().map(|r| r.decl.name.as_str()).collect()
+    }
+}
+
+/// The state of a sequence with one of its fields replaced, for
+/// `target.field = value`.
+pub(crate) fn with_field(
+    target: &str,
+    state: &Value,
+    field: &str,
+    value: Value,
+) -> Result<Value, RuntimeError> {
+    let mut instance = match state {
+        Value::Struct(instance) => (**instance).clone(),
+        other => {
+            return Err(error(format!(
+                "`{target}.{field} = ...` needs `{target}` to be a struct, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    match instance.fields.iter_mut().find(|(f, _)| f == field) {
+        Some((_, slot)) => *slot = value,
+        None => return Err(error(format!("`{}` has no field `{field}`", instance.name))),
+    }
+    Ok(Value::Struct(Rc::new(instance)))
 }
 
 fn replace(runs: &mut Vec<Run>, run: Run) {
@@ -643,7 +663,11 @@ fn replace(runs: &mut Vec<Run>, run: Run) {
     runs.push(run);
 }
 
-fn passes(duration: Result<Value, RuntimeError>, dt: f64) -> Result<usize, RuntimeError> {
+/// How many passes, one per frame, an `over` of this duration makes.
+pub(crate) fn passes(
+    duration: Result<Value, RuntimeError>,
+    dt: f64,
+) -> Result<usize, RuntimeError> {
     match duration? {
         Value::Float(d) if d >= 0.0 && d.is_finite() => {
             Ok(((d / dt - 1e-9).ceil() as usize).max(1))
