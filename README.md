@@ -43,7 +43,7 @@ and games in detail in [Games](#games).
 
 These are planned but not implemented yet.
 
-- Enums and `case`. Enums as closed sets of symbols, like `State :: enum { :idle, :serving }`, and a `case` that reports a missing symbol before the program runs, with `when` guards.
+- Checking `case`: a `case` over an enum that misses one of its symbols is reported before the program runs.
 - Type checking Types are written but not checked yet. A checker will report a wrong type before the program runs.
 - Option: `Some(x)` and `None` for a value that may be missing, instead of an error.
 - Errors as values, a function that can fail returns `Ok(value)` or `Error(reason)`, and the caller handles both with `case`. There are no exceptions.
@@ -339,6 +339,35 @@ let state = :serving
 state == :serving   // true
 ```
 
+### Enums and case
+
+An enum is a closed set of symbols, like the states something can be in. Enum
+names start with an uppercase letter.
+
+```
+State :: enum { :idle, :serving, :playing }
+```
+
+`case` takes the first branch whose pattern matches a value. A pattern is a
+symbol, a number, a String or a Bool, which match a value equal to them; a name,
+which matches anything and binds it in the branch; or `_`, which matches
+anything. A branch can add a condition with `when`. Like `if`, `case` is an
+expression, and a value that no branch matches is an error.
+
+```
+let label = case state {
+    :idle -> "press space"
+    :serving when w.pop < 1.0 -> "get ready"
+    _ -> ""
+}
+
+let sign = case n {
+    0 -> "zero"
+    m when m < 0 -> "negative"
+    _ -> "positive"
+}
+```
+
 ### Lists
 
 A list cannot be changed either, and operations return a new one. There are no
@@ -421,9 +450,10 @@ topLevel       → declaration | statement ;
 #### Declarations
 
 ```
-declaration    → funDecl | structDecl | seqDecl ;
+declaration    → funDecl | structDecl | enumDecl | seqDecl ;
 funDecl        → IDENTIFIER "::" function ;
 structDecl     → IDENTIFIER "::" "struct" "{" ( field ( separator field )* separator? )? "}" ;
+enumDecl       → IDENTIFIER "::" "enum" "{" SYMBOL ( separator SYMBOL )* separator? "}" ;
 seqDecl        → IDENTIFIER "::" "sequence" "(" parameters ")" "{" ( step NEWLINE )* "}" ;
 ```
 
@@ -454,8 +484,11 @@ factor         → unary ( ( "*" | "/" | "%" ) unary )* ;
 unary          → ( "-" | "!" ) unary | call ;
 call           → primary ( "(" arguments? ")" | "." IDENTIFIER ( "(" arguments? ")" )? )* ;
 primary        → INT | FLOAT | STRING | SYMBOL | IDENTIFIER | "true" | "false"
-               | "(" expression ")" | ifExpr | block | structLit | list ;
+               | "(" expression ")" | ifExpr | caseExpr | block | structLit | list ;
 ifExpr         → "if" expression block "else" ( ifExpr | block ) ;
+caseExpr       → "case" expression "{" branch ( separator branch )* separator? "}" ;
+branch         → pattern ( "when" expression )? "->" expression ;
+pattern        → "-"? ( INT | FLOAT ) | STRING | SYMBOL | "true" | "false" | IDENTIFIER ;
 block          → "{" ( statement NEWLINE )* expression "}" ;
 structLit      → IDENTIFIER "{" ( expression "|" )? ( fieldValue ( separator fieldValue )* separator? )? "}" ;
 list           → "[" ( expression ( "," expression )* ","? )? "]" ;

@@ -49,6 +49,14 @@ pub enum Op {
     /// Replaces the struct on top of the stack with its field named by this
     /// constant.
     GetField(usize),
+    /// Declares the enum in this shape, whose fields are its symbols.
+    DefineEnum(usize),
+    /// Replaces the value on top of the stack with whether it matches the
+    /// literal pattern in this constant: a value of its type equal to it.
+    MatchConstant(usize),
+    /// Fails because no branch of a `case` matches the value on top of the
+    /// stack.
+    NoMatch,
     /// Declares the sequence on top of the stack under the name in this
     /// constant. Like structs, sequences are looked up by name.
     DefineSequence(usize),
@@ -136,6 +144,7 @@ impl fmt::Display for Function {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Test {
     If,
+    When,
     And,
     Or,
 }
@@ -144,6 +153,7 @@ impl fmt::Display for Test {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad(match self {
             Test::If => "if",
+            Test::When => "when",
             Test::And => "and",
             Test::Or => "or",
         })
@@ -153,7 +163,8 @@ impl fmt::Display for Test {
 /// A struct as an instruction names it: the struct and some of its fields. A
 /// declaration lists all of them in order; a literal lists the ones it
 /// gives, in the order they are written. clox has no such thing, since its
-/// instances get their fields one at a time.
+/// instances get their fields one at a time. An enum is one too, with its
+/// symbols as the fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shape {
     pub name: String,
@@ -228,6 +239,16 @@ impl Chunk {
                 )
             }
             Op::GetField(index) => self.constant_op("GetField", index),
+            Op::DefineEnum(shape) => {
+                let shown = &self.shapes[shape];
+                let symbols: Vec<String> = shown.fields.iter().map(|s| format!(":{s}")).collect();
+                let symbols = symbols.join(", ");
+                format!(
+                    "{:<16} {shape:4} {} {{ {symbols} }}",
+                    "DefineEnum", shown.name
+                )
+            }
+            Op::MatchConstant(index) => self.constant_op("MatchConstant", index),
             Op::DefineSequence(index) => self.constant_op("DefineSequence", index),
             Op::Start { name, argc } => {
                 format!("{:<16} {argc:4} {:?}", "Start", self.name(name))

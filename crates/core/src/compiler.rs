@@ -1,7 +1,9 @@
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ast::{BinaryOp, Expr, FnDecl, Param, SeqDecl, Step, StepKind, Stmt, StmtKind, UnaryOp};
+use crate::ast::{
+    Arm, BinaryOp, Expr, FnDecl, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind, UnaryOp,
+};
 use crate::chunk::{Chunk, Function, Op, Shape, Test};
 use crate::value::Value;
 
@@ -239,6 +241,13 @@ impl Compiler {
                 self.constant(Value::Compiled(Rc::new(function)));
                 self.emit(Op::DefineGlobal(global));
             }
+            StmtKind::Enum(decl) => {
+                let shape = self.chunk.add_shape(Shape {
+                    name: decl.name.clone(),
+                    fields: decl.symbols.clone(),
+                });
+                self.emit(Op::DefineEnum(shape));
+            }
             StmtKind::Sequence(decl) => {
                 let name = self.identifier_constant(&decl.name);
                 let sequence = Compiler::sequence(decl, stmt.line)?;
@@ -278,6 +287,75 @@ impl Compiler {
         if count > 0 {
             self.emit(Op::PopBelow(count));
         }
+    }
+
+    /// Compiles a `case`. Its value stays on the stack as a hidden local while
+    /// each branch tests it in turn. A branch that does not apply drops what
+    /// it pushed and goes on to the next one; one that does leaves its value
+    /// and jumps to the end, where the hidden local goes.
+    fn case(&mut self, value: &Expr, arms: &[Arm]) -> Result<(), CompileError> {
+        self.expression(value)?;
+        let slot = self.height - 1;
+        let line = self.line;
+        let mut ends = Vec::new();
+        for arm in arms {
+            self.line = arm.line;
+            // Only the branch before can reach here, when it does not apply,
+            // with the value alone on the stack.
+            self.height = slot + 1;
+            self.begin_scope();
+            let mut fails = Vec::new();
+            match &arm.pattern {
+                Pattern::Wildcard => {}
+                Pattern::Bind(name) => {
+                    self.emit(Op::GetLocal(slot));
+                    self.locals.push(Local {
+                        name: name.clone(),
+                        depth: self.scope_depth,
+                        slot: self.height - 1,
+                    });
+                }
+                Pattern::Literal(literal) => {
+                    self.emit(Op::GetLocal(slot));
+                    let index = self.chunk.add_constant(Value::from(literal));
+                    self.emit(Op::MatchConstant(index));
+                    fails.push(self.emit_jump(Op::JumpIfFalse));
+                    self.emit(Op::Pop);
+                }
+            }
+            let bound = self.height - slot - 1;
+            if let Some(guard) = &arm.guard {
+                self.expression(guard)?;
+                self.emit(Op::CheckBool(Test::When));
+                fails.push(self.emit_jump(Op::JumpIfFalse));
+                self.emit(Op::Pop);
+            }
+            self.expression(&arm.body)?;
+            self.end_scope();
+            ends.push(self.emit_jump(Op::Jump));
+
+            // A pattern that does not match leaves no bindings, so every jump
+            // here has the same on the stack: what the pattern bound and the
+            // Bool that said no.
+            if !fails.is_empty() {
+                for fail in fails {
+                    self.patch_jump(fail);
+                }
+                self.height = slot + bound + 2;
+                for _ in 0..=bound {
+                    self.emit(Op::Pop);
+                }
+            }
+        }
+        self.line = line;
+        self.height = slot + 1;
+        self.emit(Op::NoMatch);
+        for end in ends {
+            self.patch_jump(end);
+        }
+        self.height = slot + 2;
+        self.emit(Op::PopBelow(1));
+        Ok(())
     }
 
     /// Emits a jump whose target is not known yet, and returns where it is
@@ -421,6 +499,7 @@ impl Compiler {
                 self.expression(otherwise)?;
                 self.patch_jump(else_jump);
             }
+            Expr::Case(value, arms) => self.case(value, arms)?,
             Expr::List(items) => {
                 for item in items {
                     self.expression(item)?;
@@ -484,6 +563,7 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
             1 - chunk.shapes[shape].fields.len() as isize - isize::from(base)
         }
         Op::DefineStruct(_) | Op::GetField(_) => 0,
+        Op::DefineEnum(_) | Op::MatchConstant(_) | Op::NoMatch => 0,
         Op::Start { argc, .. } => -(argc as isize),
         Op::Yield | Op::OverLoop { .. } | Op::End => 0,
         // It takes the duration and leaves the two counters.
@@ -698,5 +778,39 @@ mod tests {
                 compile(&stmt).unwrap_or_else(|e| panic!("{e}"));
             }
         }
+    }
+
+    #[test]
+    fn a_case_tests_each_branch_and_drops_what_a_failed_one_pushed() {
+        assert_eq!(
+            compiled("case s { :a -> 1, n when n > 2 -> n, _ -> 0 }")
+                .unwrap()
+                .to_string(),
+            "0000    1 GetGlobal           0 \"s\"\n\
+             0001    | GetLocal            0\n\
+             0002    | MatchConstant       1 :a\n\
+             0003    | JumpIfFalse         3 -> 7\n\
+             0004    | Pop\n\
+             0005    | Constant            2 1\n\
+             0006    | Jump               16 -> 23\n\
+             0007    | Pop\n\
+             0008    | GetLocal            0\n\
+             0009    | GetLocal            1\n\
+             0010    | Constant            3 2\n\
+             0011    | Greater\n\
+             0012    | CheckBool        when\n\
+             0013    | JumpIfFalse         4 -> 18\n\
+             0014    | Pop\n\
+             0015    | GetLocal            1\n\
+             0016    | PopBelow            1\n\
+             0017    | Jump                5 -> 23\n\
+             0018    | Pop\n\
+             0019    | Pop\n\
+             0020    | Constant            4 0\n\
+             0021    | Jump                1 -> 23\n\
+             0022    | NoMatch\n\
+             0023    | PopBelow            1\n\
+             0024    | Return\n"
+        );
     }
 }

@@ -4,8 +4,8 @@ use std::rc::Rc;
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::chunk::{Function, Op, Shape, Test};
 use crate::interpreter::{
-    binary, check_arity, condition, error, field, logical, passes, unary, with_field, RuntimeError,
-    MAX_CALL_DEPTH,
+    binary, check_arity, condition, enum_hint, error, field, logical, matches, no_match, passes,
+    unary, with_field, RuntimeError, MAX_CALL_DEPTH,
 };
 use crate::prelude::NATIVES;
 use crate::value::{Caller, Instance, Value};
@@ -53,6 +53,8 @@ pub struct Vm {
     /// The fields of each declared struct, in order, looked up by name like
     /// the globals.
     structs: HashMap<String, Vec<String>>,
+    /// The symbols of each declared enum.
+    enums: HashMap<String, Vec<String>>,
     /// Looked up by name like the structs.
     sequences: HashMap<String, Rc<Function>>,
     /// The sequences that are running, in the order they were started.
@@ -86,6 +88,7 @@ impl Vm {
             frames: Vec::new(),
             globals,
             structs: HashMap::new(),
+            enums: HashMap::new(),
             sequences: HashMap::new(),
             runs: Vec::new(),
             spent: false,
@@ -292,6 +295,9 @@ impl Vm {
                         None if self.sequences.contains_key(name) => Err(error(format!(
                             "`{name}` is a sequence, not a function: it runs over time and cannot be called"
                         ))),
+                        None if self.enums.contains_key(name) => {
+                            Err(error(enum_hint(name, &self.enums[name][0])))
+                        }
                         None => Err(error(format!("undefined variable `{name}`"))),
                     }
                 }
@@ -313,7 +319,8 @@ impl Vm {
                 Op::CheckBool(test) => {
                     let value = self.peek();
                     match test {
-                        Test::If => condition(value),
+                        Test::If => condition("if", value),
+                        Test::When => condition("when", value),
                         Test::And => logical(BinaryOp::And, value),
                         Test::Or => logical(BinaryOp::Or, value),
                     }
@@ -359,6 +366,18 @@ impl Vm {
                     self.build_struct(shape, base, values)
                         .map(|instance| self.push(instance))
                 }
+                Op::DefineEnum(shape) => {
+                    let Shape { name, fields } = chunk.shapes[shape].clone();
+                    self.enums.insert(name, fields);
+                    Ok(())
+                }
+                Op::MatchConstant(index) => {
+                    let value = self.pop();
+                    let matched = matches(&value, &chunk.constants[index]);
+                    self.push(Value::Bool(matched));
+                    Ok(())
+                }
+                Op::NoMatch => Err(no_match(self.peek())),
                 Op::GetField(index) => {
                     let target = self.pop();
                     field(&target, chunk.name(index)).map(|value| self.push(value))
@@ -1243,5 +1262,49 @@ mod tests {
         new.vm.stop_sequences();
         new.interpreter.stop_sequences();
         assert_eq!(new.frames(ball(0.0), 0.25, 1), "0.0 done");
+    }
+
+    #[test]
+    fn case_takes_the_first_branch_that_matches() {
+        runs(&[
+            (
+                "State :: enum { :idle, :serving }\nlet s = :serving\ncase s {\n  :idle -> 1\n  :serving -> 2\n}",
+                "2",
+            ),
+            // Guards, names that bind the value, and `_` for the rest.
+            (
+                "describe :: (n: Int) -> String {\n  case n {\n    0 -> \"zero\"\n    m when m < 0 -> \"negative\"\n    m when m % 2 == 0 -> to_string(m) + \" is even\"\n    _ -> \"odd\"\n  }\n}\n\
+                 describe(0)\ndescribe(-3)\ndescribe(4)\ndescribe(7)",
+                "zero\nnegative\n4 is even\nodd",
+            ),
+            // A value of another type is no match, and no error.
+            ("case 1 {\n  1.0 -> :float\n  \"1\" -> :string\n  1 -> :int\n}", ":int"),
+            // Inside an expression, with locals around it and in a branch.
+            (
+                "{\n  let a = 10\n  1 + case a {\n    n when n > 5 -> {\n      let d = n * 2\n      d + a\n    }\n    _ -> 0\n  }\n}",
+                "31",
+            ),
+            ("case true { false -> 0, true -> 1 }", "1"),
+        ]);
+    }
+
+    #[test]
+    fn reports_errors_in_case() {
+        runs(&[
+            (
+                "case :c {\n  :a -> 1\n  :b -> 2\n}",
+                "[line 1] error: no branch of `case` matches :c",
+            ),
+            ("case \"x\" { \"y\" -> 1 }", "[line 1] error: no branch of `case` matches \"x\""),
+            (
+                "case 1 {\n  n when n -> 1\n  _ -> 2\n}",
+                "[line 2] error: the condition of `when` must be a Bool, got Int",
+            ),
+            ("case 1 {\n  :a -> 1\n  _ -> 1 / 0\n}", "[line 3] error: division by zero"),
+            (
+                "State :: enum { :idle }\nState",
+                "[line 2] error: `State` is an enum, not a value: its values are its symbols, like `:idle`",
+            ),
+        ]);
     }
 }

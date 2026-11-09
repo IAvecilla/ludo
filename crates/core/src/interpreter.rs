@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{
-    BinaryOp, Expr, FnDecl, SeqDecl, Step, StepKind, Stmt, StmtKind, StructDecl, UnaryOp,
+    Arm, BinaryOp, EnumDecl, Expr, FnDecl, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
+    StructDecl, UnaryOp,
 };
 use crate::prelude::NATIVES;
 use crate::value::{Caller, Instance, Native, Value};
@@ -29,6 +30,7 @@ pub struct Interpreter {
     globals: HashMap<String, Value>,
     depth: usize,
     structs: HashMap<String, Rc<StructDecl>>,
+    enums: HashMap<String, Rc<EnumDecl>>,
     sequences: HashMap<String, Rc<SeqDecl>>,
     runs: Vec<Run>,
 }
@@ -48,6 +50,7 @@ impl Interpreter {
             globals: HashMap::new(),
             depth: 0,
             structs: HashMap::new(),
+            enums: HashMap::new(),
             sequences: HashMap::new(),
             runs: Vec::new(),
         };
@@ -104,6 +107,10 @@ impl Interpreter {
                 self.structs.insert(decl.name.clone(), decl.clone());
                 Ok(None)
             }
+            StmtKind::Enum(decl) => {
+                self.enums.insert(decl.name.clone(), decl.clone());
+                Ok(None)
+            }
             StmtKind::Sequence(decl) => {
                 self.sequences.insert(decl.name.clone(), decl.clone());
                 Ok(None)
@@ -138,7 +145,7 @@ impl Interpreter {
                 result
             }
             Expr::If(cond, then, otherwise) => {
-                if self.boolean(cond, condition)? {
+                if self.boolean(cond, |v| condition("if", v))? {
                     self.evaluate(then)
                 } else {
                     self.evaluate(otherwise)
@@ -171,6 +178,7 @@ impl Interpreter {
                 field(&target, name)
             }
             Expr::Struct { name, base, fields } => self.construct(name, base.as_deref(), fields),
+            Expr::Case(value, arms) => self.case(value, arms),
         }
     }
 
@@ -184,6 +192,8 @@ impl Interpreter {
             format!(
                 "`{name}` is a sequence, not a function: it runs over time and cannot be called"
             )
+        } else if let Some(decl) = self.enums.get(name) {
+            enum_hint(name, &decl.symbols[0])
         } else {
             format!("undefined variable `{name}`")
         };
@@ -284,6 +294,41 @@ impl Interpreter {
             .or_else(|| self.globals.get(name))
     }
 
+    fn case(&mut self, value: &Expr, arms: &[Arm]) -> Result<Value, RuntimeError> {
+        let value = self.evaluate(value)?;
+        for arm in arms {
+            let outer = self.locals.len();
+            self.nested += 1;
+            let result = self.arm(arm, &value);
+            self.nested -= 1;
+            self.locals.truncate(outer);
+            if let Some(result) = result? {
+                return Ok(result);
+            }
+        }
+        Err(no_match(&value))
+    }
+
+    /// The value of a branch of a `case`, if its pattern matches `value` and
+    /// its guard holds.
+    fn arm(&mut self, arm: &Arm, value: &Value) -> Result<Option<Value>, RuntimeError> {
+        match &arm.pattern {
+            Pattern::Wildcard => {}
+            Pattern::Bind(name) => self.locals.push((name.clone(), value.clone())),
+            Pattern::Literal(literal) if matches(value, &Value::from(literal)) => {}
+            Pattern::Literal(_) => return Ok(None),
+        }
+        if let Some(guard) = &arm.guard {
+            let holds = self.boolean(guard, |v| condition("when", v));
+            if !holds.map_err(|e| e.at(arm.line))? {
+                return Ok(None);
+            }
+        }
+        self.evaluate(&arm.body)
+            .map(Some)
+            .map_err(|e| e.at(arm.line))
+    }
+
     /// Evaluates an expression that must give a Bool. It runs in a frame of
     /// its own so that its temporaries do not grow the frame of `evaluate`,
     /// which deep recursion stacks up.
@@ -327,15 +372,34 @@ pub(crate) fn field(target: &Value, name: &str) -> Result<Value, RuntimeError> {
     }
 }
 
-/// The condition of an `if`, which must be a Bool: ludo has no truthiness.
-pub(crate) fn condition(value: &Value) -> Result<bool, RuntimeError> {
+/// The condition of an `if` or the guard of a branch of `case`, after
+/// `when`, which must be a Bool: ludo has no truthiness.
+pub(crate) fn condition(keyword: &str, value: &Value) -> Result<bool, RuntimeError> {
     match value {
         Value::Bool(v) => Ok(*v),
         v => Err(error(format!(
-            "the condition of `if` must be a Bool, got {}",
+            "the condition of `{keyword}` must be a Bool, got {}",
             v.type_name()
         ))),
     }
+}
+
+/// Whether a value matches a literal pattern: a value of the literal's type
+/// equal to it. A value of another type does not match; it is no error.
+pub(crate) fn matches(value: &Value, literal: &Value) -> bool {
+    value.same_type(literal) && value == literal
+}
+
+pub(crate) fn no_match(value: &Value) -> RuntimeError {
+    let shown = match value {
+        Value::Str(v) => format!("{v:?}"),
+        v => v.to_string(),
+    };
+    error(format!("no branch of `case` matches {shown}"))
+}
+
+pub(crate) fn enum_hint(name: &str, symbol: &str) -> String {
+    format!("`{name}` is an enum, not a value: its values are its symbols, like `:{symbol}`")
 }
 
 /// An operand of `and` or `or`, which must be a Bool.
