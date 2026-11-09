@@ -17,6 +17,10 @@ pressed :: (input: Input, key: Symbol) -> Bool {
 
 Color :: struct { r: Int, g: Int, b: Int, a: Int }
 
+ColorName :: enum { :white, :black, :gray, :red, :green, :blue, :yellow, :orange, :purple, :pink }
+
+Paint :: Color | ColorName
+
 rgb :: (r: Int, g: Int, b: Int) -> Color {
     Color { r: r, g: g, b: b, a: 255 }
 }
@@ -25,7 +29,9 @@ rgba :: (r: Int, g: Int, b: Int, a: Int) -> Color {
     Color { r: r, g: g, b: b, a: a }
 }
 
-Rect :: struct { x: Float, y: Float, w: Float, h: Float, color: Color }
-Circle :: struct { x: Float, y: Float, r: Float, color: Color }
-Line :: struct { x1: Float, y1: Float, x2: Float, y2: Float, thickness: Float, color: Color }
-Text :: struct { x: Float, y: Float, size: Float, text: String, color: Color }
+Rect :: struct { x: Float, y: Float, w: Float, h: Float, color: Paint }
+Circle :: struct { x: Float, y: Float, r: Float, color: Paint }
+Line :: struct { x1: Float, y1: Float, x2: Float, y2: Float, thickness: Float, color: Paint }
+Text :: struct { x: Float, y: Float, size: Float, text: String, color: Paint }
+
+Shape :: Rect | Circle | Line | Text

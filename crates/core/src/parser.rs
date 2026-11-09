@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::ast::{
     Arm, BinaryOp, EnumDecl, Expr, FnDecl, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt,
-    StmtKind, StructDecl, TypeExpr, UnaryOp, Variant,
+    StmtKind, StructDecl, TypeExpr, UnaryOp, UnionDecl, Variant,
 };
 use crate::token::{Token, TokenKind};
 
@@ -142,18 +142,21 @@ impl Parser {
 
     fn declaration(&mut self, line: usize) -> Result<StmtKind, ParseError> {
         let kind = self.kind_at(2).cloned();
-        let what = match kind {
+        let what = match &kind {
             Some(TokenKind::Struct) => "structs",
             Some(TokenKind::Enum) => "enums",
             Some(TokenKind::Sequence) => "sequences",
+            Some(TokenKind::Ident(name)) if starts_uppercase(name) => "unions",
             _ => "functions",
         };
         if self.blocks > 0 {
             return Err(self.error(format!("{what} can only be declared at the top level")));
         }
+        let union = matches!(&kind, Some(TokenKind::Ident(name)) if starts_uppercase(name));
         let named = match kind {
             Some(TokenKind::Struct) => Some("a struct"),
             Some(TokenKind::Enum) => Some("an enum"),
+            _ if union => Some("a union"),
             _ => None,
         };
         if let Some(named) = named {
@@ -181,8 +184,9 @@ impl Parser {
                 self.advance();
                 self.fn_declaration(name)
             }
+            _ if union => self.union_declaration(name),
             _ => Err(self.error(
-                "expected `(`, `struct`, `enum` or `sequence` after `::`; values are bound with `let`",
+                "expected `(`, `struct`, `enum`, `sequence` or a type after `::`; values are bound with `let`",
             )),
         }
     }
@@ -212,6 +216,16 @@ impl Parser {
     }
 
     fn type_expr(&mut self) -> Result<TypeExpr, ParseError> {
+        if self.matches(&[TokenKind::LParen]) {
+            let params = self.comma_list(
+                TokenKind::RParen,
+                "`)` to close the parameter types",
+                Self::type_expr,
+            )?;
+            self.expect(TokenKind::Arrow, "`->` and the type of the result")?;
+            let ret = Box::new(self.type_expr()?);
+            return Ok(TypeExpr::Function { params, ret });
+        }
         let name = self.expect_ident("a type")?;
         let args = if self.matches(&[TokenKind::LBracket]) {
             self.comma_list(
@@ -222,7 +236,15 @@ impl Parser {
         } else {
             Vec::new()
         };
-        Ok(TypeExpr { name, args })
+        Ok(TypeExpr::Named { name, args })
+    }
+
+    fn union_declaration(&mut self, name: String) -> Result<StmtKind, ParseError> {
+        let mut members = vec![self.type_expr()?];
+        while self.matches(&[TokenKind::Bar]) {
+            members.push(self.type_expr()?);
+        }
+        Ok(StmtKind::Union(Rc::new(UnionDecl { name, members })))
     }
 
     fn struct_declaration(&mut self, name: String) -> Result<StmtKind, ParseError> {
@@ -999,7 +1021,7 @@ mod tests {
             ("{\n  f :: () -> Int { 1 }\n  1\n}", "functions can only be declared at the top level, found `f`"),
             (
                 "speed :: 320.0",
-                "expected `(`, `struct`, `enum` or `sequence` after `::`; values are bound with `let`, found `320.0`",
+                "expected `(`, `struct`, `enum`, `sequence` or a type after `::`; values are bound with `let`, found `320.0`",
             ),
         ]);
     }
@@ -1201,6 +1223,34 @@ mod tests {
             (
                 "case x { None(1) -> 1 }",
                 "expected `->` and the value of the branch, found `(`",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn parses_function_types_and_unions() {
+        parses(&[
+            (
+                "twice :: (f: (Int) -> Int, x: Int) -> Int { f(f(x)) }",
+                "(fn twice (f: (Int) -> Int, x: Int) -> Int (block (call f (call f x))))",
+            ),
+            (
+                "pick :: () -> (List[Int], Int) -> Bool { has }",
+                "(fn pick () -> (List[Int], Int) -> Bool (block has))",
+            ),
+            (
+                "Shape :: Rect | Circle\nPaint :: Color | Symbol",
+                "(type Shape Rect | Circle)\n(type Paint Color | Symbol)",
+            ),
+        ]);
+        rejects(&[
+            (
+                "shape :: Rect | Circle",
+                "a union name starts with an uppercase letter, found `shape`",
+            ),
+            (
+                "f :: (g: (Int) Int) -> Int { 1 }",
+                "expected `->` and the type of the result, found `Int`",
             ),
         ]);
     }

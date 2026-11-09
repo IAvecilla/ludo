@@ -44,7 +44,6 @@ and games in detail in [Games](#games).
 These are planned but not implemented yet.
 
 - Checking `case`: a `case` over an enum that misses one of its symbols is reported before the program runs.
-- Type checking Types are written but not checked yet. A checker will report a wrong type, or a field a struct does not have, before the program runs.
 - Vec2: A 2D vector with `+`, `-` and `*`, for positions and velocities.
 - Accessing lists by index
 - Sound and sprites 
@@ -160,18 +159,38 @@ let speed = 320.0   // pixels per second
 
 ### Types
 
-| | | |
-| --- | --- | --- |
-| `Int` | 64 bit integer | |
-| `Float` | 64 bit float | |
-| `Bool` | `true` / `false` | |
-| `String` | text | |
-| `Symbol` | a name used as a label, like `:jump` ||
-| `List[T]` | immutable list ||
-| `struct` | named record with typed fields | |
+| | |
+| --- | --- |
+| `Int` | 64 bit integer |
+| `Float` | 64 bit float |
+| `Bool` | `true` / `false` |
+| `String` | text |
+| `Symbol` | a name used as a label, like `:jump` |
+| `List[T]` | immutable list |
+| `Option[T]`, `Result[T, E]` | a value that may be missing, or why it is |
+| `(Int, Int) -> Bool` | a function |
+| structs, enums and unions | declared by the program |
 
-Types are written in signatures and fields, but nothing checks them yet, the
-type checker is a work in progress and is not yet fully implemented.
+Types are written in signatures and in the fields of structs, and before a
+program runs the type of every value is checked against them. Where a type is
+expected, as for an argument, a field or what a function returns, the value is
+checked against it; elsewhere its type is found from what it is made of, so a
+`let` needs no type.
+
+A union is a type whose values are those of any of its members, and its name
+starts with an uppercase letter.
+
+```
+Shape :: Rect | Circle | Line | Text
+```
+
+A value fits where its union is expected, and since values never change, so
+does a list of them: a `List[Rect]` is a `List[Shape]`. A field can be read from
+a union if all its members have it, with the same type. A symbol fits an enum
+that has it, and any `Symbol`. Ints and Floats do not mix, so `1 + 2.0` is an
+error and `to_float` converts. Native functions like `map` are generic, and find
+their types at each call: `map` over a `List[Int]` with a function to `String`
+gives a `List[String]`.
 
 ### Variables
 
@@ -473,10 +492,11 @@ topLevel       → declaration | statement ;
 #### Declarations
 
 ```
-declaration    → funDecl | structDecl | enumDecl | seqDecl ;
+declaration    → funDecl | structDecl | enumDecl | unionDecl | seqDecl ;
 funDecl        → IDENTIFIER "::" function ;
 structDecl     → IDENTIFIER "::" "struct" "{" ( field ( separator field )* separator? )? "}" ;
 enumDecl       → IDENTIFIER "::" "enum" "{" SYMBOL ( separator SYMBOL )* separator? "}" ;
+unionDecl      → IDENTIFIER "::" type ( "|" type )* ;
 seqDecl        → IDENTIFIER "::" "sequence" "(" parameters ")" "{" ( step NEWLINE )* "}" ;
 ```
 
@@ -524,7 +544,8 @@ list           → "[" ( expression ( "," expression )* ","? )? "]" ;
 function       → "(" parameters? ")" "->" type block ;
 parameters     → IDENTIFIER ":" type ( "," IDENTIFIER ":" type )* ","? ;
 arguments      → expression ( "," expression )* ","? ;
-type           → IDENTIFIER ( "[" type ( "," type )* ","? "]" )? ;
+type           → IDENTIFIER ( "[" type ( "," type )* ","? "]" )?
+               | "(" ( type ( "," type )* ","? )? ")" "->" type ;
 field          → IDENTIFIER ":" type ;
 fieldValue     → IDENTIFIER ":" expression ;
 separator      → "," | NEWLINE ;
@@ -586,7 +607,9 @@ prints, without running anything,
 [line 6] Name Error: missing field `y` in `Ball`
 ```
 
-The REPL checks each input the same way, after the ones before it.
+Values of the wrong type are reported the same way, as Type Errors, like
+``[line 3] Type Error: argument 2 of `add` must be Int, got String``. The REPL
+checks each input the same way, after the ones before it.
 
 A runtime error stops the program at the line where it happened, even inside a
 function. This program
@@ -636,11 +659,14 @@ draw :: (w: World) -> List[Shape]
   `:space`, `:enter`, `:escape`, `:tab`, `:backspace`, `:shift` and `:control`.
   `input.up`, `input.w`, `input.space` and the other arrow and WASD keys are
   also plain `Bool` fields, as a shorthand for `held`.
-- A color is `rgb(r, g, b)` or `rgba(r, g, b, a)`, with each channel an `Int`
-  from 0 to 255 and `a` being the opacity, or one of ten names as a symbol, which
-  are `:white`,
-  `:black`, `:gray`, `:red`, `:green`, `:blue`, `:yellow`, `:orange`, `:purple`,
-  `:pink`.
+- A color is a `Paint`, which is either `rgb(r, g, b)` or `rgba(r, g, b, a)`,
+  with each channel an `Int` from 0 to 255 and `a` being the opacity, or one of
+  the ten names of the enum `ColorName`, which are `:white`, `:black`, `:gray`,
+  `:red`, `:green`, `:blue`, `:yellow`, `:orange`, `:purple` and `:pink`. A name
+  that is not one of them is a Type Error before the game runs.
+- `Shape :: Rect | Circle | Line | Text`, `Input`, `Config`, `Paint` and the
+  functions above are declared by the host. `ludo run` and the REPL declare them
+  too, so a game file runs there as well, and shapes can be tried in the REPL.
 
 A runtime error stops the game and shows the message at the top of the window.
 

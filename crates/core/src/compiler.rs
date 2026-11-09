@@ -242,6 +242,8 @@ impl Compiler {
                 self.constant(Value::Compiled(Rc::new(function)));
                 self.emit(Op::DefineGlobal(global));
             }
+            // A union only tells the checker what a type can be.
+            StmtKind::Union(_) => {}
             StmtKind::Enum(decl) => {
                 let shape = self.chunk.add_shape(Shape {
                     name: decl.name.clone(),

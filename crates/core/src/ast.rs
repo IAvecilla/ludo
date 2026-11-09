@@ -100,10 +100,18 @@ pub enum Literal {
     Bool(bool),
 }
 
+/// A type as it is written: a name with the types it takes, like
+/// `List[Int]`, or a function, like `(Int, Int) -> Bool`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypeExpr {
-    pub name: String,
-    pub args: Vec<TypeExpr>,
+pub enum TypeExpr {
+    Named {
+        name: String,
+        args: Vec<TypeExpr>,
+    },
+    Function {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +132,13 @@ pub struct FnDecl {
 pub struct StructDecl {
     pub name: String,
     pub fields: Vec<Param>,
+}
+
+/// `Name :: A | B`: a type whose values are those of any of its members.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnionDecl {
+    pub name: String,
+    pub members: Vec<TypeExpr>,
 }
 
 /// `Name :: enum { :a, :b }`: a closed set of symbols.
@@ -163,6 +178,7 @@ pub enum StmtKind {
     Fn(Rc<FnDecl>),
     Struct(Rc<StructDecl>),
     Enum(Rc<EnumDecl>),
+    Union(Rc<UnionDecl>),
     Sequence(Rc<SeqDecl>),
     Start(String, Vec<Expr>),
     Expr(Expr),
@@ -187,6 +203,10 @@ impl fmt::Display for StmtKind {
             StmtKind::Fn(decl) => write!(f, "{decl}"),
             StmtKind::Struct(decl) => write!(f, "{decl}"),
             StmtKind::Enum(decl) => write!(f, "{decl}"),
+            StmtKind::Union(decl) => {
+                let members: Vec<String> = decl.members.iter().map(|m| m.to_string()).collect();
+                write!(f, "(type {} {})", decl.name, members.join(" | "))
+            }
             StmtKind::Sequence(decl) => write!(f, "{decl}"),
             StmtKind::Start(name, args) => write!(f, "(start {name}{})", spaced(args)),
             StmtKind::Expr(expr) => write!(f, "{expr}"),
@@ -289,12 +309,15 @@ fn spaced(items: &[impl fmt::Display]) -> String {
 
 impl fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.name)?;
-        if !self.args.is_empty() {
-            let args: Vec<String> = self.args.iter().map(|a| a.to_string()).collect();
-            write!(f, "[{}]", args.join(", "))?;
+        let list = |types: &[TypeExpr]| {
+            let shown: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+            shown.join(", ")
+        };
+        match self {
+            TypeExpr::Named { name, args } if args.is_empty() => f.write_str(name),
+            TypeExpr::Named { name, args } => write!(f, "{name}[{}]", list(args)),
+            TypeExpr::Function { params, ret } => write!(f, "({}) -> {ret}", list(params)),
         }
-        Ok(())
     }
 }
 
