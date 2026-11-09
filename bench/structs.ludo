@@ -1,0 +1,23 @@
+// Structs built and read at every step, as the world of a game is.
+
+Particle :: struct { x: Float, y: Float, vx: Float, vy: Float }
+
+spawn :: (i: Int) -> Particle {
+    let f = to_float(i)
+    Particle { x: f, y: 0.0, vx: f / 100.0, vy: 0.0 }
+}
+
+fall :: (p: Particle) -> Particle {
+    let vy = p.vy + 0.1
+    let p = Particle { p | x: p.x + p.vx, y: p.y + vy, vy: vy }
+    if p.y > 100.0 { Particle { p | y: 100.0, vy: -p.vy * 0.8 } } else { p }
+}
+
+step :: (ps: List[Particle], i: Int) -> List[Particle] {
+    ps |> map(fall)
+}
+
+height :: (total: Float, p: Particle) -> Float { total + p.y }
+
+let particles = range(0, 200) |> map(spawn)
+print(range(0, 500) |> fold(particles, step) |> fold(0.0, height))

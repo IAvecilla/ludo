@@ -145,6 +145,7 @@ make run FILE=examples/pong.ludo
 make play FILE=examples/pong.ludo
 make test
 make lint
+make bench    # time the parsers and the backends, see bench/README.md
 ```
 
 ## Language

@@ -1,7 +1,7 @@
 CARGO ?= cargo
 FILE  ?=
 
-.PHONY: help build check test run play install repl fmt fmt-check lint ci clean
+.PHONY: help build check test run play install repl fmt fmt-check lint ci clean bench
 
 build:
 	$(CARGO) build
@@ -28,6 +28,9 @@ clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
 
 lint: fmt clippy
+
+bench:
+	./bench/run.sh
 
 clean:
 	$(CARGO) clean
