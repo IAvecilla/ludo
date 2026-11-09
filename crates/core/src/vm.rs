@@ -63,6 +63,21 @@ impl Vm {
                         None => Err(error(format!("undefined variable `{name}`"))),
                     }
                 }
+                Op::GetLocal(slot) => {
+                    let value = self.stack[slot].clone();
+                    self.push(value);
+                    Ok(())
+                }
+                Op::Pop => {
+                    self.pop();
+                    Ok(())
+                }
+                Op::PopBelow(count) => {
+                    let top = self.pop();
+                    self.stack.truncate(self.stack.len() - count);
+                    self.push(top);
+                    Ok(())
+                }
                 Op::Negate => self.unary(UnaryOp::Neg),
                 Op::Not => self.unary(UnaryOp::Not),
                 Op::Add => self.binary(BinaryOp::Add),
@@ -166,6 +181,44 @@ mod tests {
                 "x\nlet x = 1\nx\nlet y = z",
                 "[line 1] error: undefined variable `x`\n1\n[line 4] error: undefined variable `z`",
             ),
+        ]);
+    }
+
+    #[test]
+    fn blocks_keep_their_locals_on_the_stack() {
+        runs(&[
+            (
+                "let area = {\n  let w = 4\n  w * 5\n}\narea\nw",
+                "20\n[line 6] error: undefined variable `w`",
+            ),
+            (
+                "let x = 1\nlet y = {\n  let x = x + 10\n  x\n}\ny\nx",
+                "11\n1",
+            ),
+            (
+                "{\n  let a = 1\n  let b = {\n    let a = a + 10\n    a * 2\n  }\n  a + b\n}",
+                "23",
+            ),
+            // A `let` can shadow another in the same block, and the value of
+            // an expression statement is dropped.
+            ("{\n  let a = 1\n  let a = a + 1\n  a * 10\n  a\n}", "2"),
+            // A block can start above a temporary, which moves its locals up.
+            ("1 + {\n  let a = 2\n  a * 3\n}", "7"),
+        ]);
+    }
+
+    #[test]
+    fn an_error_in_a_block_reports_the_inner_line() {
+        runs(&[
+            (
+                "let y = {\n  let x = 1 / 0\n  x\n}",
+                "[line 2] error: division by zero",
+            ),
+            (
+                "let x = 1\n{\n  let x = 2\n  x / 0\n}\nx",
+                "[line 4] error: division by zero\n1",
+            ),
+            ("{\n  1\n} + true\n", "[line 1] error: operands of `+` must be two Ints, two Floats or two Strings, got Int and Bool"),
         ]);
     }
 }

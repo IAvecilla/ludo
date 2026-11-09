@@ -14,6 +14,14 @@ pub enum Op {
     DefineGlobal(usize),
     /// Pushes the value bound to the name in this constant.
     GetGlobal(usize),
+    /// Pushes a copy of the local in this stack slot.
+    GetLocal(usize),
+    /// Discards the value on top of the stack.
+    Pop,
+    /// Discards this many values under the one on top: the locals of a block
+    /// that ends, below the value of the block. clox has no such instruction
+    /// because its blocks are statements and leave no value.
+    PopBelow(usize),
     Negate,
     Not,
     Add,
@@ -71,6 +79,8 @@ impl Chunk {
             Op::Constant(index) => self.constant_op("Constant", index),
             Op::DefineGlobal(index) => self.constant_op("DefineGlobal", index),
             Op::GetGlobal(index) => self.constant_op("GetGlobal", index),
+            Op::GetLocal(slot) => format!("{:<16} {slot:4}", "GetLocal"),
+            Op::PopBelow(count) => format!("{:<16} {count:4}", "PopBelow"),
             op => format!("{op:?}"),
         };
         format!("{offset:04} {line} {op}")
