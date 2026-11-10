@@ -37,10 +37,12 @@ fn a_game_file_runs_with_the_host_prelude_on_both_backends() {
             ),
             "{backend:?}"
         );
-        assert_eq!(
-            run("square.ludo"),
-            (true, String::new(), String::new()),
-            "{backend:?}"
-        );
+        for game in ["square.ludo", "leap.ludo"] {
+            assert_eq!(
+                run(game),
+                (true, String::new(), String::new()),
+                "{game} {backend:?}"
+            );
+        }
     }
 }

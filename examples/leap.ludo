@@ -1,0 +1,193 @@
+// Leap: a platformer of single screens. Run with the arrows or A and D, and
+// jump with Space, Up or W. Holding the jump longer jumps higher.
+
+Block :: struct { x: Float, y: Float, w: Float, h: Float }
+Level :: struct { blocks: List[Block], start_x: Float, start_y: Float }
+
+Player :: struct {
+    x: Float, y: Float,
+    vx: Float, vy: Float,
+    facing: Float,
+    ground: Bool,
+    coyote: Float,
+    buffer: Float,
+}
+
+World :: struct { player: Player, time: Float }
+
+let width = 800.0
+let height = 600.0
+let tile = 20.0
+
+let player_w = 16.0
+let player_h = 22.0
+let run_speed = 240.0
+let run_accel = 2400.0      // full speed in a tenth of a second
+let gravity = 1500.0
+let jump_speed = 560.0      // about five tiles high
+let jump_cut = 300.0        // letting go of the jump while rising stops it here
+let max_fall = 720.0
+let coyote_time = 0.08      // a jump still works this long after leaving a ledge
+let buffer_time = 0.1       // and a jump pressed this long before landing waits for it
+
+config :: () -> Config {
+    Config { width: to_int(width), height: to_int(height), title: "Leap" }
+}
+
+// Levels are measured in tiles of 20 pixels, 40 across and 30 down. They are
+// built again every frame, so a change to one shows up as soon as the file
+// is saved.
+
+tiles :: (x: Int, y: Int, w: Int, h: Int) -> Block {
+    Block { x: to_float(x) * tile, y: to_float(y) * tile, w: to_float(w) * tile, h: to_float(h) * tile }
+}
+
+level :: () -> Level {
+    Level {
+        blocks: [
+            tiles(0, 26, 14, 4),
+            tiles(19, 26, 21, 4),
+            tiles(28, 23, 2, 3),
+            tiles(8, 22, 5, 1),
+            tiles(15, 18, 5, 1),
+            tiles(23, 15, 4, 1),
+            tiles(30, 12, 6, 1),
+            tiles(21, 8, 5, 1),
+        ],
+        start_x: 2.0 * tile,
+        start_y: 26.0 * tile - player_h,
+    }
+}
+
+init :: () -> World {
+    World { player: spawn(level()), time: 0.0 }
+}
+
+spawn :: (l: Level) -> Player {
+    Player {
+        x: l.start_x, y: l.start_y,
+        vx: 0.0, vy: 0.0,
+        facing: 1.0,
+        ground: false,
+        coyote: 0.0,
+        buffer: 0.0,
+    }
+}
+
+update :: (w: World, input: Input, dt: Float) -> World {
+    let l = level()
+    let p = w.player
+        |> steer(input, dt)
+        |> jump(input, dt)
+        |> fall(dt)
+        |> move(l.blocks, dt)
+    let p = if p.y > height { spawn(l) } else { p }
+    World { w | player: p, time: w.time + dt }
+}
+
+steer :: (p: Player, input: Input, dt: Float) -> Player {
+    let dir = axis(input.left or input.a, input.right or input.d)
+    let step = run_accel * dt
+    let vx = p.vx + clamp(dir * run_speed - p.vx, -step, step)
+    let facing = if dir == 0.0 { p.facing } else { dir }
+    Player { p | vx: vx, facing: facing }
+}
+
+axis :: (negative: Bool, positive: Bool) -> Float {
+    if negative and !positive {
+        -1.0
+    } else if positive and !negative {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+jump :: (p: Player, input: Input, dt: Float) -> Player {
+    let pressing = pressed(input, :space) or pressed(input, :up) or pressed(input, :w)
+    let holding = input.space or input.up or input.w
+    let buffer = if pressing { buffer_time } else { p.buffer - dt }
+    let coyote = if p.ground { coyote_time } else { p.coyote - dt }
+    if buffer > 0.0 and coyote > 0.0 {
+        Player { p | vy: -jump_speed, ground: false, buffer: 0.0, coyote: 0.0 }
+    } else if !holding and p.vy < -jump_cut {
+        Player { p | vy: -jump_cut, buffer: buffer, coyote: coyote }
+    } else {
+        Player { p | buffer: buffer, coyote: coyote }
+    }
+}
+
+fall :: (p: Player, dt: Float) -> Player {
+    Player { p | vy: min(p.vy + gravity * dt, max_fall) }
+}
+
+// Moves across first and then down, and after each one pushes the player
+// out of every block it went into. ludo has no loops, so going over the
+// blocks is a fold that carries the player.
+move :: (p: Player, blocks: List[Block], dt: Float) -> Player {
+    let p = Player { p | x: clamp(p.x + p.vx * dt, 0.0, width - player_w) }
+    let p = blocks |> fold(p, push_across)
+    let p = Player { p | y: p.y + p.vy * dt, ground: false }
+    blocks |> fold(p, push_down)
+}
+
+push_across :: (p: Player, b: Block) -> Player {
+    if !inside(p, b) {
+        p
+    } else if p.vx > 0.0 {
+        Player { p | x: b.x - player_w, vx: 0.0 }
+    } else if p.vx < 0.0 {
+        Player { p | x: b.x + b.w, vx: 0.0 }
+    } else {
+        p
+    }
+}
+
+push_down :: (p: Player, b: Block) -> Player {
+    if !inside(p, b) {
+        p
+    } else if p.vy > 0.0 {
+        Player { p | y: b.y - player_h, vy: 0.0, ground: true }
+    } else {
+        Player { p | y: b.y + b.h, vy: 0.0 }
+    }
+}
+
+inside :: (p: Player, b: Block) -> Bool {
+    p.x < b.x + b.w and p.x + player_w > b.x and p.y < b.y + b.h and p.y + player_h > b.y
+}
+
+draw :: (w: World) -> List[Shape] {
+    let l = level()
+    let ground = l.blocks |> fold(sky(), add_block)
+    concat(ground, concat(hero(w.player), hint(w.time)))
+}
+
+// The fold starts from a List[Shape], and not from a list literal of one
+// Rect, which would be a List[Rect] that a Circle could not join.
+sky :: () -> List[Shape] {
+    [Rect { x: 0.0, y: 0.0, w: width, h: height, color: rgb(22, 24, 44) }]
+}
+
+add_block :: (shapes: List[Shape], b: Block) -> List[Shape] {
+    concat(shapes, [
+        Rect { x: b.x, y: b.y, w: b.w, h: b.h, color: rgb(64, 70, 110) },
+        Rect { x: b.x, y: b.y, w: b.w, h: 4.0, color: rgb(120, 200, 140) },
+    ])
+}
+
+hero :: (p: Player) -> List[Shape] {
+    let eye = if p.facing > 0.0 { 9.0 } else { 3.0 }
+    [
+        Rect { x: p.x, y: p.y, w: player_w, h: player_h, color: rgb(250, 196, 72) },
+        Rect { x: p.x + eye, y: p.y + 6.0, w: 4.0, h: 5.0, color: rgb(30, 30, 50) },
+    ]
+}
+
+hint :: (time: Float) -> List[Shape] {
+    if time < 6.0 {
+        [Text { x: 24.0, y: 40.0, size: 24.0, text: "arrows to run, space to jump", color: rgb(170, 176, 210) }]
+    } else {
+        []
+    }
+}
