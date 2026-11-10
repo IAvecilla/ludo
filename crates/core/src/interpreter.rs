@@ -371,7 +371,9 @@ impl Caller for Interpreter {
                 check_arity(native.name, native.arity, args.len())?;
                 (native.fun)(self, &args)
             }
-            Value::Compiled(_) => unreachable!("only the VM makes compiled functions"),
+            Value::Compiled(_) | Value::CompiledClosure(_) => {
+                unreachable!("only the VM makes compiled functions")
+            }
             other => Err(error(format!(
                 "can only call functions, got {}",
                 other.type_name()

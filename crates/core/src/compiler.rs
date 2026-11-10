@@ -36,6 +36,7 @@ pub fn compile(stmt: &Stmt) -> Result<Function, CompileError> {
     Ok(Function {
         name: None,
         arity: 0,
+        captured: Vec::new(),
         chunk: compiler.chunk,
     })
 }
@@ -82,14 +83,29 @@ impl Compiler {
     /// Compiles a function with a compiler of its own, as clox does. Its
     /// parameters are its first locals, from slot 0 up: the frame starts at
     /// the first argument, as in ploxb, and the function sits right below.
-    fn function(decl: &FnDecl, line: usize) -> Result<Function, CompileError> {
+    /// The locals a closure keeps come right after them, where the VM puts
+    /// them when it is called.
+    fn function(
+        decl: &FnDecl,
+        line: usize,
+        captured: Vec<String>,
+    ) -> Result<Function, CompileError> {
         let mut compiler = Compiler::new(line);
         compiler.parameters(&decl.params);
+        for name in &captured {
+            compiler.locals.push(Local {
+                name: name.clone(),
+                depth: 1,
+                slot: compiler.height,
+            });
+            compiler.height += 1;
+        }
         compiler.expression(&decl.body)?;
         compiler.emit(Op::Return);
         Ok(Function {
             name: Some(decl.name.clone()),
             arity: decl.params.len(),
+            captured,
             chunk: compiler.chunk,
         })
     }
@@ -109,6 +125,7 @@ impl Compiler {
         Ok(Function {
             name: Some(decl.name.clone()),
             arity: decl.params.len(),
+            captured: Vec::new(),
             chunk: compiler.chunk,
         })
     }
@@ -238,7 +255,7 @@ impl Compiler {
             }
             StmtKind::Fn(decl) => {
                 let global = self.identifier_constant(&decl.name);
-                let function = Compiler::function(decl, stmt.line)?;
+                let function = Compiler::function(decl, stmt.line, Vec::new())?;
                 self.constant(Value::Compiled(Rc::new(function)));
                 self.emit(Op::DefineGlobal(global));
             }
@@ -435,6 +452,32 @@ impl Compiler {
             .map(|local| local.slot)
     }
 
+    /// Compiles a function written with `fn` and makes a closure of it. It
+    /// keeps the locals in scope here that its body names, which go on the
+    /// stack above the function for `Closure` to take. A local of the
+    /// function around it is a local here too, so a closure inside another
+    /// one finds what it keeps.
+    fn lambda(&mut self, decl: &FnDecl) -> Result<(), CompileError> {
+        let mut names = Vec::new();
+        mentioned(&decl.body, &mut names);
+        let captured: Vec<String> = names
+            .into_iter()
+            .filter(|name| decl.params.iter().all(|p| &p.name != name))
+            .filter(|name| self.resolve_local(name).is_some())
+            .collect();
+        let slots: Vec<usize> = captured
+            .iter()
+            .filter_map(|name| self.resolve_local(name))
+            .collect();
+        let function = Compiler::function(decl, self.line, captured)?;
+        self.constant(Value::Compiled(Rc::new(function)));
+        for slot in &slots {
+            self.emit(Op::GetLocal(*slot));
+        }
+        self.emit(Op::Closure(slots.len()));
+        Ok(())
+    }
+
     fn constant(&mut self, value: Value) {
         let index = self.chunk.add_constant(value);
         self.emit(Op::Constant(index));
@@ -537,13 +580,7 @@ impl Compiler {
                 self.patch_jump(else_jump);
             }
             Expr::Case(value, arms) => self.case(value, arms)?,
-            Expr::Lambda(_) => {
-                return Err(CompileError {
-                    message: "`fn` does not compile to bytecode yet: run it with --interpreter"
-                        .to_string(),
-                    line: self.line,
-                })
-            }
+            Expr::Lambda(decl) => self.lambda(decl)?,
             Expr::List(items) => {
                 for item in items {
                     self.expression(item)?;
@@ -571,6 +608,63 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+}
+
+/// Adds to `names` every name that `expr` uses as a value, once each, also
+/// inside the functions written in it. Some may be bound again inside, like
+/// `x` in `{ let x = 1 x }`, and keeping a copy of the outer one then only
+/// costs that copy.
+fn mentioned(expr: &Expr, names: &mut Vec<String>) {
+    match expr {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Symbol(_) | Expr::Bool(_) => {}
+        Expr::Ident(name) => {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        Expr::Unary(_, operand) | Expr::Field(operand, _) => mentioned(operand, names),
+        Expr::Binary(left, _, right) => {
+            mentioned(left, names);
+            mentioned(right, names);
+        }
+        Expr::Call(callee, args) => {
+            mentioned(callee, names);
+            args.iter().for_each(|arg| mentioned(arg, names));
+        }
+        Expr::Block(statements, tail, _) => {
+            for stmt in statements {
+                match &stmt.kind {
+                    StmtKind::Let(_, value) | StmtKind::Expr(value) => mentioned(value, names),
+                    StmtKind::Start(_, args) => args.iter().for_each(|arg| mentioned(arg, names)),
+                    // Declarations only go at the top level.
+                    _ => {}
+                }
+            }
+            mentioned(tail, names);
+        }
+        Expr::If(cond, then, otherwise) => {
+            mentioned(cond, names);
+            mentioned(then, names);
+            mentioned(otherwise, names);
+        }
+        Expr::List(items) => items.iter().for_each(|item| mentioned(item, names)),
+        Expr::Struct { base, fields, .. } => {
+            if let Some(base) = base {
+                mentioned(base, names);
+            }
+            fields.iter().for_each(|(_, value)| mentioned(value, names));
+        }
+        Expr::Case(value, arms) => {
+            mentioned(value, names);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    mentioned(guard, names);
+                }
+                mentioned(&arm.body, names);
+            }
+        }
+        Expr::Lambda(decl) => mentioned(&decl.body, names),
     }
 }
 
@@ -603,6 +697,8 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
         // It takes the callee and its arguments, and leaves the result.
         Op::Call(argc) => -(argc as isize),
         Op::List(count) => 1 - count as isize,
+        // It takes the function and what it keeps, and leaves the closure.
+        Op::Closure(count) => -(count as isize),
         Op::Struct { shape, base } => {
             1 - chunk.shapes[shape].fields.len() as isize - isize::from(base)
         }
@@ -643,6 +739,55 @@ mod tests {
     fn compiled(source: &str) -> Result<Chunk, CompileError> {
         let statements = parse(scan_tokens(source).unwrap()).unwrap();
         compile(&statements[0]).map(|script| script.chunk)
+    }
+
+    /// The functions in the constants of a chunk.
+    fn functions(chunk: &Chunk) -> Vec<Rc<Function>> {
+        chunk
+            .constants
+            .iter()
+            .filter_map(|constant| match constant {
+                Value::Compiled(function) => Some(function.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn declared(source: &str) -> Rc<Function> {
+        let statements = parse(scan_tokens(source).unwrap()).unwrap();
+        functions(&compile(&statements[0]).unwrap().chunk)[0].clone()
+    }
+
+    #[test]
+    fn a_lambda_keeps_the_locals_it_names() {
+        let f = declared("f :: (k: Int, unused: Int) -> Fn {\n  fn(x: Int) -> Int { x * k }\n}");
+        assert_eq!(
+            f.chunk.code,
+            [Op::Constant(0), Op::GetLocal(0), Op::Closure(1), Op::Return]
+        );
+        let lambda = &functions(&f.chunk)[0];
+        assert_eq!(
+            (lambda.arity, lambda.captured.clone()),
+            (1, vec!["k".to_string()])
+        );
+        // What it keeps sits right after its parameter.
+        assert_eq!(
+            lambda.chunk.code,
+            [Op::GetLocal(0), Op::GetLocal(1), Op::Mul, Op::Return]
+        );
+
+        // The middle one keeps `a` for the inner one, which keeps it and `b`.
+        let g = declared(
+            "g :: (a: Int) -> Fn {\n  fn(b: Int) -> Fn { fn(c: Int) -> Int { a + b + c } }\n}",
+        );
+        let middle = &functions(&g.chunk)[0];
+        let inner = &functions(&middle.chunk)[0];
+        assert_eq!(middle.captured, ["a"]);
+        assert_eq!(inner.captured, ["a", "b"]);
+
+        // A parameter with the name of a local around it hides that local.
+        let h = declared("h :: (x: Int) -> Fn {\n  fn(x: Int) -> Int { x }\n}");
+        assert!(functions(&h.chunk)[0].captured.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::interpreter::{
     passes, sequence_hint, struct_hint, unary, with_field, RuntimeError, MAX_CALL_DEPTH,
 };
 use crate::prelude::{constants, NATIVES};
-use crate::value::{Caller, Instance, Value};
+use crate::value::{Caller, CompiledClosure, Instance, Value};
 
 /// A call in progress: the function, the next instruction it runs and where
 /// its frame starts on the stack. clox keeps the function in slot 0; here,
@@ -165,6 +165,7 @@ impl Vm {
     pub fn arity(&self, name: &str) -> Option<usize> {
         match self.globals.get(name)? {
             Value::Compiled(function) => Some(function.arity),
+            Value::CompiledClosure(closure) => Some(closure.function.arity),
             Value::Native(native) => Some(native.arity),
             _ => None,
         }
@@ -457,14 +458,25 @@ impl Vm {
                     let callee = self.stack[self.stack.len() - 1 - argc].clone();
                     self.call_value(callee, argc)
                 }
+                Op::Closure(count) => {
+                    let captured = self.stack.split_off(self.stack.len() - count);
+                    let Value::Compiled(function) = self.pop() else {
+                        unreachable!("a closure is made of a compiled function")
+                    };
+                    let closure = CompiledClosure { function, captured };
+                    self.push(Value::CompiledClosure(Rc::new(closure)));
+                    Ok(())
+                }
                 Op::Return => {
                     let frame = self.frames.pop().expect("a frame runs until it returns");
                     // ploxb checks that the stack ends as the compiler counted
                     // it: a function leaves just its result above its
                     // parameters, and a script its value or nothing.
-                    let above = self.stack.len() - frame.base - frame.function.arity;
+                    let function = &frame.function;
+                    let above =
+                        self.stack.len() - frame.base - function.arity - function.captured.len();
                     debug_assert!(
-                        above == 1 || (above == 0 && frame.function.name.is_none()),
+                        above == 1 || (above == 0 && function.name.is_none()),
                         "inconsistent stack height: {above} values above the parameters of {}",
                         frame.function
                     );
@@ -489,18 +501,11 @@ impl Vm {
         match callee {
             Value::Compiled(function) => {
                 check_arity(function.name(), function.arity, argc)?;
-                if self.frames.len() - self.root >= MAX_CALL_DEPTH {
-                    return Err(error(format!(
-                        "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
-                    )));
-                }
-                let base = self.stack.len() - argc;
-                self.frames.push(CallFrame {
-                    function,
-                    ip: 0,
-                    base,
-                });
-                Ok(())
+                self.enter(function, argc, &[])
+            }
+            Value::CompiledClosure(closure) => {
+                check_arity("fn", closure.function.arity, argc)?;
+                self.enter(Rc::clone(&closure.function), argc, &closure.captured)
             }
             Value::Native(native) => {
                 check_arity(native.name, native.arity, argc)?;
@@ -515,6 +520,30 @@ impl Vm {
                 other.type_name()
             ))),
         }
+    }
+
+    /// Gives a compiled function a frame that starts at its first argument.
+    /// What a closure keeps goes on the stack right after the arguments, in
+    /// the slots where its body reads them.
+    fn enter(
+        &mut self,
+        function: Rc<Function>,
+        argc: usize,
+        captured: &[Value],
+    ) -> Result<(), RuntimeError> {
+        if self.frames.len() - self.root >= MAX_CALL_DEPTH {
+            return Err(error(format!(
+                "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
+            )));
+        }
+        let base = self.stack.len() - argc;
+        self.stack.extend_from_slice(captured);
+        self.frames.push(CallFrame {
+            function,
+            ip: 0,
+            base,
+        });
+        Ok(())
     }
 
     /// Builds a struct from a literal, with the same checks and errors as the
@@ -826,6 +855,52 @@ mod tests {
     }
 
     #[test]
+    fn closures_keep_the_locals_around_them() {
+        runs(&[
+            (
+                "let double = fn(x: Int) -> Int { x * 2 }\ndouble(21)\ndouble",
+                "42\n<fn>",
+            ),
+            (
+                "adder :: (n: Int) -> Fn { fn(x: Int) -> Int { x + n } }\nadder(3)(4)\n[1, 2] |> map(adder(10))",
+                "7\n[11, 12]",
+            ),
+            (
+                "scaled :: (xs: List, k: Int) -> List {\n  xs |> map(fn(x: Int) -> Int { x * k })\n}\nscaled([1, 2, 3], 10)",
+                "[10, 20, 30]",
+            ),
+            // A later `let` of the same name is another local.
+            (
+                "{\n  let base = 100\n  let f = fn(x: Int) -> Int { x + base }\n  let base = 0\n  f(1)\n}",
+                "101",
+            ),
+            (
+                "let curry = {\n  let a = 1\n  fn(b: Int) -> Fn { fn(c: Int) -> Int { a + b + c } }\n}\ncurry(10)(100)",
+                "111",
+            ),
+            // A local of the body hides the one kept with its name.
+            (
+                "{\n  let x = 1\n  let f = fn() -> Int {\n    let x = 2\n    x\n  }\n  f() + x\n}",
+                "3",
+            ),
+            (
+                "let pick = case Some(5) {\n  Some(n) -> fn(x: Int) -> Int { x + n }\n  None -> fn(x: Int) -> Int { x }\n}\npick(1)",
+                "6",
+            ),
+            // The top level is looked up by name when it runs.
+            ("let k = 1\nlet f = fn() -> Int { k }\nlet k = 2\nf()", "2"),
+            (
+                "let f = fn(x: Int) -> Int {\n  10 / x\n}\n[1, 0] |> map(f)",
+                "[line 2] error: division by zero",
+            ),
+            (
+                "let f = fn(x: Int) -> Int { x }\nf(1, 2)",
+                "[line 2] error: `fn` expects 1 argument, got 2",
+            ),
+        ]);
+    }
+
+    #[test]
     fn reports_errors_in_calls() {
         let add = "add :: (a: Int, b: Int) -> Int { a + b }\n";
         runs(&[
@@ -1104,6 +1179,14 @@ mod tests {
             "second :: sequence (b: Ball) {\n  b.x = b.x + 10.0\n}\nfirst :: sequence (b: Ball) {\n  b.x = 1.0\n  start second(b)\n}\nstart first(Ball { x: 0.0, y: 0.0 })",
         );
         assert_eq!(both.frames(ball(0.0), 0.25, 2), "1.0, 11.0 done");
+    }
+
+    #[test]
+    fn a_sequence_keeps_its_closures_between_frames() {
+        let mut both = Both::new(
+            "s :: sequence (b: Ball) {\n  let by = 5.0\n  let add = fn(x: Float) -> Float { x + by }\n  wait 0.5s\n  b.x = add(b.x)\n}\nstart s(Ball { x: 0.0, y: 0.0 })",
+        );
+        assert_eq!(both.frames(ball(1.0), 0.25, 2), "1.0, 6.0 done");
     }
 
     #[test]
