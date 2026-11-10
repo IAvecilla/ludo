@@ -1,0 +1,8 @@
+// Strings built by joining smaller ones, in the shape of fib: every call
+// makes a new string.
+
+words :: (n: Int) -> String {
+    if n < 2 { "x" } else { words(n - 1) + words(n - 2) }
+}
+
+print(words(25))
