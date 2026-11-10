@@ -1,0 +1,7 @@
+// The loops benchmark of ploxb: the sum of i * j for every i below 1000 and
+// j below 100. ludo has no loops, so it folds over one range, and the cell k
+// is row k / 100 and column k % 100.
+
+cell :: (total: Int, k: Int) -> Int { total + (k / 100) * (k % 100) }
+
+print(range(0, 100000) |> fold(0, cell))

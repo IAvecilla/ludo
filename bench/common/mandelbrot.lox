@@ -1,0 +1,31 @@
+// Float arithmetic: how many points of a 60 by 60 grid are in the Mandelbrot
+// set, following each one for at most 50 steps.
+
+fun steps(cr, ci) {
+  var zr = 0;
+  var zi = 0;
+  var n = 0;
+  while (n < 50 and zr * zr + zi * zi <= 4) {
+    var next = zr * zr - zi * zi + cr;
+    zi = 2 * zr * zi + ci;
+    zr = next;
+    n = n + 1;
+  }
+  return n;
+}
+
+fun inside(size) {
+  var count = 0;
+  var y = 0;
+  while (y < size) {
+    var x = 0;
+    while (x < size) {
+      if (steps(x * 3 / size - 2, y * 3 / size - 1.5) == 50) count = count + 1;
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return count;
+}
+
+print inside(60);

@@ -1,0 +1,21 @@
+// Float arithmetic: how many points of a 60 by 60 grid are in the Mandelbrot
+// set, following each one for at most 50 steps. ludo has no loops, so the
+// steps of a point are a recursion and the grid is one range, where point k
+// is in row k / 60 and column k % 60.
+
+steps :: (zr: Float, zi: Float, cr: Float, ci: Float, n: Int) -> Int {
+    if n == 50 or zr * zr + zi * zi > 4.0 {
+        n
+    } else {
+        steps(zr * zr - zi * zi + cr, 2.0 * zr * zi + ci, cr, ci, n + 1)
+    }
+}
+
+point :: (count: Int, k: Int) -> Int {
+    let x = to_float(k % 60)
+    let y = to_float(k / 60)
+    let n = steps(0.0, 0.0, x * 3.0 / 60.0 - 2.0, y * 3.0 / 60.0 - 1.5, 0)
+    if n == 50 { count + 1 } else { count }
+}
+
+print(range(0, 60 * 60) |> fold(0, point))

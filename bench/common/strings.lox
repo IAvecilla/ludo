@@ -1,0 +1,9 @@
+// Strings built by joining smaller ones, in the shape of fib: every call
+// makes a new string.
+
+fun words(n) {
+  if (n < 2) return "x";
+  return words(n - 1) + words(n - 2);
+}
+
+print words(25);
