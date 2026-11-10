@@ -6,7 +6,7 @@ use crate::ast::{
     StructDecl, UnaryOp, Variant,
 };
 use crate::prelude::{constants, NATIVES};
-use crate::value::{Caller, Instance, Native, Value};
+use crate::value::{Caller, Closure, Instance, Native, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -90,6 +90,7 @@ impl Interpreter {
     pub fn arity(&self, name: &str) -> Option<usize> {
         match self.globals.get(name)? {
             Value::Function(decl) => Some(decl.params.len()),
+            Value::Closure(closure) => Some(closure.decl.params.len()),
             Value::Native(native) => Some(native.arity),
             _ => None,
         }
@@ -184,6 +185,10 @@ impl Interpreter {
             }
             Expr::Struct { name, base, fields } => self.construct(name, base.as_deref(), fields),
             Expr::Case(value, arms) => self.case(value, arms),
+            Expr::Lambda(decl) => Ok(Value::Closure(Rc::new(Closure {
+                decl: decl.clone(),
+                captured: self.locals[self.frame..].to_vec(),
+            }))),
         }
     }
 
@@ -255,7 +260,14 @@ impl Interpreter {
         })))
     }
 
-    fn invoke(&mut self, decl: &FnDecl, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    /// Runs a function with its arguments, in a frame that starts with the
+    /// locals a closure keeps.
+    fn invoke(
+        &mut self,
+        decl: &FnDecl,
+        captured: &[(String, Value)],
+        args: Vec<Value>,
+    ) -> Result<Value, RuntimeError> {
         if self.depth == MAX_CALL_DEPTH {
             return Err(error(format!(
                 "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
@@ -263,6 +275,7 @@ impl Interpreter {
         }
 
         let caller = std::mem::replace(&mut self.frame, self.locals.len());
+        self.locals.extend_from_slice(captured);
         for (param, value) in decl.params.iter().zip(args) {
             self.locals.push((param.name.clone(), value));
         }
@@ -348,7 +361,11 @@ impl Caller for Interpreter {
         match callee {
             Value::Function(decl) => {
                 check_arity(&decl.name, decl.params.len(), args.len())?;
-                self.invoke(&decl, args)
+                self.invoke(&decl, &[], args)
+            }
+            Value::Closure(closure) => {
+                check_arity("fn", closure.decl.params.len(), args.len())?;
+                self.invoke(&closure.decl, &closure.captured, args)
             }
             Value::Native(native) => {
                 check_arity(native.name, native.arity, args.len())?;
@@ -915,6 +932,37 @@ mod tests {
             outputs("loop_forever :: (n: Int) -> Int { loop_forever(n + 1) }\nloop_forever(0)"),
             format!("error: stack overflow: more than {MAX_CALL_DEPTH} nested calls")
         );
+    }
+
+    #[test]
+    fn a_closure_keeps_the_locals_around_it() {
+        runs(&[
+            ("let double = fn(x: Int) -> Int { x * 2 }\ndouble(21)\ndouble", "42\n<fn>"),
+            (
+                "adder :: (n: Int) -> Fn { fn(x: Int) -> Int { x + n } }\nlet add3 = adder(3)\nadd3(4)",
+                "7",
+            ),
+            (
+                "scaled :: (xs: List, k: Int) -> List {\n  xs |> map(fn(x: Int) -> Int { x * k })\n}\nscaled([1, 2, 3], 10)",
+                "[10, 20, 30]",
+            ),
+            // It keeps the value a name had when it was made: a later `let`
+            // of the same name is another one.
+            (
+                "{\n  let base = 100\n  let f = fn(x: Int) -> Int { x + base }\n  let base = 0\n  f(1)\n}",
+                "101",
+            ),
+            (
+                "let curry = {\n  let a = 1\n  fn(b: Int) -> Fn { fn(c: Int) -> Int { a + b + c } }\n}\ncurry(10)(100)",
+                "111",
+            ),
+            // The top level is not kept but looked up when it runs.
+            ("let k = 1\nlet f = fn() -> Int { k }\nlet k = 2\nf()", "2"),
+            (
+                "let f = fn(x: Int) -> Int { x }\nf(1, 2)",
+                "error: `fn` expects 1 argument, got 2",
+            ),
+        ]);
     }
 
     #[test]

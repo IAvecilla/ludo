@@ -14,6 +14,8 @@ pub enum Value {
     Symbol(String),
     /// A function as the interpreter runs it, straight from the tree.
     Function(Rc<FnDecl>),
+    /// A function written with `fn`, as the interpreter runs it.
+    Closure(Rc<Closure>),
     /// A function as the VM runs it, compiled to bytecode.
     Compiled(Rc<Function>),
     Native(Native),
@@ -23,6 +25,15 @@ pub enum Value {
     Option(Option<Rc<Value>>),
     /// `Ok(x)` or `Error(e)`.
     Result(Result<Rc<Value>, Rc<Value>>),
+}
+
+/// A function written with `fn` and the locals that were in scope where it
+/// was made. Values never change, so keeping a copy of them is the same as
+/// keeping the variables: nothing can change them in the meantime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Closure {
+    pub decl: Rc<FnDecl>,
+    pub captured: Vec<(String, Value)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +76,9 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Str(_) => "String",
             Value::Symbol(_) => "Symbol",
-            Value::Function(_) | Value::Compiled(_) | Value::Native(_) => "Function",
+            Value::Function(_) | Value::Closure(_) | Value::Compiled(_) | Value::Native(_) => {
+                "Function"
+            }
             Value::Struct(instance) => &instance.name,
             Value::List(_) => "List",
             Value::Option(_) => "Option",
@@ -76,7 +89,7 @@ impl Value {
     pub fn is_function(&self) -> bool {
         matches!(
             self,
-            Value::Function(_) | Value::Compiled(_) | Value::Native(_)
+            Value::Function(_) | Value::Closure(_) | Value::Compiled(_) | Value::Native(_)
         )
     }
 
@@ -110,6 +123,7 @@ impl fmt::Display for Value {
             Value::Str(v) => write!(f, "{v}"),
             Value::Symbol(v) => write!(f, ":{v}"),
             Value::Function(decl) => write!(f, "<fn {}>", decl.name),
+            Value::Closure(_) => f.write_str("<fn>"),
             Value::Compiled(function) => write!(f, "{function}"),
             Value::Native(native) => write!(f, "<fn {}>", native.name),
             Value::Struct(instance) => {

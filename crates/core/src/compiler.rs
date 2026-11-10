@@ -537,6 +537,13 @@ impl Compiler {
                 self.patch_jump(else_jump);
             }
             Expr::Case(value, arms) => self.case(value, arms)?,
+            Expr::Lambda(_) => {
+                return Err(CompileError {
+                    message: "`fn` does not compile to bytecode yet: run it with --interpreter"
+                        .to_string(),
+                    line: self.line,
+                })
+            }
             Expr::List(items) => {
                 for item in items {
                     self.expression(item)?;

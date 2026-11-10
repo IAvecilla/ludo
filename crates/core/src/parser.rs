@@ -452,6 +452,7 @@ impl Parser {
                 });
             }
             TokenKind::LBrace => return self.block(),
+            TokenKind::Fn => return self.lambda(),
             TokenKind::If => return self.if_expression(),
             TokenKind::Case => return self.case_expression(),
             TokenKind::Wait | TokenKind::Over => {
@@ -468,6 +469,17 @@ impl Parser {
         };
         self.advance();
         Ok(expr)
+    }
+
+    /// `fn(x: Int) -> Int { x * 2 }`: written as a declared function is,
+    /// with `fn` in place of its name and `::`.
+    fn lambda(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        self.expect(TokenKind::LParen, "`(` and the parameters after `fn`")?;
+        let StmtKind::Fn(decl) = self.fn_declaration("fn".to_string())? else {
+            unreachable!("fn_declaration gives a function")
+        };
+        Ok(Expr::Lambda(decl))
     }
 
     fn block(&mut self) -> Result<Expr, ParseError> {
@@ -1177,6 +1189,43 @@ mod tests {
             (
                 "case x { None(1) -> 1 }",
                 "expected `->` and the value of the branch, found `(`",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn parses_lambdas() {
+        parses(&[
+            (
+                "let double = fn(x: Int) -> Int { x * 2 }",
+                "(let double (fn (x: Int) -> Int (block (* x 2))))",
+            ),
+            (
+                "xs |> filter(fn(x: Int) -> Bool { x > 0 })",
+                "(call filter xs (fn (x: Int) -> Bool (block (> x 0))))",
+            ),
+            ("fn() -> Int { 1 }()", "(call (fn () -> Int (block 1)))"),
+            (
+                "map(xs, fn(x: Int) -> Int {\n  let y = x + 1\n  y\n})",
+                "(call map xs (fn (x: Int) -> Int (block (let y (+ x 1)) y)))",
+            ),
+            (
+                "fn(a: Int) -> (Int) -> Int { fn(b: Int) -> Int { a + b } }",
+                "(fn (a: Int) -> (Int) -> Int (block (fn (b: Int) -> Int (block (+ a b)))))",
+            ),
+        ]);
+        rejects(&[
+            (
+                "fn x -> x",
+                "expected `(` and the parameters after `fn`, found `x`",
+            ),
+            (
+                "fn(x: Int) { x }",
+                "expected `->` and a return type, found `{`",
+            ),
+            (
+                "fn(x: Int) -> Int {\n  f :: () -> Int { 1 }\n  x\n}",
+                "functions can only be declared at the top level, found `f`",
             ),
         ]);
     }
