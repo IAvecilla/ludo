@@ -1,88 +1,108 @@
-// Leap: a platformer of single screens. Run with the arrows or A and D, and
-// jump with Space, Up or W. Holding the jump longer jumps higher.
-
-Block :: struct { x: Float, y: Float, w: Float, h: Float }
-Level :: struct { blocks: List[Block], start_x: Float, start_y: Float }
+// Leap: climb as high as you can. Every platform you land on throws you up
+// again, the arrows or A and D steer, and leaving the screen by one side
+// brings you back by the other. Falling off the bottom starts a new climb.
 
 Player :: struct {
     x: Float, y: Float,
     vx: Float, vy: Float,
+    last_y: Float,
     facing: Float,
-    ground: Bool,
-    coyote: Float,
-    buffer: Float,
 }
 
-World :: struct { player: Player, time: Float }
+Platform :: struct { x: Float, y: Float, w: Float }
 
-let width = 800.0
-let height = 600.0
-let tile = 20.0
+// Heights are measured downwards, as on the screen, so climbing makes y
+// smaller. `camera` is the height at the top of the screen, `top` the
+// highest the player has been, and `base` picks the platforms of this climb.
+World :: struct { player: Player, camera: Float, top: Float, base: Int, time: Float }
 
-let player_w = 16.0
-let player_h = 22.0
-let run_speed = 240.0
-let run_accel = 2400.0      // full speed in a tenth of a second
-let gravity = 1500.0
-let jump_speed = 560.0      // about five tiles high
-let jump_cut = 300.0        // letting go of the jump while rising stops it here
-let max_fall = 720.0
-let coyote_time = 0.08      // a jump still works this long after leaving a ledge
-let buffer_time = 0.1       // and a jump pressed this long before landing waits for it
+let width = 480.0
+let height = 720.0
+
+let player_w = 20.0
+let player_h = 24.0
+let run_speed = 320.0
+let run_accel = 2000.0      // full speed in a sixth of a second
+let gravity = 1600.0
+let bounce = 920.0          // each bounce goes about 260 pixels up
+
+let row = 72.0              // the height between two rows of platforms
+let floor_y = 680.0         // the floor is row 0, and row k is k rows above it
+let rows = 100000           // the rows of one climb
+let platform_w = 64.0
+let platform_h = 12.0
 
 config :: () -> Config {
     Config { width: to_int(width), height: to_int(height), title: "Leap" }
 }
 
-// Levels are measured in tiles of 20 pixels, 40 across and 30 down. They are
-// built again every frame, so a change to one shows up as soon as the file
-// is saved.
-
-tiles :: (x: Int, y: Int, w: Int, h: Int) -> Block {
-    Block { x: to_float(x) * tile, y: to_float(y) * tile, w: to_float(w) * tile, h: to_float(h) * tile }
-}
-
-level :: () -> Level {
-    Level {
-        blocks: [
-            tiles(0, 26, 14, 4),
-            tiles(19, 26, 21, 4),
-            tiles(28, 23, 2, 3),
-            tiles(8, 22, 5, 1),
-            tiles(15, 18, 5, 1),
-            tiles(23, 15, 4, 1),
-            tiles(30, 12, 6, 1),
-            tiles(21, 8, 5, 1),
-        ],
-        start_x: 2.0 * tile,
-        start_y: 26.0 * tile - player_h,
-    }
-}
-
 init :: () -> World {
-    World { player: spawn(level()), time: 0.0 }
+    climb(0)
 }
 
-spawn :: (l: Level) -> Player {
-    Player {
-        x: l.start_x, y: l.start_y,
-        vx: 0.0, vy: 0.0,
-        facing: 1.0,
-        ground: false,
-        coyote: 0.0,
-        buffer: 0.0,
+climb :: (base: Int) -> World {
+    let y = floor_y - player_h
+    World {
+        player: Player { x: width / 2.0 - player_w / 2.0, y: y, vx: 0.0, vy: 0.0, last_y: y, facing: 1.0 },
+        camera: 0.0,
+        top: y,
+        base: base,
+        time: 0.0,
     }
+}
+
+// The platforms are not kept in the world. Row k of a climb always has the
+// same one, made up from the number of the row, so only the rows on the
+// screen are built, every frame. Each climb uses other numbers: the row k of
+// the climb with base b is number b + k.
+
+noise :: (n: Int) -> Int {
+    let a = (n * 1103515245 + 12345) % 2147483648
+    let b = ((a / 32768) * (a % 32768) + n) % 2147483648
+    let c = (b * 1103515245 + 12345) % 2147483648
+    c / 65536
+}
+
+// Every third row has a platform, so the next one is always within reach,
+// and the rows between have one less often the higher they are.
+has_platform :: (n: Int) -> Bool {
+    let k = n % rows
+    k % 3 == 0 or noise(n) % 100 < 90 - min(k / 4, 55)
+}
+
+platform :: (n: Int) -> Platform {
+    let k = n % rows
+    if k == 0 {
+        Platform { x: 0.0, y: floor_y, w: width }
+    } else {
+        let x = noise(n + 7) % to_int(width - platform_w)
+        Platform { x: to_float(x), y: floor_y - to_float(k) * row, w: platform_w }
+    }
+}
+
+on_screen :: (w: World) -> List[Platform] {
+    let lowest = clamp(to_int((floor_y - w.camera - height) / row), 0, rows - 1)
+    let highest = clamp(to_int((floor_y - w.camera) / row) + 1, 0, rows - 1)
+    range(w.base + lowest, w.base + highest + 1) |> fold([], add_row)
+}
+
+add_row :: (platforms: List[Platform], n: Int) -> List[Platform] {
+    if has_platform(n) { concat(platforms, [platform(n)]) } else { platforms }
 }
 
 update :: (w: World, input: Input, dt: Float) -> World {
-    let l = level()
     let p = w.player
         |> steer(input, dt)
-        |> jump(input, dt)
-        |> fall(dt)
-        |> move(l.blocks, dt)
-    let p = if p.y > height { spawn(l) } else { p }
-    World { w | player: p, time: w.time + dt }
+        |> fly(dt)
+        |> wrap()
+    let p = on_screen(w) |> fold(p, land)
+    let w = World { w |
+        player: p,
+        camera: min(w.camera, p.y - height * 0.45),
+        top: min(w.top, p.y),
+        time: w.time + dt,
+    }
+    if p.y > w.camera + height { climb(next_base(w)) } else { w }
 }
 
 steer :: (p: Player, input: Input, dt: Float) -> Player {
@@ -103,91 +123,90 @@ axis :: (negative: Bool, positive: Bool) -> Float {
     }
 }
 
-jump :: (p: Player, input: Input, dt: Float) -> Player {
-    let pressing = pressed(input, :space) or pressed(input, :up) or pressed(input, :w)
-    let holding = input.space or input.up or input.w
-    let buffer = if pressing { buffer_time } else { p.buffer - dt }
-    let coyote = if p.ground { coyote_time } else { p.coyote - dt }
-    if buffer > 0.0 and coyote > 0.0 {
-        Player { p | vy: -jump_speed, ground: false, buffer: 0.0, coyote: 0.0 }
-    } else if !holding and p.vy < -jump_cut {
-        Player { p | vy: -jump_cut, buffer: buffer, coyote: coyote }
-    } else {
-        Player { p | buffer: buffer, coyote: coyote }
-    }
+fly :: (p: Player, dt: Float) -> Player {
+    let vy = p.vy + gravity * dt
+    Player { p | x: p.x + p.vx * dt, y: p.y + vy * dt, vy: vy, last_y: p.y }
 }
 
-fall :: (p: Player, dt: Float) -> Player {
-    Player { p | vy: min(p.vy + gravity * dt, max_fall) }
-}
-
-// Moves across first and then down, and after each one pushes the player
-// out of every block it went into. ludo has no loops, so going over the
-// blocks is a fold that carries the player.
-move :: (p: Player, blocks: List[Block], dt: Float) -> Player {
-    let p = Player { p | x: clamp(p.x + p.vx * dt, 0.0, width - player_w) }
-    let p = blocks |> fold(p, push_across)
-    let p = Player { p | y: p.y + p.vy * dt, ground: false }
-    blocks |> fold(p, push_down)
-}
-
-push_across :: (p: Player, b: Block) -> Player {
-    if !inside(p, b) {
-        p
-    } else if p.vx > 0.0 {
-        Player { p | x: b.x - player_w, vx: 0.0 }
-    } else if p.vx < 0.0 {
-        Player { p | x: b.x + b.w, vx: 0.0 }
+wrap :: (p: Player) -> Player {
+    let center = p.x + player_w / 2.0
+    if center < 0.0 {
+        Player { p | x: p.x + width }
+    } else if center > width {
+        Player { p | x: p.x - width }
     } else {
         p
     }
 }
 
-push_down :: (p: Player, b: Block) -> Player {
-    if !inside(p, b) {
-        p
-    } else if p.vy > 0.0 {
-        Player { p | y: b.y - player_h, vy: 0.0, ground: true }
+// Platforms only stop the player from above: going up, it passes through.
+land :: (p: Player, platform: Platform) -> Player {
+    let falling = p.vy > 0.0
+    let crossed = p.last_y + player_h <= platform.y and p.y + player_h >= platform.y
+    let above = p.x + player_w > platform.x and p.x < platform.x + platform.w
+    if falling and crossed and above {
+        Player { p | y: platform.y - player_h, vy: -bounce }
     } else {
-        Player { p | y: b.y + b.h, vy: 0.0 }
+        p
     }
 }
 
-inside :: (p: Player, b: Block) -> Bool {
-    p.x < b.x + b.w and p.x + player_w > b.x and p.y < b.y + b.h and p.y + player_h > b.y
+score :: (w: World) -> Int {
+    to_int((floor_y - player_h - w.top) / 10.0)
 }
+
+// Where the next climb starts depends on how long this one lasted.
+next_base :: (w: World) -> Int {
+    (w.base / rows + to_int(w.time * 60.0) % 997 + 1) % 1000 * rows
+}
+
+// Drawing a platform needs the camera, and a function passed to fold sees
+// only its arguments, so the camera goes along with the shapes.
+Canvas :: struct { camera: Float, shapes: List[Shape] }
 
 draw :: (w: World) -> List[Shape] {
-    let l = level()
-    let ground = l.blocks |> fold(sky(), add_block)
-    concat(ground, concat(hero(w.player), hint(w.time)))
+    let canvas = on_screen(w) |> fold(Canvas { camera: w.camera, shapes: sky() }, paint)
+    concat(canvas.shapes, concat(hero(w.player, w.camera), hud(w)))
 }
 
-// The fold starts from a List[Shape], and not from a list literal of one
-// Rect, which would be a List[Rect] that a Circle could not join.
 sky :: () -> List[Shape] {
     [Rect { x: 0.0, y: 0.0, w: width, h: height, color: rgb(22, 24, 44) }]
 }
 
-add_block :: (shapes: List[Shape], b: Block) -> List[Shape] {
-    concat(shapes, [
-        Rect { x: b.x, y: b.y, w: b.w, h: b.h, color: rgb(64, 70, 110) },
-        Rect { x: b.x, y: b.y, w: b.w, h: 4.0, color: rgb(120, 200, 140) },
-    ])
+paint :: (c: Canvas, platform: Platform) -> Canvas {
+    let y = platform.y - c.camera
+    Canvas { c | shapes: concat(c.shapes, [
+        Rect { x: platform.x, y: y, w: platform.w, h: platform_h, color: rgb(64, 70, 110) },
+        Rect { x: platform.x, y: y, w: platform.w, h: 4.0, color: rgb(120, 200, 140) },
+    ]) }
 }
 
-hero :: (p: Player) -> List[Shape] {
-    let eye = if p.facing > 0.0 { 9.0 } else { 3.0 }
+// Near a side, the player shows on both, as it goes through.
+hero :: (p: Player, camera: Float) -> List[Shape] {
+    let y = p.y - camera
+    let other = if p.x < 0.0 {
+        body(p.x + width, y, p.facing)
+    } else if p.x + player_w > width {
+        body(p.x - width, y, p.facing)
+    } else {
+        []
+    }
+    concat(body(p.x, y, p.facing), other)
+}
+
+body :: (x: Float, y: Float, facing: Float) -> List[Shape] {
+    let eye = if facing > 0.0 { 12.0 } else { 4.0 }
     [
-        Rect { x: p.x, y: p.y, w: player_w, h: player_h, color: rgb(250, 196, 72) },
-        Rect { x: p.x + eye, y: p.y + 6.0, w: 4.0, h: 5.0, color: rgb(30, 30, 50) },
+        Rect { x: x, y: y, w: player_w, h: player_h, color: rgb(250, 196, 72) },
+        Rect { x: x + eye, y: y + 7.0, w: 4.0, h: 5.0, color: rgb(30, 30, 50) },
     ]
 }
 
-hint :: (time: Float) -> List[Shape] {
-    if time < 6.0 {
-        [Text { x: 24.0, y: 40.0, size: 24.0, text: "arrows to run, space to jump", color: rgb(170, 176, 210) }]
+hud :: (w: World) -> List[Shape] {
+    let shown = [Text { x: 16.0, y: 36.0, size: 28.0, text: to_string(score(w)), color: :white }]
+    if w.time < 5.0 and w.base == 0 {
+        concat(shown, [Text { x: 16.0, y: 68.0, size: 20.0, text: "arrows to steer", color: rgb(170, 176, 210) }])
     } else {
-        []
+        shown
     }
 }
