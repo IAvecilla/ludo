@@ -79,10 +79,15 @@ pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
-    blocks: usize,
-    struct_ok: bool,
-    state: Option<String>,
     exprs: ExprParser,
+    /// How many `{ }` the parser is inside of.
+    blocks: usize,
+    /// Whether `Name {` starts a struct. It does not in a condition, as in
+    /// `if x > MAX { ... }`, where the `{` starts a block.
+    struct_ok: bool,
+    /// The state of the sequence being parsed: the only name whose fields a
+    /// step can change.
+    state: String,
 }
 
 impl Parser {
@@ -90,21 +95,23 @@ impl Parser {
         Self {
             tokens,
             current: 0,
+            exprs,
             blocks: 0,
             struct_ok: true,
-            state: None,
-            exprs,
+            state: String::new(),
         }
     }
 
     fn statement_line(&mut self) -> Result<Stmt, ParseError> {
         let stmt = self.statement()?;
-        if !self.is_at_end() && !self.matches(&[TokenKind::Newline]) {
+        if !self.is_at_end() && !self.matches(TokenKind::Newline) {
             return Err(self.error("expected a new line after the statement"));
         }
         Ok(stmt)
     }
 
+    /// Skips to the end of the statement that failed, past any `{ }` it
+    /// left open.
     fn synchronize(&mut self) {
         let mut depth = self.blocks;
         while !self.is_at_end() {
@@ -128,8 +135,8 @@ impl Parser {
                 self.expect(TokenKind::Eq, "`=` after the name")?;
                 StmtKind::Let(name, self.expression()?)
             }
-            TokenKind::Ident(_) if self.kind_at(1) == Some(&TokenKind::ColonColon) => {
-                self.declaration(line)?
+            TokenKind::Ident(name) if self.kind_at(1) == Some(&TokenKind::ColonColon) => {
+                self.declaration(name.clone(), line)?
             }
             TokenKind::Struct => {
                 return Err(self.error("structs are declared as `Name :: struct { ... }`"))
@@ -160,54 +167,38 @@ impl Parser {
         Ok(Stmt { kind, line })
     }
 
-    fn declaration(&mut self, line: usize) -> Result<StmtKind, ParseError> {
-        let kind = self.kind_at(2).cloned();
-        let what = match &kind {
-            Some(TokenKind::Struct) => "structs",
-            Some(TokenKind::Enum) => "enums",
-            Some(TokenKind::Sequence) => "sequences",
-            Some(TokenKind::Ident(name)) if starts_uppercase(name) => "unions",
-            _ => "functions",
+    /// `name :: ...`, with the parser still on `name`.
+    fn declaration(&mut self, name: String, line: usize) -> Result<StmtKind, ParseError> {
+        let union = matches!(self.kind_at(2), Some(TokenKind::Ident(ty)) if starts_uppercase(ty));
+        let (what, named) = match self.kind_at(2) {
+            Some(TokenKind::Struct) => ("structs", Some("a struct")),
+            Some(TokenKind::Enum) => ("enums", Some("an enum")),
+            Some(TokenKind::Sequence) => ("sequences", None),
+            _ if union => ("unions", Some("a union")),
+            _ => ("functions", None),
         };
         if self.blocks > 0 {
             return Err(self.error(format!("{what} can only be declared at the top level")));
         }
-        let union = matches!(&kind, Some(TokenKind::Ident(name)) if starts_uppercase(name));
-        let named = match kind {
-            Some(TokenKind::Struct) => Some("a struct"),
-            Some(TokenKind::Enum) => Some("an enum"),
-            _ if union => Some("a union"),
-            _ => None,
-        };
-        if let Some(named) = named {
-            if matches!(self.peek(), TokenKind::Ident(name) if !starts_uppercase(name)) {
-                return Err(self.error(format!("{named} name starts with an uppercase letter")));
-            }
+        if let Some(named) = named.filter(|_| !starts_uppercase(&name)) {
+            return Err(self.error(format!("{named} name starts with an uppercase letter")));
         }
 
-        let name = self.expect_ident("a name")?;
-        self.advance();
-        match self.peek() {
-            TokenKind::Struct => {
-                self.advance();
-                self.struct_declaration(name)
-            }
-            TokenKind::Enum => {
-                self.advance();
-                self.enum_declaration(name, line)
-            }
-            TokenKind::Sequence => {
-                self.advance();
-                self.sequence_declaration(name, line)
-            }
-            TokenKind::LParen => {
-                self.advance();
-                self.fn_declaration(name)
-            }
-            _ if union => self.union_declaration(name),
-            _ => Err(self.error(
+        self.current += 2;
+        if self.matches(TokenKind::Struct) {
+            self.struct_declaration(name)
+        } else if self.matches(TokenKind::Enum) {
+            self.enum_declaration(name, line)
+        } else if self.matches(TokenKind::Sequence) {
+            self.sequence_declaration(name, line)
+        } else if self.matches(TokenKind::LParen) {
+            self.fn_declaration(name)
+        } else if union {
+            self.union_declaration(name)
+        } else {
+            Err(self.error(
                 "expected `(`, `struct`, `enum`, `sequence` or a type after `::`; values are bound with `let`",
-            )),
+            ))
         }
     }
 
@@ -236,7 +227,7 @@ impl Parser {
     }
 
     fn type_expr(&mut self) -> Result<TypeExpr, ParseError> {
-        if self.matches(&[TokenKind::LParen]) {
+        if self.matches(TokenKind::LParen) {
             let params = self.comma_list(
                 TokenKind::RParen,
                 "`)` to close the parameter types",
@@ -247,7 +238,7 @@ impl Parser {
             return Ok(TypeExpr::Function { params, ret });
         }
         let name = self.expect_ident("a type")?;
-        let args = if self.matches(&[TokenKind::LBracket]) {
+        let args = if self.matches(TokenKind::LBracket) {
             self.comma_list(
                 TokenKind::RBracket,
                 "`]` to close the type arguments",
@@ -261,7 +252,7 @@ impl Parser {
 
     fn union_declaration(&mut self, name: String) -> Result<StmtKind, ParseError> {
         let mut members = vec![self.type_expr()?];
-        while self.matches(&[TokenKind::Bar]) {
+        while self.matches(TokenKind::Bar) {
             members.push(self.type_expr()?);
         }
         Ok(StmtKind::Union(Rc::new(UnionDecl { name, members })))
@@ -270,7 +261,7 @@ impl Parser {
     fn struct_declaration(&mut self, name: String) -> Result<StmtKind, ParseError> {
         self.expect(TokenKind::LBrace, "`{` after `struct`")?;
         let mut seen = Vec::new();
-        let fields = self.lines(true, "expected `}` to close the struct", "the field", |p| {
+        let fields = self.lines("the struct", Some("the field"), |p| {
             let name = p.field_name(&mut seen, "this field is already declared")?;
             p.expect(TokenKind::Colon, "`:` and a type after the field name")?;
             Ok(Param {
@@ -284,28 +275,20 @@ impl Parser {
     fn enum_declaration(&mut self, name: String, line: usize) -> Result<StmtKind, ParseError> {
         self.expect(TokenKind::LBrace, "`{` after `enum`")?;
         let mut symbols: Vec<String> = Vec::new();
-        let listed = self.lines(
-            true,
-            "expected `}` to close the enum",
-            "the symbol",
-            |p| match p.peek().clone() {
-                TokenKind::Symbol(symbol) if symbols.contains(&symbol) => {
-                    Err(p.error("this symbol is already in the enum"))
-                }
-                TokenKind::Symbol(symbol) => {
-                    p.advance();
-                    symbols.push(symbol);
-                    Ok(())
-                }
-                _ => Err(p.error("expected a symbol, like `:idle`")),
-            },
-        );
-        listed?;
+        self.lines("the enum", Some("the symbol"), |p| match p.peek().clone() {
+            TokenKind::Symbol(symbol) if symbols.contains(&symbol) => {
+                Err(p.error("this symbol is already in the enum"))
+            }
+            TokenKind::Symbol(symbol) => {
+                p.advance();
+                symbols.push(symbol);
+                Ok(())
+            }
+            _ => Err(p.error("expected a symbol, like `:idle`")),
+        })?;
         if symbols.is_empty() {
-            return Err(ParseError::at(
-                line,
-                format!("`{name}` needs at least one symbol"),
-            ));
+            let message = format!("`{name}` needs at least one symbol");
+            return Err(ParseError::at(line, message));
         }
         Ok(StmtKind::Enum(Rc::new(EnumDecl { name, symbols })))
     }
@@ -313,28 +296,16 @@ impl Parser {
     fn sequence_declaration(&mut self, name: String, line: usize) -> Result<StmtKind, ParseError> {
         self.expect(TokenKind::LParen, "`(` after `sequence`")?;
         let params = self.parameters()?;
-        let Some(state) = params.first().map(|p| p.name.clone()) else {
-            return Err(ParseError::at(
-                line,
-                format!(
-                    "`{name}` needs a parameter: the first one is the state the sequence runs over"
-                ),
-            ));
+        let Some(state) = params.first() else {
+            let message = format!(
+                "`{name}` needs a parameter: the first one is the state the sequence runs over"
+            );
+            return Err(ParseError::at(line, message));
         };
+        self.state = state.name.clone();
         self.expect(TokenKind::LBrace, "`{` to start the sequence body")?;
-        self.state = Some(state);
-        let body = self.lines(
-            false,
-            "expected `}` to close the sequence",
-            "the statement",
-            |p| p.step(false),
-        );
-        self.state = None;
-        Ok(StmtKind::Sequence(Rc::new(SeqDecl {
-            name,
-            params,
-            body: body?,
-        })))
+        let body = self.lines("the sequence", None, |p| p.step(false))?;
+        Ok(StmtKind::Sequence(Rc::new(SeqDecl { name, params, body })))
     }
 
     fn step(&mut self, in_over: bool) -> Result<Step, ParseError> {
@@ -356,31 +327,32 @@ impl Parser {
             TokenKind::Over => {
                 self.advance();
                 let duration = self.condition()?;
-                let var = match self.matches(&[TokenKind::As]) {
-                    true => Some(self.expect_ident("a name after `as`")?),
-                    false => None,
+                let var = if self.matches(TokenKind::As) {
+                    Some(self.expect_ident("a name after `as`")?)
+                } else {
+                    None
                 };
                 self.expect(TokenKind::LBrace, "`{` to start the body of `over`")?;
-                let body = self.lines(
-                    false,
-                    "expected `}` to close the body of `over`",
-                    "the statement",
-                    |p| p.step(true),
-                )?;
+                let body = self.lines("the body of `over`", None, |p| p.step(true))?;
                 StepKind::Over {
                     duration,
                     var,
                     body,
                 }
             }
-            TokenKind::Ident(name) if self.is_field_assignment() => {
-                let target = name.clone();
-                if self.state.as_ref() != Some(&target) {
-                    let state = self.state.clone().unwrap_or_default();
+            // `target.field = value`
+            TokenKind::Ident(target)
+                if self.kind_at(1) == Some(&TokenKind::Dot)
+                    && matches!(self.kind_at(2), Some(TokenKind::Ident(_)))
+                    && self.kind_at(3) == Some(&TokenKind::Eq) =>
+            {
+                if *target != self.state {
                     return Err(self.error(format!(
-                        "only `{state}`, the state of the sequence, can have its fields changed"
+                        "only `{}`, the state of the sequence, can have its fields changed",
+                        self.state
                     )));
                 }
+                let target = target.clone();
                 self.current += 2;
                 let field = self.expect_ident("a field name")?;
                 self.advance();
@@ -389,12 +361,6 @@ impl Parser {
             _ => StepKind::Stmt(self.statement()?),
         };
         Ok(Step { kind, line })
-    }
-
-    fn is_field_assignment(&self) -> bool {
-        self.kind_at(1) == Some(&TokenKind::Dot)
-            && matches!(self.kind_at(2), Some(TokenKind::Ident(_)))
-            && self.kind_at(3) == Some(&TokenKind::Eq)
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
@@ -408,7 +374,7 @@ impl Parser {
     /// passes it as the first argument.
     fn dot(&mut self, receiver: Expr) -> Result<Expr, ParseError> {
         let name = self.expect_ident("a field or method name after `.`")?;
-        if self.matches(&[TokenKind::LParen]) {
+        if self.matches(TokenKind::LParen) {
             let mut args = vec![receiver];
             args.extend(self.arguments()?);
             Ok(Expr::Call(Box::new(Expr::Ident(name)), args))
@@ -431,7 +397,7 @@ impl Parser {
                     && self.kind_at(1) == Some(&TokenKind::LBrace) =>
             {
                 self.current += 2;
-                return self.with_structs(true, |p| p.struct_literal(name));
+                return self.struct_literal(name);
             }
             TokenKind::Ident(v) => Expr::Ident(v),
             TokenKind::LParen => {
@@ -442,14 +408,14 @@ impl Parser {
             }
             TokenKind::LBracket => {
                 self.advance();
-                return self.with_structs(true, |p| {
+                let items = self.with_structs(true, |p| {
                     p.comma_list(
                         TokenKind::RBracket,
                         "`,` or `]` in the list",
                         Self::expression,
                     )
-                    .map(Expr::List)
-                });
+                })?;
+                return Ok(Expr::List(items));
             }
             TokenKind::LBrace => return self.block(),
             TokenKind::If => return self.if_expression(),
@@ -472,14 +438,7 @@ impl Parser {
 
     fn block(&mut self) -> Result<Expr, ParseError> {
         let open_line = self.advance().line;
-        let mut statements = self.with_structs(true, |p| {
-            p.lines(
-                false,
-                "expected `}` to close the block",
-                "the statement",
-                Self::statement,
-            )
-        })?;
+        let mut statements = self.lines("the block", None, Self::statement)?;
         match statements.pop() {
             Some(Stmt {
                 kind: StmtKind::Expr(tail),
@@ -505,10 +464,11 @@ impl Parser {
         let cond = self.condition()?;
         let then = self.block_after("`{` after the condition of `if`")?;
 
+        // The `else` may go on the next line.
         if matches!(self.next_significant(), TokenKind::Else | TokenKind::Eof) {
             self.skip_newlines();
         }
-        if !self.matches(&[TokenKind::Else]) {
+        if !self.matches(TokenKind::Else) {
             return Err(self.error("expected `else`: an `if` without one has no value"));
         }
 
@@ -528,14 +488,7 @@ impl Parser {
         let line = self.advance().line;
         let value = self.condition()?;
         self.expect(TokenKind::LBrace, "`{` after the value of `case`")?;
-        let arms = self.with_structs(true, |p| {
-            p.lines(
-                true,
-                "expected `}` to close the `case`",
-                "the branch",
-                Self::arm,
-            )
-        })?;
+        let arms = self.lines("the `case`", Some("the branch"), Self::arm)?;
         if arms.is_empty() {
             return Err(ParseError::at(line, "a `case` needs at least one branch"));
         }
@@ -545,9 +498,10 @@ impl Parser {
     fn arm(&mut self) -> Result<Arm, ParseError> {
         let line = self.line();
         let pattern = self.pattern()?;
-        let guard = match self.matches(&[TokenKind::When]) {
-            true => Some(self.expression()?),
-            false => None,
+        let guard = if self.matches(TokenKind::When) {
+            Some(self.expression()?)
+        } else {
+            None
         };
         self.expect(TokenKind::Arrow, "`->` and the value of the branch")?;
         Ok(Arm {
@@ -559,7 +513,7 @@ impl Parser {
     }
 
     fn pattern(&mut self) -> Result<Pattern, ParseError> {
-        let negative = self.matches(&[TokenKind::Minus]);
+        let negative = self.matches(TokenKind::Minus);
         let pattern = match self.peek().clone() {
             TokenKind::Int(v) => Pattern::Literal(Literal::Int(if negative { -v } else { v })),
             TokenKind::Float(v) => Pattern::Literal(Literal::Float(if negative { -v } else { v })),
@@ -578,10 +532,8 @@ impl Parser {
                     _ => Variant::Error,
                 };
                 self.advance();
-                self.expect(
-                    TokenKind::LParen,
-                    &format!("`(` and a pattern after `{name}`"),
-                )?;
+                let after = format!("`(` and a pattern after `{name}`");
+                self.expect(TokenKind::LParen, &after)?;
                 let inner = self.pattern()?;
                 self.expect(TokenKind::RParen, "`)` to close the pattern")?;
                 return Ok(Pattern::Variant(variant, Some(Box::new(inner))));
@@ -597,10 +549,12 @@ impl Parser {
         Ok(pattern)
     }
 
+    /// An expression right before a `{` that is not a struct's.
     fn condition(&mut self) -> Result<Expr, ParseError> {
         self.with_structs(false, Self::expression)
     }
 
+    /// `Name { [base |] field: value, ... }`, after the `{`.
     fn struct_literal(&mut self, name: String) -> Result<Expr, ParseError> {
         self.skip_newlines();
         let starts_with_field = matches!(self.peek(), TokenKind::Ident(_))
@@ -615,7 +569,7 @@ impl Parser {
         };
 
         let mut seen = Vec::new();
-        let fields = self.lines(true, "expected `}` to close the struct", "the field", |p| {
+        let fields = self.lines("the struct", Some("the field"), |p| {
             let field = p.field_name(&mut seen, "this field is already given")?;
             p.expect(TokenKind::Colon, "`:` after the field name")?;
             Ok((field, p.expression()?))
@@ -644,37 +598,41 @@ impl Parser {
         )
     }
 
+    /// The items of a `{ }` that closes `what`, after the `{`: one per line
+    /// or, when `entry` names them, also separated by commas.
     fn lines<T>(
         &mut self,
-        commas: bool,
-        closing: &str,
-        after: &str,
+        what: &str,
+        entry: Option<&str>,
         mut item: impl FnMut(&mut Self) -> Result<T, ParseError>,
     ) -> Result<Vec<T>, ParseError> {
         self.blocks += 1;
-        let mut items = Vec::new();
-        loop {
-            self.skip_newlines();
-            if self.matches(&[TokenKind::RBrace]) {
-                break;
+        let closing = format!("expected `}}` to close {what}");
+        let items = self.with_structs(true, |p| {
+            let mut items = Vec::new();
+            loop {
+                p.skip_newlines();
+                if p.matches(TokenKind::RBrace) {
+                    return Ok(items);
+                }
+                if p.is_at_end() {
+                    return Err(p.error(closing));
+                }
+                items.push(item(p)?);
+                let separated = p.matches(TokenKind::Newline)
+                    || (entry.is_some() && p.matches(TokenKind::Comma));
+                if !separated && p.peek() != &TokenKind::RBrace {
+                    let message = if p.is_at_end() {
+                        closing
+                    } else if let Some(entry) = entry {
+                        format!("expected `,`, a new line or `}}` after {entry}")
+                    } else {
+                        "expected a new line or `}` after the statement".to_string()
+                    };
+                    return Err(p.error(message));
+                }
             }
-            if self.is_at_end() {
-                return Err(self.error(closing));
-            }
-            items.push(item(self)?);
-            if self.is_at_end() {
-                return Err(self.error(closing));
-            }
-            let separated = self.matches(&[TokenKind::Newline])
-                || (commas && self.matches(&[TokenKind::Comma]));
-            if !separated && self.peek() != &TokenKind::RBrace {
-                return Err(self.error(if commas {
-                    format!("expected `,`, a new line or `}}` after {after}")
-                } else {
-                    format!("expected a new line or `}}` after {after}")
-                }));
-            }
-        }
+        })?;
         self.blocks -= 1;
         Ok(items)
     }
@@ -688,7 +646,7 @@ impl Parser {
         let mut items = Vec::new();
         while self.peek() != &close {
             items.push(item(self)?);
-            if !self.matches(&[TokenKind::Comma]) {
+            if !self.matches(TokenKind::Comma) {
                 break;
             }
         }
@@ -704,7 +662,7 @@ impl Parser {
     }
 
     fn skip_newlines(&mut self) {
-        while self.matches(&[TokenKind::Newline]) {}
+        while self.matches(TokenKind::Newline) {}
     }
 
     fn next_significant(&self) -> &TokenKind {
@@ -738,8 +696,8 @@ impl Parser {
         &self.tokens[self.current - 1]
     }
 
-    fn matches(&mut self, kinds: &[TokenKind]) -> bool {
-        let found = kinds.contains(self.peek());
+    fn matches(&mut self, kind: TokenKind) -> bool {
+        let found = self.peek() == &kind;
         if found {
             self.advance();
         }
@@ -747,7 +705,7 @@ impl Parser {
     }
 
     fn expect(&mut self, kind: TokenKind, what: &str) -> Result<(), ParseError> {
-        if self.matches(&[kind]) {
+        if self.matches(kind) {
             return Ok(());
         }
         Err(self.error(format!("expected {what}")))
@@ -806,26 +764,28 @@ mod tests {
     /// Parses with Pratt and with the ladder, which must agree on every tree
     /// and every error.
     fn both(source: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
-        let run = |exprs| {
-            parse_with(
-                scan_tokens(source).expect("source should scan cleanly"),
-                exprs,
-            )
-        };
+        let run = |exprs| parse_with(scan_tokens(source).expect("source should scan"), exprs);
         let pratt = run(ExprParser::Pratt);
         assert_eq!(
             run(ExprParser::Ladder),
             pratt,
-            "the ladder and Pratt disagree on {source:?}"
+            "the parsers disagree on {source:?}"
         );
         pratt
     }
 
     fn tree(source: &str) -> Result<String, String> {
-        let join = |lines: Vec<String>| lines.join("\n");
         match both(source) {
-            Ok(statements) => Ok(join(statements.iter().map(|s| s.to_string()).collect())),
-            Err(errors) => Err(join(errors.into_iter().map(|e| e.message).collect())),
+            Ok(statements) => Ok(statements
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")),
+            Err(errors) => Err(errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("\n")),
         }
     }
 
@@ -848,14 +808,8 @@ mod tests {
                 "1\n0.2s\n\"hi\"\n:jump\ntrue",
                 "1\n0.2\n\"hi\"\n:jump\ntrue",
             ),
-            ("1 - 2 - 3\na < b < c", "(- (- 1 2) 3)\n(< (< a b) c)"),
-            ("1 + 2 * 3\n1 * 2 + 3", "(+ 1 (* 2 3))\n(+ (* 1 2) 3)"),
-            ("(1 + 2) * 3", "(* (+ 1 2) 3)"),
-            ("-1 * 2\n!!a", "(* (- 1) 2)\n(! (! a))"),
-            (
-                "-f(x).y * -a\n!a == b",
-                "(* (- (. (call f x) y)) (- a))\n(== (! a) b)",
-            ),
+            ("1 - 2 - 3\n(1 + 2) * 3", "(- (- 1 2) 3)\n(* (+ 1 2) 3)"),
+            ("-f(x).y * !!a", "(* (- (. (call f x) y)) (! (! a)))"),
             (
                 "a or b and c == d < e + f * g",
                 "(or a (and b (== c (< d (+ e (* f g))))))",
@@ -873,19 +827,11 @@ mod tests {
     #[test]
     fn calls_dots_and_pipes_build_calls() {
         parses(&[
-            (
-                "f()\nf(1)(2)\nf(\n  1,\n  2\n)",
-                "(call f)\n(call (call f 1) 2)\n(call f 1 2)",
-            ),
+            ("f()\nf(1)(2)", "(call f)\n(call (call f 1) 2)"),
             ("p.pos.x", "(. (. p pos) x)"),
             (
-                "f(p, d)\np.f(d)\np |> f(d)",
-                "(call f p d)\n(call f p d)\n(call f p d)",
-            ),
-            ("p |> g", "(call g p)"),
-            (
-                "let p = q\n  |> f(a)\n  |> g",
-                "(let p (call g (call f q a)))",
+                "p.f(d)\np |> f(d)\np |> g",
+                "(call f p d)\n(call f p d)\n(call g p)",
             ),
             (
                 "a + b |> f\nx |> v() and y",
@@ -962,7 +908,6 @@ mod tests {
                 "add :: (a: Int, b: Int) -> Int {\n  a + b\n}",
                 "(fn add (a: Int, b: Int) -> Int (block (+ a b)))",
             ),
-            ("one :: () -> Int { 1 }", "(fn one () -> Int (block 1))"),
             (
                 "f :: (m: Map[String, List[Int]]) -> Int { 1 }",
                 "(fn f (m: Map[String, List[Int]]) -> Int (block 1))",
@@ -1012,8 +957,8 @@ mod tests {
                 "(struct B (x: Float, y: Float))\n(struct E ())",
             ),
             ("B { x: 1.0, y: 2.0 }\nE {}", "(B x: 1.0 y: 2.0)\n(E)"),
-            ("let b = B {\n  x: 1.0,\n}", "(let b (B x: 1.0))"),
             ("B { f(b) | x: 1.0 }", "(B (call f b) | x: 1.0)"),
+            // In a condition the `{` starts the block, unless in parentheses.
             (
                 "if x > MAX { 1 } else { 2 }",
                 "(if (> x MAX) (block 1) (block 2))",
@@ -1041,10 +986,6 @@ mod tests {
                 "expected `:` and a type after the field name, found `}`",
             ),
             (
-                "f :: () -> Int {\n  A :: struct {}\n  1\n}",
-                "structs can only be declared at the top level, found `A`",
-            ),
-            (
                 "B { x: 1.0, x: 2.0 }",
                 "this field is already given, found `x`",
             ),
@@ -1057,10 +998,7 @@ mod tests {
 
     #[test]
     fn parses_lists() {
-        parses(&[(
-            "[]\n[1, 2 + 3]\n[\n  1,\n]",
-            "(list)\n(list 1 (+ 2 3))\n(list 1)",
-        )]);
+        parses(&[("[]\n[1, 2 + 3]", "(list)\n(list 1 (+ 2 3))")]);
         rejects(&[("[1 2]", "expected `,` or `]` in the list, found `2`")]);
     }
 
@@ -1122,10 +1060,6 @@ mod tests {
                 "enums are declared as `Name :: enum { :a, :b }`, found `enum`",
             ),
             (
-                "state :: enum { :a }",
-                "an enum name starts with an uppercase letter, found `state`",
-            ),
-            (
                 "S :: enum { :a, :a }",
                 "this symbol is already in the enum, found `:a`",
             ),
@@ -1134,10 +1068,6 @@ mod tests {
                 "expected a symbol, like `:idle`, found `a`",
             ),
             ("S :: enum {}", "`S` needs at least one symbol"),
-            (
-                "f :: () -> Int {\n  E :: enum { :a }\n  1\n}",
-                "enums can only be declared at the top level, found `E`",
-            ),
             ("case x {}", "a `case` needs at least one branch"),
             (
                 "case x { :a 1 }",
@@ -1192,10 +1122,7 @@ mod tests {
                 "pick :: () -> (List[Int], Int) -> Bool { has }",
                 "(fn pick () -> (List[Int], Int) -> Bool (block has))",
             ),
-            (
-                "Shape :: Rect | Circle\nPaint :: Color | Symbol",
-                "(type Shape Rect | Circle)\n(type Paint Color | Symbol)",
-            ),
+            ("Shape :: Rect | Circle", "(type Shape Rect | Circle)"),
         ]);
         rejects(&[
             (

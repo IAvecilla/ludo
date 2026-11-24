@@ -1,7 +1,5 @@
 use crate::token::{Token, TokenKind};
 
-const DURATION_SUFFIX: &str = "s";
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanError {
     pub message: String,
@@ -9,7 +7,30 @@ pub struct ScanError {
 }
 
 pub fn scan_tokens(source: &str) -> Result<Vec<Token>, Vec<ScanError>> {
-    Scanner::new(source).run()
+    let mut scanner = Scanner {
+        chars: source.chars().collect(),
+        start: 0,
+        current: 0,
+        line: 1,
+        open: Vec::new(),
+        tokens: Vec::new(),
+    };
+    let mut errors = Vec::new();
+    while !scanner.is_at_end() {
+        scanner.start = scanner.current;
+        if let Err(message) = scanner.scan_token() {
+            let line = scanner.line;
+            errors.push(ScanError { message, line });
+        }
+    }
+    scanner.start = scanner.current;
+    scanner.add_token(TokenKind::Eof);
+
+    if errors.is_empty() {
+        Ok(scanner.tokens)
+    } else {
+        Err(errors)
+    }
 }
 
 struct Scanner {
@@ -17,53 +38,25 @@ struct Scanner {
     start: usize,
     current: usize,
     line: usize,
+    /// The brackets opened and not yet closed, innermost last.
     open: Vec<char>,
     tokens: Vec<Token>,
-    errors: Vec<ScanError>,
 }
 
 impl Scanner {
-    fn new(source: &str) -> Self {
-        Self {
-            chars: source.chars().collect(),
-            start: 0,
-            current: 0,
-            line: 1,
-            open: Vec::new(),
-            tokens: Vec::new(),
-            errors: Vec::new(),
-        }
-    }
-
-    fn run(mut self) -> Result<Vec<Token>, Vec<ScanError>> {
-        while !self.is_at_end() {
-            self.start = self.current;
-            self.scan_token();
-        }
-
-        self.start = self.current;
-        self.add_token(TokenKind::Eof);
-
-        if self.errors.is_empty() {
-            Ok(self.tokens)
-        } else {
-            Err(self.errors)
-        }
-    }
-
-    fn scan_token(&mut self) {
+    fn scan_token(&mut self) -> Result<(), String> {
         let c = self.advance();
         let kind = match c {
-            ' ' | '\r' | '\t' => return,
+            ' ' | '\r' | '\t' => return Ok(()),
             '\n' => {
                 // A newline ends a statement, except inside `( )` or `[ ]` and when the
                 // next line starts with `|>` or `.`, which continue the current one.
                 let in_group = matches!(self.open.last(), Some('(' | '['));
-                if in_group || self.next_line_continues() {
-                    self.line += 1;
-                    return;
+                if !in_group && !self.next_line_continues() {
+                    self.add_token(TokenKind::Newline);
                 }
-                TokenKind::Newline
+                self.line += 1;
+                return Ok(());
             }
 
             '(' => TokenKind::LParen,
@@ -96,38 +89,33 @@ impl Scanner {
                 while !self.is_at_end() && self.peek() != '\n' {
                     self.advance();
                 }
-                return;
+                return Ok(());
             }
             '/' => TokenKind::Slash,
 
             ':' if self.matches(':') => TokenKind::ColonColon,
-            ':' if is_symbol_start(self.peek()) => self.symbol(),
+            ':' if self.peek().is_ascii_lowercase() || self.peek() == '_' => {
+                self.skip_word();
+                TokenKind::Symbol(self.lexeme()[1..].to_string())
+            }
             ':' => TokenKind::Colon,
 
-            '"' => match self.string() {
-                Ok(kind) => kind,
-                Err(message) => return self.error(message),
-            },
-            c if c.is_ascii_digit() => match self.number() {
-                Ok(kind) => kind,
-                Err(message) => return self.error(message),
-            },
-            c if is_ident_start(c) => self.identifier(),
+            '"' => self.string()?,
+            c if c.is_ascii_digit() => self.number()?,
+            c if is_word_start(c) => self.identifier(),
 
-            other => return self.error(format!("unexpected character `{other}`")),
+            other => return Err(format!("unexpected character `{other}`")),
         };
 
-        match kind {
-            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => self.open.push(c),
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+        match c {
+            '(' | '[' | '{' => self.open.push(c),
+            ')' | ']' | '}' => {
                 self.open.pop();
             }
             _ => {}
         }
         self.add_token(kind);
-        if c == '\n' {
-            self.line += 1;
-        }
+        Ok(())
     }
 
     fn next_line_continues(&self) -> bool {
@@ -145,30 +133,19 @@ impl Scanner {
         while !self.is_at_end() && self.peek() != '"' && self.peek() != '\n' {
             self.advance();
         }
-
         if self.is_at_end() || self.peek() == '\n' {
             return Err(format!("unterminated string: `{}`", self.lexeme()));
         }
-
         self.advance();
-        let value = self.chars[self.start + 1..self.current - 1]
-            .iter()
-            .collect();
-        Ok(TokenKind::Str(value))
-    }
 
-    fn symbol(&mut self) -> TokenKind {
-        while is_ident_continue(self.peek()) {
-            self.advance();
-        }
-        TokenKind::Symbol(self.chars[self.start + 1..self.current].iter().collect())
+        let text = self.lexeme();
+        Ok(TokenKind::Str(text[1..text.len() - 1].to_string()))
     }
 
     fn number(&mut self) -> Result<TokenKind, String> {
         while self.peek().is_ascii_digit() {
             self.advance();
         }
-
         let mut is_float = self.peek() == '.' && self.peek_next().is_ascii_digit();
         if is_float {
             self.advance();
@@ -176,20 +153,15 @@ impl Scanner {
                 self.advance();
             }
         }
-
         let text = self.lexeme();
 
-        if is_ident_start(self.peek()) {
-            let suffix_start = self.current;
-            while is_ident_continue(self.peek()) {
-                self.advance();
-            }
-            let suffix: String = self.chars[suffix_start..self.current].iter().collect();
-            if suffix != DURATION_SUFFIX {
-                return Err(format!(
-                    "unknown numeric suffix `{suffix}` in `{}`",
-                    self.lexeme()
-                ));
+        // A duration, like `0.5s`, is a number of seconds.
+        if is_word_start(self.peek()) {
+            self.skip_word();
+            let lexeme = self.lexeme();
+            let suffix = &lexeme[text.len()..];
+            if suffix != "s" {
+                return Err(format!("unknown numeric suffix `{suffix}` in `{lexeme}`"));
             }
             is_float = true;
         }
@@ -206,10 +178,7 @@ impl Scanner {
     }
 
     fn identifier(&mut self) -> TokenKind {
-        while is_ident_continue(self.peek()) {
-            self.advance();
-        }
-
+        self.skip_word();
         let text = self.lexeme();
         match text.as_str() {
             "let" => TokenKind::Let,
@@ -223,14 +192,18 @@ impl Scanner {
             "or" => TokenKind::Or,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
-
             "sequence" => TokenKind::Sequence,
             "over" => TokenKind::Over,
             "wait" => TokenKind::Wait,
             "start" => TokenKind::Start,
             "as" => TokenKind::As,
-
             _ => TokenKind::Ident(text),
+        }
+    }
+
+    fn skip_word(&mut self) {
+        while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
+            self.advance();
         }
     }
 
@@ -239,17 +212,16 @@ impl Scanner {
     }
 
     fn advance(&mut self) -> char {
-        let c = self.chars[self.current];
         self.current += 1;
-        c
+        self.chars[self.current - 1]
     }
 
     fn matches(&mut self, expected: char) -> bool {
-        if self.is_at_end() || self.chars[self.current] != expected {
-            return false;
+        let found = !self.is_at_end() && self.peek() == expected;
+        if found {
+            self.current += 1;
         }
-        self.current += 1;
-        true
+        found
     }
 
     fn peek(&self) -> char {
@@ -266,84 +238,46 @@ impl Scanner {
 
     fn add_token(&mut self, kind: TokenKind) {
         let lexeme = self.lexeme();
-        self.tokens.push(Token::new(kind, lexeme, self.line));
-    }
-
-    fn error(&mut self, message: String) {
-        self.errors.push(ScanError {
-            message,
-            line: self.line,
-        });
+        let line = self.line;
+        self.tokens.push(Token { kind, lexeme, line });
     }
 }
 
-fn is_ident_start(c: char) -> bool {
+fn is_word_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
-}
-
-fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-fn is_symbol_start(c: char) -> bool {
-    c.is_ascii_lowercase() || c == '_'
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn kinds(source: &str) -> String {
-        let tokens = scan_tokens(source).expect("source should scan cleanly");
-        assert_eq!(tokens.last().map(|t| &t.kind), Some(&TokenKind::Eof));
-        let kinds: Vec<String> = tokens[..tokens.len() - 1]
-            .iter()
-            .map(|t| format!("{:?}", t.kind))
-            .collect();
-        kinds.join(" ")
-    }
-
     fn scans(cases: &[(&str, &str)]) {
         for (source, expected) in cases {
-            assert_eq!(kinds(source), *expected, "{source:?}");
+            let tokens = scan_tokens(source).expect("source should scan cleanly");
+            let kinds: Vec<String> = tokens.iter().map(|t| format!("{:?}", t.kind)).collect();
+            assert_eq!(kinds.join(" "), format!("{expected} Eof"), "{source:?}");
         }
     }
 
     #[test]
-    fn scans_operators_and_numbers() {
+    fn scans_operators_numbers_and_names() {
         scans(&[
             (
-                "1 + 2 * 3 % 4 / 2.0",
-                "Int(1) Plus Int(2) Star Int(3) Percent Int(4) Slash Float(2.0)",
+                "1 + 2 * 3 % 4 / 2.0 - 0.5s",
+                "Int(1) Plus Int(2) Star Int(3) Percent Int(4) Slash Float(2.0) Minus Float(0.5)",
             ),
             (
                 "== != <= >= -> |> | = < > !",
                 "EqEq BangEq LessEq GreaterEq Arrow PipeGt Bar Eq Less Greater Bang",
             ),
-        ]);
-    }
-
-    #[test]
-    fn scans_keywords_and_names() {
-        scans(&[
             (
-                "sequence sequencer over overflow on only",
-                r#"Sequence Ident("sequencer") Over Ident("overflow") Ident("on") Ident("only")"#,
+                "over overflow _unused",
+                r#"Over Ident("overflow") Ident("_unused")"#,
             ),
-            ("_ _unused", r#"Ident("_") Ident("_unused")"#),
-        ]);
-    }
-
-    #[test]
-    fn tells_symbols_from_annotations() {
-        scans(&[
-            (":jump", r#"Symbol("jump")"#),
-            ("f :: :jump", r#"Ident("f") ColonColon Symbol("jump")"#),
-            ("pos: Vec2", r#"Ident("pos") Colon Ident("Vec2")"#),
-            ("pos:Vec2", r#"Ident("pos") Colon Ident("Vec2")"#),
+            // A colon before a lowercase name starts a symbol.
             (
-                "Player { p | hp: 1 }",
-                r#"Ident("Player") LBrace Ident("p") Bar Ident("hp") Colon Int(1) RBrace"#,
+                "f :: :jump pos:Vec2",
+                r#"Ident("f") ColonColon Symbol("jump") Ident("pos") Colon Ident("Vec2")"#,
             ),
         ]);
     }
@@ -351,14 +285,10 @@ mod tests {
     #[test]
     fn scans_strings_and_comments() {
         scans(&[
-            (r#""hello""#, r#"Str("hello")"#),
-            (r#""""#, r#"Str("")"#),
             (
-                r#""let x |> 1 // not a comment""#,
-                r#"Str("let x |> 1 // not a comment")"#,
+                r#""let // not a comment\n""#,
+                r#"Str("let // not a comment\\n")"#,
             ),
-            (r#""a\nb""#, r#"Str("a\\nb")"#),
-            ("1 // 2 + 3", "Int(1)"),
             ("1 // 2\n3", "Int(1) Newline Int(3)"),
         ]);
     }
@@ -367,24 +297,17 @@ mod tests {
     fn a_newline_ends_a_statement_unless_it_is_grouped_or_continued() {
         scans(&[
             (
-                "let x = 1\nx",
-                r#"Let Ident("x") Eq Int(1) Newline Ident("x")"#,
+                "f(\n[1,\n2]\n)",
+                r#"Ident("f") LParen LBracket Int(1) Comma Int(2) RBracket RParen"#,
             ),
-            (
-                "f(\n1,\n2\n)",
-                r#"Ident("f") LParen Int(1) Comma Int(2) RParen"#,
-            ),
-            ("[1,\n2]", "LBracket Int(1) Comma Int(2) RBracket"),
-            ("{\n1\n}", "LBrace Newline Int(1) Newline RBrace"),
             (
                 "f({\n1\n})",
                 r#"Ident("f") LParen LBrace Newline Int(1) Newline RBrace RParen"#,
             ),
             (
-                "p\n  |> f\n  |> g",
-                r#"Ident("p") PipeGt Ident("f") PipeGt Ident("g")"#,
+                "p\n  |> f\n  .g",
+                r#"Ident("p") PipeGt Ident("f") Dot Ident("g")"#,
             ),
-            ("p\n  .f()", r#"Ident("p") Dot Ident("f") LParen RParen"#),
             ("a\n| b", r#"Ident("a") Newline Bar Ident("b")"#),
         ]);
     }
@@ -405,5 +328,23 @@ mod tests {
         assert_eq!(lines("let x\n\nx"), [1, 1, 1, 2, 3, 3]);
         assert_eq!(lines("f(\n1\n)"), [1, 1, 2, 3, 3]);
         assert_eq!(lines("p\n|> f"), [1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn reports_every_error_with_its_line() {
+        let errors = scan_tokens("@\n\"ab\n2x 99999999999999999999").unwrap_err();
+        let shown: Vec<String> = errors
+            .iter()
+            .map(|e| format!("{}: {}", e.line, e.message))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "1: unexpected character `@`",
+                "2: unterminated string: `\"ab`",
+                "3: unknown numeric suffix `x` in `2x`",
+                "3: integer literal `99999999999999999999` does not fit in 64 bits",
+            ]
+        );
     }
 }

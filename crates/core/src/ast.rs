@@ -192,41 +192,102 @@ pub struct Stmt {
 
 impl fmt::Display for Stmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.kind)
-    }
-}
-
-impl fmt::Display for StmtKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        match &self.kind {
             StmtKind::Let(name, value) => write!(f, "(let {name} {value})"),
-            StmtKind::Fn(decl) => write!(f, "{decl}"),
-            StmtKind::Struct(decl) => write!(f, "{decl}"),
-            StmtKind::Enum(decl) => write!(f, "{decl}"),
-            StmtKind::Union(decl) => {
-                let members: Vec<String> = decl.members.iter().map(|m| m.to_string()).collect();
-                write!(f, "(type {} {})", decl.name, members.join(" | "))
+            StmtKind::Fn(decl) => write!(
+                f,
+                "(fn {} ({}) -> {} {})",
+                decl.name,
+                joined(&decl.params, ", "),
+                decl.ret,
+                decl.body
+            ),
+            StmtKind::Struct(decl) => {
+                write!(f, "(struct {} ({}))", decl.name, joined(&decl.fields, ", "))
             }
-            StmtKind::Sequence(decl) => write!(f, "{decl}"),
+            StmtKind::Enum(decl) => {
+                let symbols: String = decl.symbols.iter().map(|s| format!(" :{s}")).collect();
+                write!(f, "(enum {}{symbols})", decl.name)
+            }
+            StmtKind::Union(decl) => {
+                write!(f, "(type {} {})", decl.name, joined(&decl.members, " | "))
+            }
+            StmtKind::Sequence(decl) => write!(
+                f,
+                "(sequence {} ({}){})",
+                decl.name,
+                joined(&decl.params, ", "),
+                spaced(&decl.body)
+            ),
             StmtKind::Start(name, args) => write!(f, "(start {name}{})", spaced(args)),
             StmtKind::Expr(expr) => write!(f, "{expr}"),
         }
     }
 }
 
-impl fmt::Display for StructDecl {
+impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(struct {} ({}))", self.name, params(&self.fields))
+        match &self.kind {
+            StepKind::Stmt(stmt) => write!(f, "{stmt}"),
+            StepKind::Set(target, field, value) => write!(f, "(set {target}.{field} {value})"),
+            StepKind::Over {
+                duration,
+                var,
+                body,
+            } => write!(
+                f,
+                "(over {duration} {}{})",
+                var.as_deref().unwrap_or("_"),
+                spaced(body)
+            ),
+        }
     }
 }
 
-impl fmt::Display for EnumDecl {
+impl fmt::Display for Param {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "(enum {}", self.name)?;
-        for symbol in &self.symbols {
-            write!(f, " :{symbol}")?;
+        write!(f, "{}: {}", self.name, self.ty)
+    }
+}
+
+impl fmt::Display for TypeExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TypeExpr::Named { name, args } if args.is_empty() => f.write_str(name),
+            TypeExpr::Named { name, args } => write!(f, "{name}[{}]", joined(args, ", ")),
+            TypeExpr::Function { params, ret } => write!(f, "({}) -> {ret}", joined(params, ", ")),
         }
-        f.write_str(")")
+    }
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Int(v) => write!(f, "{v}"),
+            Expr::Float(v) => write!(f, "{v:?}"),
+            Expr::Str(v) => write!(f, "{v:?}"),
+            Expr::Symbol(v) => write!(f, ":{v}"),
+            Expr::Bool(v) => write!(f, "{v}"),
+            Expr::Ident(v) => write!(f, "{v}"),
+            Expr::Unary(op, e) => write!(f, "({op} {e})"),
+            Expr::Binary(l, op, r) => write!(f, "({op} {l} {r})"),
+            Expr::Field(e, name) => write!(f, "(. {e} {name})"),
+            Expr::If(cond, then, otherwise) => write!(f, "(if {cond} {then} {otherwise})"),
+            Expr::Block(statements, tail, _) => write!(f, "(block{} {tail})", spaced(statements)),
+            Expr::List(items) => write!(f, "(list{})", spaced(items)),
+            Expr::Struct { name, base, fields } => {
+                write!(f, "({name}")?;
+                if let Some(base) = base {
+                    write!(f, " {base} |")?;
+                }
+                for (field, value) in fields {
+                    write!(f, " {field}: {value}")?;
+                }
+                f.write_str(")")
+            }
+            Expr::Call(callee, args) => write!(f, "(call {callee}{})", spaced(args)),
+            Expr::Case(value, arms) => write!(f, "(case {value}{})", spaced(arms)),
+        }
     }
 }
 
@@ -264,76 +325,6 @@ impl fmt::Display for Literal {
     }
 }
 
-impl fmt::Display for SeqDecl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "(sequence {} ({}){})",
-            self.name,
-            params(&self.params),
-            spaced(&self.body)
-        )
-    }
-}
-
-impl fmt::Display for Step {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            StepKind::Stmt(stmt) => write!(f, "{stmt}"),
-            StepKind::Set(target, field, value) => write!(f, "(set {target}.{field} {value})"),
-            StepKind::Over {
-                duration,
-                var,
-                body,
-            } => write!(
-                f,
-                "(over {duration} {}{})",
-                var.as_deref().unwrap_or("_"),
-                spaced(body)
-            ),
-        }
-    }
-}
-
-fn params(params: &[Param]) -> String {
-    let params: Vec<String> = params
-        .iter()
-        .map(|p| format!("{}: {}", p.name, p.ty))
-        .collect();
-    params.join(", ")
-}
-
-fn spaced(items: &[impl fmt::Display]) -> String {
-    items.iter().map(|item| format!(" {item}")).collect()
-}
-
-impl fmt::Display for TypeExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let list = |types: &[TypeExpr]| {
-            let shown: Vec<String> = types.iter().map(|t| t.to_string()).collect();
-            shown.join(", ")
-        };
-        match self {
-            TypeExpr::Named { name, args } if args.is_empty() => f.write_str(name),
-            TypeExpr::Named { name, args } => write!(f, "{name}[{}]", list(args)),
-            TypeExpr::Function { params, ret } => write!(f, "({}) -> {ret}", list(params)),
-        }
-    }
-}
-
-impl fmt::Display for FnDecl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "(fn {} ({}) -> {} {})",
-            self.name,
-            params(&self.params),
-            self.ret,
-            self.body
-        )
-    }
-}
-
 impl fmt::Display for UnaryOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -363,33 +354,11 @@ impl fmt::Display for BinaryOp {
     }
 }
 
-impl fmt::Display for Expr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Expr::Int(v) => write!(f, "{v}"),
-            Expr::Float(v) => write!(f, "{v:?}"),
-            Expr::Str(v) => write!(f, "{v:?}"),
-            Expr::Symbol(v) => write!(f, ":{v}"),
-            Expr::Bool(v) => write!(f, "{v}"),
-            Expr::Ident(v) => write!(f, "{v}"),
-            Expr::Unary(op, e) => write!(f, "({op} {e})"),
-            Expr::Binary(l, op, r) => write!(f, "({op} {l} {r})"),
-            Expr::Field(e, name) => write!(f, "(. {e} {name})"),
-            Expr::If(cond, then, otherwise) => write!(f, "(if {cond} {then} {otherwise})"),
-            Expr::Block(statements, tail, _) => write!(f, "(block{} {tail})", spaced(statements)),
-            Expr::List(items) => write!(f, "(list{})", spaced(items)),
-            Expr::Struct { name, base, fields } => {
-                write!(f, "({name}")?;
-                if let Some(base) = base {
-                    write!(f, " {base} |")?;
-                }
-                for (field, value) in fields {
-                    write!(f, " {field}: {value}")?;
-                }
-                f.write_str(")")
-            }
-            Expr::Call(callee, args) => write!(f, "(call {callee}{})", spaced(args)),
-            Expr::Case(value, arms) => write!(f, "(case {value}{})", spaced(arms)),
-        }
-    }
+fn joined(items: &[impl fmt::Display], separator: &str) -> String {
+    let shown: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+    shown.join(separator)
+}
+
+fn spaced(items: &[impl fmt::Display]) -> String {
+    items.iter().map(|item| format!(" {item}")).collect()
 }

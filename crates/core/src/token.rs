@@ -64,13 +64,3 @@ pub struct Token {
     pub lexeme: String,
     pub line: usize,
 }
-
-impl Token {
-    pub fn new(kind: TokenKind, lexeme: impl Into<String>, line: usize) -> Self {
-        Self {
-            kind,
-            lexeme: lexeme.into(),
-            line,
-        }
-    }
-}

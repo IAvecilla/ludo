@@ -43,10 +43,9 @@ impl Parser {
 
     fn pipe(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.term()?;
-        while self.matches(&[TokenKind::PipeGt]) {
-            let line = self.tokens[self.current - 1].line;
-            let right = self.term()?;
-            left = pipe_into(left, right, line)?;
+        while self.peek() == &TokenKind::PipeGt {
+            let line = self.advance().line;
+            left = pipe_into(left, self.term()?, line)?;
         }
         Ok(left)
     }
@@ -99,9 +98,9 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.primary()?;
         loop {
-            if self.matches(&[TokenKind::LParen]) {
+            if self.matches(TokenKind::LParen) {
                 expr = Expr::Call(Box::new(expr), self.arguments()?);
-            } else if self.matches(&[TokenKind::Dot]) {
+            } else if self.matches(TokenKind::Dot) {
                 expr = self.dot(expr)?;
             } else {
                 return Ok(expr);
