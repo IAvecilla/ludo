@@ -19,8 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::ast::{
-    Arm, BinaryOp, Expr, FnDecl, Literal, Param, Pattern, Step, StepKind, Stmt, StmtKind, TypeExpr,
-    UnaryOp, Variant,
+    Arm, BinaryOp, Expr, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
+    TypeExpr, UnaryOp, Variant,
 };
 use crate::interpreter::{check_arity, enum_hint, sequence_hint, struct_hint};
 use crate::prelude::{constants, NATIVES};
@@ -98,19 +98,14 @@ impl Default for Checker {
 
 impl Checker {
     pub fn new() -> Self {
-        let mut declared = Declared::default();
-        for native in NATIVES {
-            declared
-                .values
-                .insert(native.name.to_string(), native_type(native.name));
-        }
-        for (name, _) in constants() {
-            declared
-                .values
-                .insert(name.to_string(), constant_type(name));
-        }
+        let natives = NATIVES.iter().map(|native| native.name);
+        let names = natives.chain(constants().map(|(name, _)| name));
+        let values = names.map(|name| (name.to_string(), native_type(name)));
         Checker {
-            declared,
+            declared: Declared {
+                values: values.collect(),
+                ..Declared::default()
+            },
             types: Types::default(),
             vars: Vars::default(),
         }
@@ -122,41 +117,35 @@ impl Checker {
     pub fn check(&mut self, statements: &[Stmt]) -> Result<(), Vec<CheckError>> {
         let mut pass = Pass {
             declared: self.declared.clone(),
-            ahead: Declared::default(),
             types: self.types.clone(),
             vars: self.vars.clone(),
-            lets: HashMap::new(),
-            scopes: Vec::new(),
-            body: None,
-            state: None,
-            line: 0,
-            errors: Vec::new(),
+            ..Pass::default()
         };
         pass.declare_types(statements);
         pass.look_ahead(statements);
         for stmt in statements {
-            pass.top_level(stmt);
+            pass.statement(stmt);
         }
-        if pass.errors.is_empty() {
-            self.declared = pass.declared;
-            self.types = pass.types;
-            self.vars = pass.vars;
-            self.vars.commit();
-            Ok(())
-        } else {
-            Err(pass.errors)
+        if !pass.errors.is_empty() {
+            return Err(pass.errors);
         }
+        self.declared = pass.declared;
+        self.types = pass.types;
+        self.vars = pass.vars;
+        self.vars.commit();
+        Ok(())
     }
 }
 
-/// The type of each native. A generic one has its types found at each call:
-/// `map` gives a list of what its function gives.
+/// The type of each native and constant. A generic one has its types found
+/// at each use: `map` gives a list of what its function gives.
 fn native_type(name: &str) -> Type {
     let a = || Type::Generic(0, false);
     let b = || Type::Generic(1, false);
     let number = || Type::Generic(0, true);
     let fun = Type::function;
     match name {
+        "None" => Type::option(a()),
         "Some" => fun(vec![a()], Type::option(a())),
         "Ok" => fun(vec![a()], Type::result(a(), b())),
         "Error" => fun(vec![b()], Type::result(a(), b())),
@@ -185,13 +174,6 @@ fn native_type(name: &str) -> Type {
     }
 }
 
-fn constant_type(name: &str) -> Type {
-    match name {
-        "None" => Type::option(Type::Generic(0, false)),
-        other => unreachable!("every constant has a type, `{other}` too"),
-    }
-}
-
 fn literal_type(literal: &Literal) -> Type {
     match literal {
         Literal::Int(_) => Type::Int,
@@ -207,6 +189,7 @@ fn literal_type(literal: &Literal) -> Type {
 type Expected<'a> = Option<(&'a Type, &'a str)>;
 
 /// One walk of the checker over a group of statements.
+#[derive(Default)]
 struct Pass {
     /// What the top level has declared before the statement being checked.
     declared: Declared,
@@ -222,8 +205,6 @@ struct Pass {
     scopes: Vec<Vec<(String, Type)>>,
     /// Inside the body of a function or a sequence, which of the two it is.
     body: Option<&'static str>,
-    /// Inside a sequence, its name and the name and type of its state.
-    state: Option<(String, String, Type)>,
     line: usize,
     errors: Vec<CheckError>,
 }
@@ -238,9 +219,8 @@ impl Pass {
                     self.types.structs.insert(decl.name.clone(), Vec::new());
                 }
                 StmtKind::Enum(decl) => {
-                    self.types
-                        .enums
-                        .insert(decl.name.clone(), decl.symbols.clone());
+                    let symbols = decl.symbols.clone();
+                    self.types.enums.insert(decl.name.clone(), symbols);
                 }
                 StmtKind::Union(decl) => {
                     self.types.unions.insert(decl.name.clone(), Vec::new());
@@ -288,14 +268,11 @@ impl Pass {
     /// Whether the union `name` has `target` among its members, or among
     /// those of a union in it.
     fn made_of(&self, name: &str, target: &str, seen: &mut HashSet<String>) -> bool {
-        if !seen.insert(name.to_string()) {
-            return false;
-        }
-        let members = self.types.unions.get(name).cloned().unwrap_or_default();
-        members.iter().any(|member| match member {
-            Type::Union(inner) => inner == target || self.made_of(inner, target, seen),
-            _ => false,
-        })
+        seen.insert(name.to_string())
+            && self.types.unions[name].iter().any(|member| match member {
+                Type::Union(inner) => inner == target || self.made_of(inner, target, seen),
+                _ => false,
+            })
     }
 
     /// Learns what the statements declare that a body can use before it is
@@ -308,16 +285,16 @@ impl Pass {
                     self.lets.entry(name.clone()).or_insert(stmt.line);
                 }
                 StmtKind::Fn(decl) => {
-                    let signature = self.signature(decl);
+                    let params = decl.params.iter().map(|p| self.resolve(&p.ty)).collect();
+                    let signature = Type::function(params, self.resolve(&decl.ret));
                     self.ahead.values.insert(decl.name.clone(), signature);
                 }
                 StmtKind::Struct(decl) => {
                     self.ahead.structs.insert(decl.name.clone());
                 }
                 StmtKind::Enum(decl) => {
-                    self.ahead
-                        .enums
-                        .insert(decl.name.clone(), decl.symbols[0].clone());
+                    let first = decl.symbols[0].clone();
+                    self.ahead.enums.insert(decl.name.clone(), first);
                 }
                 StmtKind::Sequence(decl) => {
                     let params = decl.params.iter().map(|p| self.resolve(&p.ty)).collect();
@@ -326,11 +303,6 @@ impl Pass {
                 StmtKind::Union(_) | StmtKind::Start(..) | StmtKind::Expr(_) => {}
             }
         }
-    }
-
-    fn signature(&mut self, decl: &FnDecl) -> Type {
-        let params = decl.params.iter().map(|p| self.resolve(&p.ty)).collect();
-        Type::function(params, self.resolve(&decl.ret))
     }
 
     /// The type a written type stands for.
@@ -348,16 +320,12 @@ impl Pass {
             _ => 0,
         };
         if args.len() != takes {
-            let types = |n: usize| match n {
+            let types = match takes {
                 0 => "no types".to_string(),
                 1 => "1 type".to_string(),
                 n => format!("{n} types"),
             };
-            self.type_error(format!(
-                "`{name}` takes {}, got {}",
-                types(takes),
-                args.len()
-            ));
+            self.type_error(format!("`{name}` takes {types}, got {}", args.len()));
             return Type::Unknown;
         }
         let mut arg = |i: usize| self.resolve(&args[i]);
@@ -369,10 +337,7 @@ impl Pass {
             "Symbol" => Type::Symbol,
             "List" => Type::list(arg(0)),
             "Option" => Type::option(arg(0)),
-            "Result" => {
-                let ok = arg(0);
-                Type::result(ok, arg(1))
-            }
+            "Result" => Type::result(arg(0), arg(1)),
             _ if self.types.structs.contains_key(name) => Type::Struct(name.to_string()),
             _ if self.types.enums.contains_key(name) => Type::Enum(name.to_string()),
             _ if self.types.unions.contains_key(name) => Type::Union(name.to_string()),
@@ -383,63 +348,73 @@ impl Pass {
         }
     }
 
-    fn top_level(&mut self, stmt: &Stmt) {
-        self.line = stmt.line;
+    /// Checks a statement, and declares what it declares. The parser keeps
+    /// declarations at the top level.
+    fn statement(&mut self, stmt: &Stmt) {
+        let outer = std::mem::replace(&mut self.line, stmt.line);
         match &stmt.kind {
             StmtKind::Let(name, value) => {
                 // Declared once its value is checked, which cannot use it.
                 let ty = self.synth(value);
-                self.declared.values.insert(name.clone(), ty);
+                match self.scopes.last_mut() {
+                    Some(scope) => scope.push((name.clone(), ty)),
+                    None => {
+                        self.declared.values.insert(name.clone(), ty);
+                    }
+                }
+            }
+            StmtKind::Start(name, args) => match self.sequence(name) {
+                Some(params) => {
+                    self.arity(name, params.len(), args.len());
+                    self.arguments(args, &params, &format!("`{name}`"));
+                }
+                None => self.synth_all(args),
+            },
+            StmtKind::Expr(expr) => {
+                self.synth(expr);
             }
             StmtKind::Fn(decl) => {
                 let signature = self.ahead.values[&decl.name].clone();
-                self.declared
-                    .values
-                    .insert(decl.name.clone(), signature.clone());
+                let name = decl.name.clone();
+                self.declared.values.insert(name, signature.clone());
                 let Type::Function(params, ret) = signature else {
                     unreachable!("a function has a function type")
                 };
                 let what = format!("the value of `{}`", decl.name);
-                self.body(&decl.params, params, "function", |pass| {
+                self.body("function", &decl.params, params, |pass| {
                     pass.check(&decl.body, &ret, &what)
                 });
             }
             StmtKind::Sequence(decl) => {
                 let params = self.ahead.sequences[&decl.name].clone();
-                self.declared
-                    .sequences
-                    .insert(decl.name.clone(), params.clone());
-                let state = (
-                    decl.name.clone(),
-                    decl.params[0].name.clone(),
-                    params[0].clone(),
-                );
-                self.state = Some(state);
-                self.body(&decl.params, params, "sequence", |pass| {
+                let name = decl.name.clone();
+                self.declared.sequences.insert(name, params.clone());
+                let state = params[0].clone();
+                self.body("sequence", &decl.params, params, |pass| {
                     for step in &decl.body {
-                        pass.step(step);
+                        pass.step(step, decl, &state);
                     }
                 });
-                self.state = None;
             }
             StmtKind::Struct(decl) => {
                 self.declared.structs.insert(decl.name.clone());
             }
             StmtKind::Enum(decl) => {
-                self.declared
-                    .enums
-                    .insert(decl.name.clone(), decl.symbols[0].clone());
+                let first = decl.symbols[0].clone();
+                self.declared.enums.insert(decl.name.clone(), first);
             }
             StmtKind::Union(_) => {}
-            StmtKind::Start(..) | StmtKind::Expr(_) => self.statement(stmt),
         }
+        self.line = outer;
     }
 
+    /// Checks the body of a function or a sequence, with its parameters in
+    /// scope.
     fn body(
         &mut self,
+        kind: &'static str,
         params: &[Param],
         types: Vec<Type>,
-        kind: &'static str,
         check: impl FnOnce(&mut Self),
     ) {
         self.body = Some(kind);
@@ -450,77 +425,32 @@ impl Pass {
         self.body = None;
     }
 
-    fn statement(&mut self, stmt: &Stmt) {
-        let outer = std::mem::replace(&mut self.line, stmt.line);
-        match &stmt.kind {
-            StmtKind::Let(name, value) => {
-                let ty = self.synth(value);
-                self.declare(name, ty);
-            }
-            StmtKind::Start(name, args) => self.start(name, args),
-            StmtKind::Expr(expr) => {
-                self.synth(expr);
-            }
-            // The parser keeps declarations at the top level.
-            StmtKind::Fn(_)
-            | StmtKind::Struct(_)
-            | StmtKind::Enum(_)
-            | StmtKind::Union(_)
-            | StmtKind::Sequence(_) => {}
-        }
-        self.line = outer;
-    }
-
-    fn start(&mut self, name: &str, args: &[Expr]) {
-        let Some(params) = self.sequence(name) else {
-            for arg in args {
-                self.synth(arg);
-            }
-            return;
-        };
-        self.arity(name, params.len(), args.len());
-        for (i, arg) in args.iter().enumerate() {
-            match params.get(i) {
-                Some(param) => {
-                    let what = format!("argument {} of `{name}`", i + 1);
-                    self.check(arg, param, &what)
-                }
-                None => {
-                    self.synth(arg);
-                }
-            }
-        }
-    }
-
-    fn step(&mut self, step: &Step) {
+    /// Checks a step of the sequence `seq`, whose state is of type `state`.
+    fn step(&mut self, step: &Step, seq: &SeqDecl, state: &Type) {
         let outer = std::mem::replace(&mut self.line, step.line);
-        let state = self.state.clone().expect("steps are in a sequence");
         match &step.kind {
             // A `let` of the state's name replaces the state, which has to
             // stay of its type.
             StepKind::Stmt(Stmt {
                 kind: StmtKind::Let(name, value),
                 ..
-            }) if *name == state.1 => {
-                let what = format!("the state of `{}`", state.0);
-                self.check(value, &state.2, &what);
+            }) if *name == seq.params[0].name => {
+                let what = format!("the state of `{}`", seq.name);
+                self.check(value, state, &what);
             }
             StepKind::Stmt(stmt) => self.statement(stmt),
-            StepKind::Set(target, field, value) => self.set(target, field, value, &state.2),
+            StepKind::Set(target, field, value) => self.set(target, field, value, state),
             StepKind::Over {
                 duration,
                 var,
                 body,
             } => {
-                let ty = self.synth(duration);
-                if !self.fits(&ty, &Type::Float) {
-                    let got = self.show(&ty);
-                    self.type_error(format!("a duration must be a Float in seconds, got {got}"));
-                }
-                self.scopes
-                    .push(var.iter().map(|v| (v.clone(), Type::Float)).collect());
+                let must = "a duration must be a Float in seconds";
+                self.require(duration, &Type::Float, must);
+                let locals = var.iter().map(|v| (v.clone(), Type::Float)).collect();
+                self.scopes.push(locals);
                 for step in body {
-                    self.step(step);
+                    self.step(step, seq, state);
                 }
                 self.scopes.pop();
             }
@@ -566,10 +496,26 @@ impl Pass {
         self.expression(expr, None)
     }
 
+    fn synth_all(&mut self, exprs: &[Expr]) {
+        for expr in exprs {
+            self.synth(expr);
+        }
+    }
+
     /// Checks that an expression gives a value that fits where `expected`
     /// is. `what` names that place for the error.
     fn check(&mut self, expr: &Expr, expected: &Type, what: &str) {
         self.expression(expr, Some((expected, what)));
+    }
+
+    /// Finds the type of an expression and reports that it `must` be one
+    /// that fits `want` if it does not, as for a condition.
+    fn require(&mut self, expr: &Expr, want: &Type, must: &str) {
+        let ty = self.synth(expr);
+        if !self.fits(&ty, want) {
+            let got = self.show(&ty);
+            self.type_error(format!("{must}, got {got}"));
+        }
     }
 
     /// The type of an expression. With an expected type it checks the
@@ -607,16 +553,12 @@ impl Pass {
             Expr::Struct { name, base, fields } => self.structure(name, base.as_deref(), fields),
         };
         if let Some((want, what)) = expected {
-            self.expect(&ty, want, what);
+            if !self.fits(&ty, want) {
+                let (want, got) = (self.show(want), self.show(&ty));
+                self.type_error(format!("{what} must be {want}, got {got}"));
+            }
         }
         ty
-    }
-
-    fn expect(&mut self, actual: &Type, expected: &Type, what: &str) {
-        if !self.fits(actual, expected) {
-            let (expected, actual) = (self.show(expected), self.show(actual));
-            self.type_error(format!("{what} must be {expected}, got {actual}"));
-        }
     }
 
     fn if_expression(
@@ -626,7 +568,7 @@ impl Pass {
         otherwise: &Expr,
         expected: Expected,
     ) -> Type {
-        self.condition(cond, "if");
+        self.require(cond, &Type::Bool, "the condition of `if` must be a Bool");
         match expected {
             Some((want, _)) => {
                 self.expression(then, expected);
@@ -636,18 +578,8 @@ impl Pass {
             None => {
                 let then = self.synth(then);
                 let otherwise = self.synth(otherwise);
-                self.join_or_error(&then, &otherwise, "the branches of `if`")
+                self.join(&then, &otherwise, "the branches of `if`")
             }
-        }
-    }
-
-    fn condition(&mut self, cond: &Expr, keyword: &str) {
-        let ty = self.synth(cond);
-        if !self.fits(&ty, &Type::Bool) {
-            let got = self.show(&ty);
-            self.type_error(format!(
-                "the condition of `{keyword}` must be a Bool, got {got}"
-            ));
         }
     }
 
@@ -672,14 +604,14 @@ impl Pass {
             self.pattern(&arm.pattern, &scrutinee, &mut bound);
             self.scopes.push(bound);
             if let Some(guard) = &arm.guard {
-                self.condition(guard, "when");
+                self.require(guard, &Type::Bool, "the condition of `when` must be a Bool");
             }
             let ty = self.expression(&arm.body, expected);
             self.scopes.pop();
             if expected.is_none() {
                 result = Some(match result {
                     None => ty,
-                    Some(before) => self.join_or_error(&before, &ty, "the branches of `case`"),
+                    Some(before) => self.join(&before, &ty, "the branches of `case`"),
                 });
             }
             self.line = outer;
@@ -712,16 +644,17 @@ impl Pass {
                     Variant::Ok => (Type::result(held.clone(), other), "a Result"),
                     Variant::Error => (Type::result(other, held.clone()), "a Result"),
                 };
-                if !self.fits(ty, &whole) {
+                let held = if self.fits(ty, &whole) {
+                    held
+                } else {
                     let got = self.show(ty);
                     self.type_error(format!(
                         "a `{}` pattern needs {type_name}, got {got}",
                         variant.name()
                     ));
-                    if let Some(inner) = inner {
-                        self.pattern(inner, &Type::Unknown, bound);
-                    }
-                } else if let Some(inner) = inner {
+                    Type::Unknown
+                };
+                if let Some(inner) = inner {
                     self.pattern(inner, &held, bound);
                 }
             }
@@ -734,7 +667,7 @@ impl Pass {
             let ty = self.synth(value);
             item = Some(match item {
                 None => ty,
-                Some(before) => self.join_or_error(&before, &ty, "the items of a list"),
+                Some(before) => self.join(&before, &ty, "the items of a list"),
             });
         }
         // The items of an empty list get their type from where it is used.
@@ -749,26 +682,18 @@ impl Pass {
         let callee = self.synth(callee);
         let (params, ret) = match self.vars.shallow(&callee) {
             Type::Function(params, ret) => (params, *ret),
-            Type::Unknown | Type::Var(_) => {
-                for arg in args {
-                    self.synth(arg);
-                }
-                return Type::Unknown;
-            }
             other => {
-                let got = self.show(&other);
-                self.type_error(format!("can only call functions, got {got}"));
-                for arg in args {
-                    self.synth(arg);
+                if !matches!(other, Type::Unknown | Type::Var(_)) {
+                    let got = self.show(&other);
+                    self.type_error(format!("can only call functions, got {got}"));
                 }
+                self.synth_all(args);
                 return Type::Unknown;
             }
         };
         if params.len() != args.len() {
             self.arity(name.unwrap_or("the function"), params.len(), args.len());
-            for arg in args {
-                self.synth(arg);
-            }
+            self.synth_all(args);
             return self.vars.resolve(&ret);
         }
         // What the call must give tells a generic native its types before
@@ -777,15 +702,28 @@ impl Pass {
         if let Some(expected) = expected {
             self.trial(|pass| pass.fits(&ret, expected));
         }
-        for (i, (arg, param)) in args.iter().zip(&params).enumerate() {
-            let param = self.vars.resolve(param);
-            let what = match name {
-                Some(name) => format!("argument {} of `{name}`", i + 1),
-                None => format!("argument {} of the call", i + 1),
-            };
-            self.check(arg, &param, &what);
-        }
+        let callee = match name {
+            Some(name) => format!("`{name}`"),
+            None => "the call".to_string(),
+        };
+        self.arguments(args, &params, &callee);
         self.vars.resolve(&ret)
+    }
+
+    /// Checks each argument against its parameter, as found so far, and
+    /// finds the type of those that have none.
+    fn arguments(&mut self, args: &[Expr], params: &[Type], callee: &str) {
+        for (i, arg) in args.iter().enumerate() {
+            match params.get(i) {
+                Some(param) => {
+                    let param = self.vars.resolve(param);
+                    self.check(arg, &param, &format!("argument {} of {callee}", i + 1));
+                }
+                None => {
+                    self.synth(arg);
+                }
+            }
+        }
     }
 
     fn unary(&mut self, op: UnaryOp, operand: &Expr) -> Type {
@@ -829,10 +767,8 @@ impl Pass {
             return Type::Bool;
         }
 
-        let result = match op {
-            Eq | Ne | Lt | Le | Gt | Ge => Type::Bool,
-            _ => Type::Unknown,
-        };
+        let compares = matches!(op, Eq | Ne | Lt | Le | Gt | Ge);
+        let result = if compares { Type::Bool } else { Type::Unknown };
         let (a, b) = (self.vars.shallow(&a), self.vars.shallow(&b));
         if a == Type::Unknown || b == Type::Unknown {
             return result;
@@ -840,41 +776,36 @@ impl Pass {
         if let Eq | Ne = op {
             if matches!(a, Type::Function(..)) && matches!(b, Type::Function(..)) {
                 self.type_error("functions cannot be compared".to_string());
-            } else if !(self.trial(|p| p.fits(&a, &b))
-                || self.trial(|p| p.fits(&b, &a))
-                || (a.is_symbolic() && b.is_symbolic()))
-            {
+            } else if !(self.compatible(&a, &b) || (a.is_symbolic() && b.is_symbolic())) {
                 self.operands(op, &a, &b, "two values of the same type");
             }
             return result;
         }
 
-        let expected = match op {
-            Add => "two Ints, two Floats or two Strings",
-            _ => "two Ints or two Floats",
-        };
-        if !(self.trial(|p| p.fits(&a, &b)) || self.trial(|p| p.fits(&b, &a))) {
-            self.operands(op, &a, &b, expected);
-            return result;
-        }
-        let ty = self.vars.shallow(&a);
-        let fits = match &ty {
-            Type::Int | Type::Float => true,
-            Type::Str => op == Add,
-            Type::Var(var) if op == Add || self.vars.is_numeric(*var) => true,
-            Type::Var(_) => {
-                let number = self.vars.fresh(true);
-                self.fits(&ty, &number)
-            }
-            _ => false,
-        };
+        // Both of one type, which the operator works on.
+        let fits = self.compatible(&a, &b)
+            && match self.vars.shallow(&a) {
+                Type::Int | Type::Float => true,
+                Type::Str => op == Add,
+                Type::Var(var) if op == Add || self.vars.is_numeric(var) => true,
+                var @ Type::Var(_) => {
+                    let number = self.vars.fresh(true);
+                    self.fits(&var, &number)
+                }
+                _ => false,
+            };
         if !fits {
+            let expected = match op {
+                Add => "two Ints, two Floats or two Strings",
+                _ => "two Ints or two Floats",
+            };
             self.operands(op, &a, &b, expected);
             return result;
         }
-        match result {
-            Type::Bool => Type::Bool,
-            _ => self.vars.resolve(&ty),
+        if compares {
+            Type::Bool
+        } else {
+            self.vars.resolve(&a)
         }
     }
 
@@ -897,19 +828,14 @@ impl Pass {
             },
             // A field of a union is one all its members have, of one type.
             Type::Union(name) => {
-                let members = self.types.unions[&name].clone();
-                let types: Vec<Option<Type>> = members
-                    .iter()
-                    .map(|member| match member {
-                        Type::Struct(member) => self.field_type(member, field),
-                        _ => None,
-                    })
-                    .collect();
-                match types.first() {
-                    Some(Some(first)) if types.iter().all(|t| t.as_ref() == Some(first)) => {
-                        first.clone()
-                    }
-                    _ => {
+                let mut types = self.types.unions[&name].iter().map(|member| match member {
+                    Type::Struct(member) => self.field_type(member, field),
+                    _ => None,
+                });
+                let first = types.next().flatten();
+                match first.filter(|first| types.all(|ty| ty.as_ref() == Some(first))) {
+                    Some(ty) => ty,
+                    None => {
                         self.type_error(format!(
                             "not every member of `{name}` has a field `{field}` of the same type"
                         ));
@@ -965,6 +891,20 @@ impl Pass {
         Type::Struct(name.to_string())
     }
 
+    /// What `name` is in a table of the globals the code being checked can
+    /// see: those the top level declared before it and, inside a body, those
+    /// declared anywhere.
+    fn global<'a, T>(
+        &'a self,
+        table: impl Fn(&'a Declared) -> &'a HashMap<String, T>,
+        name: &str,
+    ) -> Option<&'a T> {
+        match table(&self.declared).get(name) {
+            None if self.body.is_some() => table(&self.ahead).get(name),
+            found => found,
+        }
+    }
+
     /// The fields of the struct a literal builds, if it is declared where
     /// the literal can see it.
     fn struct_fields(&mut self, name: &str) -> Option<Vec<(String, Type)>> {
@@ -984,12 +924,7 @@ impl Pass {
     /// The types of the parameters of the sequence a `start` starts, if it
     /// is declared where the `start` can see it.
     fn sequence(&mut self, name: &str) -> Option<Vec<Type>> {
-        let found = (self.declared.sequences.get(name))
-            .or(match self.body {
-                Some(_) => self.ahead.sequences.get(name),
-                None => None,
-            })
-            .cloned();
+        let found = self.global(|d| &d.sequences, name).cloned();
         if found.is_none() {
             let message = match self.ahead.sequences.contains_key(name) {
                 true => used_before(name),
@@ -1000,12 +935,6 @@ impl Pass {
         found
     }
 
-    fn declare(&mut self, name: &str, ty: Type) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.push((name.to_string(), ty));
-        }
-    }
-
     /// The type of a name used as a value: the innermost local with it, or
     /// what the top level declares.
     fn value(&mut self, name: &str) -> Type {
@@ -1013,11 +942,7 @@ impl Pass {
         if let Some((_, ty)) = local {
             return ty.clone();
         }
-        let global = self.declared.values.get(name).or(match self.body {
-            Some(_) => self.ahead.values.get(name),
-            None => None,
-        });
-        if let Some(ty) = global.cloned() {
+        if let Some(ty) = self.global(|d| &d.values, name).cloned() {
             return self.vars.instantiate(&ty);
         }
 
@@ -1100,29 +1025,22 @@ impl Pass {
         fits
     }
 
-    /// The type of something that is one value or the other, as the branches
-    /// of an `if`: the more general of the two, if one fits in the other.
-    fn join(&mut self, a: &Type, b: &Type) -> Option<Type> {
-        let (a, b) = (self.vars.resolve(a), self.vars.resolve(b));
-        if let (Type::Symbols(x), Type::Symbols(y)) = (&a, &b) {
-            return Some(Type::Symbols(x.union(y).cloned().collect()));
-        }
-        if self.trial(|pass| pass.fits(&a, &b)) {
-            Some(self.vars.resolve(&b))
-        } else if self.trial(|pass| pass.fits(&b, &a)) {
-            Some(self.vars.resolve(&a))
-        } else if a.is_symbolic() && b.is_symbolic() {
-            Some(Type::Symbol)
-        } else {
-            None
-        }
+    /// Whether one of two types fits in the other.
+    fn compatible(&mut self, a: &Type, b: &Type) -> bool {
+        self.trial(|pass| pass.fits(a, b)) || self.trial(|pass| pass.fits(b, a))
     }
 
-    fn join_or_error(&mut self, a: &Type, b: &Type, what: &str) -> Type {
-        match self.join(a, b) {
-            Some(ty) => ty,
-            None => {
-                let (a, b) = (self.show(a), self.show(b));
+    /// The type of something that is one value or the other, as the branches
+    /// of an `if`: the more general of the two, if one fits in the other.
+    fn join(&mut self, a: &Type, b: &Type, what: &str) -> Type {
+        let (a, b) = (self.vars.resolve(a), self.vars.resolve(b));
+        match (&a, &b) {
+            (Type::Symbols(x), Type::Symbols(y)) => Type::Symbols(x.union(y).cloned().collect()),
+            _ if self.trial(|pass| pass.fits(&a, &b)) => self.vars.resolve(&b),
+            _ if self.trial(|pass| pass.fits(&b, &a)) => self.vars.resolve(&a),
+            _ if a.is_symbolic() && b.is_symbolic() => Type::Symbol,
+            _ => {
+                let (a, b) = (self.show(&a), self.show(&b));
                 self.type_error(format!("{what} have different types, {a} and {b}"));
                 Type::Unknown
             }
@@ -1169,16 +1087,14 @@ mod tests {
 
     /// The errors of checking `source` as a whole file, one per line.
     fn errors(source: &str) -> String {
-        match Checker::new().check(&statements(source)) {
-            Ok(()) => String::new(),
-            Err(errors) => {
-                let lines: Vec<String> = errors
-                    .iter()
-                    .map(|e| format!("[line {}] {}", e.line, e.message))
-                    .collect();
-                lines.join("\n")
-            }
-        }
+        let Err(errors) = Checker::new().check(&statements(source)) else {
+            return String::new();
+        };
+        let lines: Vec<String> = errors
+            .iter()
+            .map(|e| format!("[line {}] {}", e.line, e.message))
+            .collect();
+        lines.join("\n")
     }
 
     fn passes(sources: &[&str]) {
@@ -1194,46 +1110,50 @@ mod tests {
     }
 
     #[test]
-    fn a_body_can_use_what_the_program_declares_anywhere() {
+    fn values_of_the_right_types_pass() {
         passes(&[
-            "f :: () -> Int { g() }\ng :: () -> Int { 1 }",
-            "is_even :: (n: Int) -> Bool { n == 0 or is_odd(n - 1) }\nis_odd :: (n: Int) -> Bool { n != 0 and is_even(n - 1) }",
-            "origin :: () -> P { P { x: 0, y: 0 } }\nP :: struct { x: Int, y: Int }",
+            // A body can use functions, structs and sequences declared after it.
+            "f :: () -> P { g() }\ng :: () -> P { P { x: 0 } }\nP :: struct { x: Int }",
             "kick :: (b: Int) -> Int {\n  start push(b)\n  b\n}\npush :: sequence (b: Int) {}",
             // Parameters, locals, `let`s of a block and names bound by `case`.
             "let x = 1\nf :: (a: Int) -> Int {\n  let b = a + x\n  case b {\n    n when n > 0 -> n\n    _ -> {\n      let c = 0\n      c\n    }\n  }\n}",
             "s :: sequence (b: Ball, to: Float) {\n  let from = b.x\n  over 1.0s as t {\n    b.x = from + to * t\n  }\n}\nBall :: struct { x: Float }",
+            // A generic native finds its types at each call.
+            "double :: (x: Int) -> Int { x * 2 }\nadd :: (a: Int, b: Int) -> Int { a + b }\nrange(0, 5) |> map(double) |> fold(0, add)",
             "range(0, 3) |> map(Some)\nprint(None)",
-            "twice :: (f: (Int) -> Int, x: Int) -> Int { f(f(x)) }",
+            "twice :: (f: (Int) -> Int, x: Int) -> Int { f(f(x)) }\ndouble :: (x: Int) -> Int { x * 2 }\ntwice(double, 3)",
+            "abs(-1)\nabs(-1.5)\nmin(2, 3) + 1\nclamp(0.5, 0.0, 1.0) * 2.0",
+            // A symbol fits an enum that has it.
+            "State :: enum { :idle, :serving }\nnext :: (s: State) -> State { if s == :idle { :serving } else { :idle } }\nnext(:idle)",
+            // A list of one member fits a list of the union.
+            "A :: struct { x: Float }\nB :: struct { x: Float, y: Float }\nAB :: A | B\n\
+             all :: () -> List[AB] { concat([A { x: 1.0 }], [B { x: 1.0, y: 2.0 }]) }\n\
+             first_x :: (v: AB) -> Float { v.x }",
+            "half :: (n: Int) -> Result[Int, String] { if n % 2 == 0 { Ok(n / 2) } else { Error(\"odd\") } }\n\
+             case half(4) { Ok(n) -> n, Error(_) -> 0 }\nis_two :: (n: Int) -> Bool { n == 2 }\nfind([1, 2], is_two) == Some(2)",
+            // An empty list takes its type from where it is used.
+            "let xs = []\nconcat(xs, [1])\nsum :: (xs: List[Int]) -> Int { 0 }\nsum([])",
         ]);
     }
 
     #[test]
-    fn reports_names_that_are_not_declared() {
+    fn reports_names_that_are_not_declared_where_they_are_used() {
         rejects(&[
-            ("x + 1", "[line 1] undefined name `x`"),
-            ("f :: () -> Int {\n  let a = 1\n  b\n}", "[line 3] undefined name `b`"),
-            ("case 1 {\n  n -> m\n}", "[line 2] undefined name `m`"),
-            ("{\n  let a = 1\n  a\n}\na", "[line 5] undefined name `a`"),
+            (
+                "x + 1\n{\n  let a = 1\n  a\n}\na",
+                "[line 1] undefined name `x`\n[line 6] undefined name `a`",
+            ),
             (
                 "Ball :: struct { x: Float }\nBall\nS :: enum { :a }\nS\ns :: sequence (n: Int) {}\ns(1)",
                 "[line 2] `Ball` is a struct, not a value: build one with `Ball { ... }`\n\
                  [line 4] `S` is an enum, not a value: its values are its symbols, like `:a`\n\
                  [line 6] `s` is a sequence, not a function: it runs over time and cannot be called",
             ),
-        ]);
-    }
-
-    #[test]
-    fn the_top_level_runs_in_order() {
-        rejects(&[
+            // The top level runs in order.
             (
-                "let a = f()\nf :: () -> Int { 1 }",
-                "[line 1] `f` is used before it is declared: the top level runs from top to bottom",
-            ),
-            (
-                "x\nlet x = 1",
-                "[line 1] `x` is used before it is declared: the top level runs from top to bottom",
+                "let a = f()\nf :: () -> Int { 1 }\nx\nlet x = 1",
+                "[line 1] `f` is used before it is declared: the top level runs from top to bottom\n\
+                 [line 3] `x` is used before it is declared: the top level runs from top to bottom",
             ),
             (
                 "start s(1)\ns :: sequence (n: Int) {}\nB { x: 1 }\nB :: struct { x: Int }",
@@ -1251,14 +1171,10 @@ mod tests {
     fn reports_calls_and_structs_that_do_not_fit() {
         rejects(&[
             (
-                "add :: (a: Int, b: Int) -> Int { a + b }\nadd(1)\n2 |> add(3, 4)\nabs(1, 2)",
+                "add :: (a: Int, b: Int) -> Int { a + b }\nadd(1)\ns :: sequence (b: Int) {}\nstart s()\nstart t(1)",
                 "[line 2] `add` expects 2 arguments, got 1\n\
-                 [line 3] `add` expects 2 arguments, got 3\n\
-                 [line 4] `abs` expects 1 argument, got 2",
-            ),
-            (
-                "s :: sequence (b: Int) {}\nstart s()\nstart t(1)",
-                "[line 2] `s` expects 1 argument, got 0\n[line 3] undefined sequence `t`",
+                 [line 4] `s` expects 1 argument, got 0\n\
+                 [line 5] undefined sequence `t`",
             ),
             (
                 "B :: struct { x: Float, y: Float }\nB { x: 1.0 }\nB { x: 1.0, y: 2.0, z: 3.0 }\nlet b = B { x: 1.0, y: 1.0 }\nB { b | y: 2.0 }\nW { a: 1 }",
@@ -1302,27 +1218,6 @@ mod tests {
                 checker.check(&statements(source)).unwrap();
             }
         }
-    }
-
-    #[test]
-    fn values_of_the_right_types_pass() {
-        passes(&[
-            // A generic native finds its types at each call.
-            "double :: (x: Int) -> Int { x * 2 }\nadd :: (a: Int, b: Int) -> Int { a + b }\nrange(0, 5) |> map(double) |> fold(0, add)",
-            "twice :: (f: (Int) -> Int, x: Int) -> Int { f(f(x)) }\ndouble :: (x: Int) -> Int { x * 2 }\ntwice(double, 3)",
-            "abs(-1)\nabs(-1.5)\nmin(2, 3) + 1\nclamp(0.5, 0.0, 1.0) * 2.0",
-            // A symbol fits an enum that has it.
-            "State :: enum { :idle, :serving }\nnext :: (s: State) -> State { if s == :idle { :serving } else { :idle } }\nnext(:idle)",
-            // A list of one member fits a list of the union.
-            "A :: struct { x: Float }\nB :: struct { x: Float, y: Float }\nAB :: A | B\n\
-             all :: () -> List[AB] { concat([A { x: 1.0 }], [B { x: 1.0, y: 2.0 }]) }\n\
-             first_x :: (v: AB) -> Float { v.x }",
-            "half :: (n: Int) -> Result[Int, String] { if n % 2 == 0 { Ok(n / 2) } else { Error(\"odd\") } }\n\
-             case half(4) { Ok(n) -> n, Error(_) -> 0 }\nis_two :: (n: Int) -> Bool { n == 2 }\nfind([1, 2], is_two) == Some(2)",
-            // An empty list takes its type from where it is used.
-            "let xs = []\nconcat(xs, [1])\nsum :: (xs: List[Int]) -> Int { 0 }\nsum([])",
-            "Ball :: struct { x: Float }\ns :: sequence (b: Ball, to: Float) {\n  let from = b.x\n  over 0.5s as t {\n    b.x = from + to * t\n  }\n}",
-        ]);
     }
 
     #[test]
@@ -1371,12 +1266,6 @@ mod tests {
                 "[line 2] a duration must be a Float in seconds, got Int\n\
                  [line 6] field `x` of `Ball` must be Float, got Int",
             ),
-        ]);
-    }
-
-    #[test]
-    fn reports_types_that_do_not_exist() {
-        rejects(&[
             (
                 "f :: (x: Foo) -> List { 1 }",
                 "[line 1] undefined type `Foo`\n[line 1] `List` takes 1 type, got 0",

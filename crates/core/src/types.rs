@@ -58,14 +58,27 @@ impl Type {
     pub fn is_symbolic(&self) -> bool {
         matches!(self, Type::Symbol | Type::Symbols(_) | Type::Enum(_))
     }
+
+    /// The same type with `f` applied to each type it is made of.
+    fn map(&self, mut f: impl FnMut(&Type) -> Type) -> Type {
+        match self {
+            Type::List(item) => Type::list(f(item)),
+            Type::Option(item) => Type::option(f(item)),
+            Type::Result(ok, error) => {
+                let ok = f(ok);
+                Type::result(ok, f(error))
+            }
+            Type::Function(params, ret) => {
+                let params = params.iter().map(&mut f).collect();
+                Type::function(params, f(ret))
+            }
+            other => other.clone(),
+        }
+    }
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let list = |types: &[Type]| {
-            let shown: Vec<String> = types.iter().map(|t| t.to_string()).collect();
-            shown.join(", ")
-        };
         match self {
             Type::Int => f.write_str("Int"),
             Type::Float => f.write_str("Float"),
@@ -80,7 +93,10 @@ impl fmt::Display for Type {
             Type::List(item) => write!(f, "List[{item}]"),
             Type::Option(item) => write!(f, "Option[{item}]"),
             Type::Result(ok, error) => write!(f, "Result[{ok}, {error}]"),
-            Type::Function(params, ret) => write!(f, "({}) -> {ret}", list(params)),
+            Type::Function(params, ret) => {
+                let params: Vec<String> = params.iter().map(Type::to_string).collect();
+                write!(f, "({}) -> {ret}", params.join(", "))
+            }
             Type::Generic(..) | Type::Var(_) | Type::Unknown => f.write_str("_"),
         }
     }
@@ -132,8 +148,7 @@ impl Vars {
     /// Undoes every change since the snapshot, and drops the variables made
     /// after it.
     pub fn rollback(&mut self, snapshot: Snapshot) {
-        while self.trail.len() > snapshot.trail {
-            let (var, slot) = self.trail.pop().expect("the trail is longer");
+        for (var, slot) in self.trail.drain(snapshot.trail..).rev() {
             self.slots[var] = slot;
         }
         self.slots.truncate(snapshot.slots);
@@ -144,9 +159,10 @@ impl Vars {
         self.trail.clear();
     }
 
-    fn set(&mut self, var: usize, slot: Slot) {
-        let before = std::mem::replace(&mut self.slots[var], slot);
-        self.trail.push((var, before));
+    /// Changes a variable, keeping on the trail what it was.
+    fn change(&mut self, var: usize, change: impl FnOnce(&mut Slot)) {
+        self.trail.push((var, self.slots[var].clone()));
+        change(&mut self.slots[var]);
     }
 
     /// A type with the variables found so far put in, all the way down.
@@ -156,14 +172,7 @@ impl Vars {
                 Some(bound) => self.resolve(bound),
                 None => ty.clone(),
             },
-            Type::List(item) => Type::list(self.resolve(item)),
-            Type::Option(item) => Type::option(self.resolve(item)),
-            Type::Result(ok, error) => Type::result(self.resolve(ok), self.resolve(error)),
-            Type::Function(params, ret) => Type::function(
-                params.iter().map(|p| self.resolve(p)).collect(),
-                self.resolve(ret),
-            ),
-            other => other.clone(),
+            _ => ty.map(|part| self.resolve(part)),
         }
     }
 
@@ -174,7 +183,7 @@ impl Vars {
                 Some(bound) => self.shallow(bound),
                 None => ty.clone(),
             },
-            other => other.clone(),
+            _ => ty.clone(),
         }
     }
 
@@ -182,43 +191,18 @@ impl Vars {
     /// only takes an Int, a Float or another variable, and none takes a type
     /// that has itself inside.
     pub fn bind(&mut self, var: usize, ty: Type) -> bool {
-        match ty {
-            Type::Var(other) if other == var => true,
-            Type::Var(other) => {
-                if self.slots[var].numeric && !self.slots[other].numeric {
-                    self.set(
-                        other,
-                        Slot {
-                            bound: None,
-                            numeric: true,
-                        },
-                    );
-                }
-                self.bind_slot(var, Type::Var(other));
-                true
-            }
-            Type::Int | Type::Float | Type::Unknown => {
-                self.bind_slot(var, ty);
-                true
-            }
-            _ if self.slots[var].numeric => false,
-            _ if self.occurs(var, &ty) => false,
-            _ => {
-                self.bind_slot(var, ty);
-                true
-            }
-        }
-    }
-
-    fn bind_slot(&mut self, var: usize, ty: Type) {
         let numeric = self.slots[var].numeric;
-        self.set(
-            var,
-            Slot {
-                bound: Some(ty),
-                numeric,
-            },
-        );
+        match ty {
+            Type::Var(other) if other == var => return true,
+            Type::Var(other) if numeric && !self.slots[other].numeric => {
+                self.change(other, |slot| slot.numeric = true);
+            }
+            Type::Var(_) | Type::Int | Type::Float | Type::Unknown => {}
+            _ if numeric || self.occurs(var, &ty) => return false,
+            _ => {}
+        }
+        self.change(var, |slot| slot.bound = Some(ty));
+        true
     }
 
     fn occurs(&self, var: usize, ty: &Type) -> bool {
@@ -245,20 +229,7 @@ impl Vars {
                 .entry(*id)
                 .or_insert_with(|| self.fresh(*numeric))
                 .clone(),
-            Type::List(item) => Type::list(self.instantiate_with(item, fresh)),
-            Type::Option(item) => Type::option(self.instantiate_with(item, fresh)),
-            Type::Result(ok, error) => {
-                let ok = self.instantiate_with(ok, fresh);
-                Type::result(ok, self.instantiate_with(error, fresh))
-            }
-            Type::Function(params, ret) => {
-                let params = params
-                    .iter()
-                    .map(|p| self.instantiate_with(p, fresh))
-                    .collect();
-                Type::function(params, self.instantiate_with(ret, fresh))
-            }
-            other => other.clone(),
+            _ => ty.map(|part| self.instantiate_with(part, fresh)),
         }
     }
 }
