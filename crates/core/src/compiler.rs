@@ -209,7 +209,7 @@ impl Compiler {
                 compiler.expression(&decl.body)?;
                 compiler.emit(Op::Return);
                 let function = compiler.finish(Some(&decl.name));
-                self.constant(Value::Compiled(Rc::new(function)));
+                self.constant(Value::Function(Rc::new(function)));
                 self.emit(Op::DefineGlobal(global));
             }
             // Only the names of the fields matter when the program runs.
@@ -237,7 +237,7 @@ impl Compiler {
                 }
                 compiler.emit(Op::End);
                 let sequence = compiler.finish(Some(&decl.name));
-                self.constant(Value::Compiled(Rc::new(sequence)));
+                self.constant(Value::Function(Rc::new(sequence)));
                 self.emit(Op::DefineSequence(name));
             }
             StmtKind::Start(name, args) => {
@@ -263,8 +263,8 @@ impl Compiler {
     fn step(&mut self, step: &Step) -> Result<(), CompileError> {
         let outer = std::mem::replace(&mut self.line, step.line);
         match &step.kind {
-            // Binding the state's name again replaces the state, as in the
-            // interpreter, where the newest binding is what the game gets.
+            // Binding the state's name again replaces the state: the newest
+            // binding is what the game gets.
             StepKind::Stmt(Stmt {
                 kind: StmtKind::Let(name, value),
                 ..
@@ -298,7 +298,7 @@ impl Compiler {
         body: &[Step],
     ) -> Result<(), CompileError> {
         // If this frame already had a pass, the duration waits for the next
-        // one too, as the interpreter evaluates it at the first pass.
+        // one too, since it is evaluated at the first pass.
         self.emit(Op::Yield);
         self.expression(duration)?;
         self.emit(Op::OverStart);
@@ -581,7 +581,7 @@ mod tests {
         let script = compile(&statements[0]).unwrap();
         let mut listing = script.chunk.to_string();
         for constant in &script.chunk.constants {
-            if let Value::Compiled(function) = constant {
+            if let Value::Function(function) = constant {
                 listing += &format!("== {function} ==\n{}", function.chunk);
             }
         }

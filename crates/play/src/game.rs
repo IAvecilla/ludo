@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
 use ludo_core::checker::Checker;
-use ludo_core::engine::{Backend, Engine, Failure};
 use ludo_core::parser::parse;
 use ludo_core::runtime::RuntimeError;
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::{Instance, Value};
+use ludo_core::vm::{Failure, Vm};
 
 /// What a game can use without declaring it: the input, the shapes it
 /// draws, the colors and the config. The CLI loads it too, so a game file
@@ -78,10 +78,10 @@ pub enum Shape {
     },
 }
 
-/// A game running on one of the backends: on the VM, its code is compiled to
-/// bytecode once, when it loads or reloads.
+/// A game running on the VM: its code is compiled to bytecode once, when it
+/// loads or reloads.
 pub struct Game {
-    engine: Engine,
+    vm: Vm,
     world: Value,
     config: Config,
 }
@@ -93,37 +93,33 @@ pub enum Reload {
 }
 
 impl Game {
-    pub fn load(source: &str, backend: Backend) -> Result<Game, Vec<String>> {
-        let (mut engine, config) = prepare(source, backend)?;
-        let world = init(&mut engine).map_err(|e| vec![e])?;
-        Ok(Game {
-            engine,
-            world,
-            config,
-        })
+    pub fn load(source: &str) -> Result<Game, Vec<String>> {
+        let (mut vm, config) = prepare(source)?;
+        let world = init(&mut vm).map_err(|e| vec![e])?;
+        Ok(Game { vm, world, config })
     }
 
     pub fn reload(&mut self, source: &str) -> Result<Reload, Vec<String>> {
-        let (mut engine, _) = prepare(source, self.engine.backend())?;
-        let before = self.engine.struct_shapes();
-        let after = engine.struct_shapes();
+        let (mut vm, _) = prepare(source)?;
+        let before = self.vm.struct_shapes();
+        let after = vm.struct_shapes();
         let changed = before
             .iter()
             .any(|(name, fields)| after.get(name) != Some(fields));
 
         if changed {
-            self.world = init(&mut engine).map_err(|e| vec![e])?;
-            self.engine = engine;
+            self.world = init(&mut vm).map_err(|e| vec![e])?;
+            self.vm = vm;
             return Ok(Reload::Restarted);
         }
-        engine.adopt_sequences(&mut self.engine);
-        self.engine = engine;
+        vm.adopt_sequences(&mut self.vm);
+        self.vm = vm;
         Ok(Reload::Kept)
     }
 
     pub fn restart(&mut self) -> Result<(), String> {
-        self.engine.stop_sequences();
-        self.world = init(&mut self.engine)?;
+        self.vm.stop_sequences();
+        self.world = init(&mut self.vm)?;
         Ok(())
     }
 
@@ -134,11 +130,11 @@ impl Game {
     pub fn step(&mut self, keys: &Keys, dt: f64) -> Result<(), String> {
         let args = vec![self.world.clone(), input(keys), Value::Float(dt)];
         let world = self
-            .engine
+            .vm
             .call_function("update", args)
             .map_err(|e| runtime("update", e))?;
         self.world = self
-            .engine
+            .vm
             .run_sequences(world, dt)
             .map_err(|e| runtime("a sequence", e))?;
         Ok(())
@@ -146,7 +142,7 @@ impl Game {
 
     pub fn draw(&mut self) -> Result<Vec<Shape>, String> {
         let shapes = self
-            .engine
+            .vm
             .call_function("draw", vec![self.world.clone()])
             .map_err(|e| runtime("draw", e))?;
         let Value::List(items) = shapes else {
@@ -159,15 +155,15 @@ impl Game {
     }
 }
 
-fn prepare(source: &str, backend: Backend) -> Result<(Engine, Config), Vec<String>> {
-    let mut engine = Engine::new(backend);
+fn prepare(source: &str) -> Result<(Vm, Config), Vec<String>> {
+    let mut vm = Vm::new();
     let mut checker = Checker::new();
-    run(&mut engine, &mut checker, HOST).expect("the host prelude is valid");
-    run(&mut engine, &mut checker, source)?;
+    run(&mut vm, &mut checker, HOST).expect("the host prelude is valid");
+    run(&mut vm, &mut checker, source)?;
 
     let mut errors = Vec::new();
     for (name, arity, signature) in CONTRACT {
-        match engine.arity(name) {
+        match vm.arity(name) {
             Some(n) if n == arity => {}
             Some(n) => errors.push(format!(
                 "`{name}` takes {n} parameters, but a game needs `{signature}`"
@@ -179,10 +175,10 @@ fn prepare(source: &str, backend: Backend) -> Result<(Engine, Config), Vec<Strin
         return Err(errors);
     }
 
-    let config = match engine.arity("config") {
+    let config = match vm.arity("config") {
         None => Config::default(),
         Some(0) => {
-            let value = engine
+            let value = vm
                 .call_function("config", vec![])
                 .map_err(|e| vec![runtime("config", e)])?;
             read_config(&value).map_err(|e| vec![e])?
@@ -193,17 +189,16 @@ fn prepare(source: &str, backend: Backend) -> Result<(Engine, Config), Vec<Strin
             )])
         }
     };
-    Ok((engine, config))
+    Ok((vm, config))
 }
 
-fn init(engine: &mut Engine) -> Result<Value, String> {
-    engine
-        .call_function("init", vec![])
+fn init(vm: &mut Vm) -> Result<Value, String> {
+    vm.call_function("init", vec![])
         .map_err(|e| runtime("init", e))
 }
 
 /// Checks the names of a program, after what `checker` has seen, and runs it.
-fn run(engine: &mut Engine, checker: &mut Checker, source: &str) -> Result<(), Vec<String>> {
+fn run(vm: &mut Vm, checker: &mut Checker, source: &str) -> Result<(), Vec<String>> {
     let tokens = scan_tokens(source).map_err(|errors| {
         errors
             .iter()
@@ -220,7 +215,7 @@ fn run(engine: &mut Engine, checker: &mut Checker, source: &str) -> Result<(), V
         .check(&statements)
         .map_err(|errors| errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())?;
     for stmt in &statements {
-        engine.execute(stmt).map_err(|failure| match failure {
+        vm.interpret(stmt).map_err(|failure| match failure {
             Failure::Compile(e) => vec![e.to_string()],
             Failure::Runtime(e) => vec![runtime("the program", e)],
         })?;
@@ -408,7 +403,7 @@ mod tests {
     #[test]
     fn plays_the_square() {
         let square = include_str!("../../../examples/square.ludo");
-        let mut game = Game::load(square, Backend::Vm).unwrap();
+        let mut game = Game::load(square).unwrap();
         let right = Keys {
             held: vec!["right"],
             pressed: vec![],
@@ -430,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_reload_keeps_the_world_and_the_sequences_unless_a_struct_changes() {
-        let mut game = Game::load(PONG, Backend::Vm).unwrap();
+        let mut game = Game::load(PONG).unwrap();
         assert_eq!(game.config().title, "Pong");
         steps(&mut game, 30);
         assert_eq!(get(&game.world, &["serving"]), &Value::Bool(true));
@@ -449,7 +444,7 @@ mod tests {
                  draw :: (w: World) -> List[Shape] {{ [] }}"
             )
         };
-        let mut game = Game::load(&tiny("x: Float", "x: 1.0"), Backend::Vm).unwrap();
+        let mut game = Game::load(&tiny("x: Float", "x: 1.0")).unwrap();
         let reload = game.reload(&tiny("x: Float, y: Float", "x: 2.0, y: 0.0"));
         assert_eq!(reload.unwrap(), Reload::Restarted);
         assert_eq!(get(&game.world, &["x"]), &Value::Float(2.0));
@@ -457,9 +452,7 @@ mod tests {
 
     #[test]
     fn a_game_needs_its_functions() {
-        let errors = Game::load("init :: () -> Int { 1 }", Backend::Vm)
-            .err()
-            .unwrap();
+        let errors = Game::load("init :: () -> Int { 1 }").err().unwrap();
         assert_eq!(
             errors,
             [
@@ -470,17 +463,12 @@ mod tests {
     }
 
     #[test]
-    fn pong_plays_the_same_on_both_backends() {
-        let mut vm = Game::load(PONG, Backend::Vm).unwrap();
-        let mut interpreter = Game::load(PONG, Backend::Interpreter).unwrap();
-        // Ten seconds of game: the serve, the ball crossing and bouncing, and
-        // the CPU paddle following it.
-        for frame in 0..600 {
-            vm.step(&Keys::default(), FRAME).unwrap();
-            interpreter.step(&Keys::default(), FRAME).unwrap();
-            assert_eq!(vm.world, interpreter.world, "frame {frame}");
-        }
-        assert_eq!(vm.draw().unwrap(), interpreter.draw().unwrap());
-        assert_ne!(get(&vm.world, &["ball", "x"]), &Value::Float(320.0));
+    fn pong_plays_for_ten_seconds() {
+        // The serve, the ball crossing and bouncing, and the CPU paddle
+        // following it.
+        let mut game = Game::load(PONG).unwrap();
+        steps(&mut game, 600);
+        game.draw().unwrap();
+        assert_ne!(get(&game.world, &["ball", "x"]), &Value::Float(320.0));
     }
 }

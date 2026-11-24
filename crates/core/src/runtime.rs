@@ -1,8 +1,7 @@
-//! The meaning of ludo when it runs, shared by both backends so they give
-//! the same values and errors: runtime errors, operators, fields, structs,
-//! patterns and how sequences run.
+//! What values do when a program runs, apart from the VM that runs it:
+//! runtime errors, operators, fields, structs, patterns and the timing of
+//! `over`. The checker shares the hints for names used as the wrong thing.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{BinaryOp, UnaryOp, Variant};
@@ -31,59 +30,6 @@ pub(crate) fn error(message: impl Into<String>) -> RuntimeError {
 }
 
 pub(crate) const MAX_CALL_DEPTH: usize = 200;
-
-/// What a program declares besides its globals, which both backends look up
-/// by name when they run, so a function can use what is declared after it:
-/// the fields of its structs, the symbols of its enums and its sequences.
-pub(crate) struct Declarations<S> {
-    pub structs: HashMap<String, Rc<[String]>>,
-    pub enums: HashMap<String, Vec<String>>,
-    pub sequences: HashMap<String, S>,
-}
-
-impl<S> Default for Declarations<S> {
-    fn default() -> Self {
-        Declarations {
-            structs: HashMap::new(),
-            enums: HashMap::new(),
-            sequences: HashMap::new(),
-        }
-    }
-}
-
-impl<S: Clone> Declarations<S> {
-    pub fn fields(&self, name: &str) -> Result<&Rc<[String]>, RuntimeError> {
-        self.structs
-            .get(name)
-            .ok_or_else(|| error(format!("undefined struct `{name}`")))
-    }
-
-    pub fn sequence(&self, name: &str) -> Result<S, RuntimeError> {
-        self.sequences
-            .get(name)
-            .cloned()
-            .ok_or_else(|| error(format!("undefined sequence `{name}`")))
-    }
-
-    pub fn shapes(&self) -> HashMap<String, Vec<String>> {
-        let shapes = self.structs.iter();
-        shapes.map(|(name, f)| (name.clone(), f.to_vec())).collect()
-    }
-
-    /// The error for a name that is not a variable, which says what it is if
-    /// it is declared as something else.
-    pub fn undefined(&self, name: &str) -> RuntimeError {
-        error(if self.structs.contains_key(name) {
-            struct_hint(name)
-        } else if self.sequences.contains_key(name) {
-            sequence_hint(name)
-        } else if let Some(symbols) = self.enums.get(name) {
-            enum_hint(name, &symbols[0])
-        } else {
-            format!("undefined variable `{name}`")
-        })
-    }
-}
 
 pub(crate) fn struct_hint(name: &str) -> String {
     format!("`{name}` is a struct, not a value: build one with `{name} {{ ... }}`")
@@ -225,14 +171,12 @@ pub(crate) fn field(target: &Value, name: &str) -> Result<Value, RuntimeError> {
 
 /// Builds a struct of type `name`, whose `declared` fields come from those
 /// of `base`, if it updates one, and the `fields` a literal gives in the
-/// order they are written. `value` gives the value of each of these once its
-/// field is known to be declared.
-pub(crate) fn build_struct<'a, T>(
+/// order they are written.
+pub(crate) fn build_struct<'a>(
     name: &str,
     declared: &[String],
     base: Option<Value>,
-    fields: impl IntoIterator<Item = (&'a str, T)>,
-    mut value: impl FnMut(T) -> Result<Value, RuntimeError>,
+    fields: impl IntoIterator<Item = (&'a str, Value)>,
 ) -> Result<Value, RuntimeError> {
     let mut slots: Vec<Option<Value>> = match base {
         Some(Value::Struct(instance)) if instance.name == name => instance
@@ -254,7 +198,7 @@ pub(crate) fn build_struct<'a, T>(
             .iter()
             .position(|f| f == field)
             .ok_or_else(|| error(format!("`{name}` has no field `{field}`")))?;
-        slots[index] = Some(value(given)?);
+        slots[index] = Some(given);
     }
 
     let fields = declared
@@ -343,69 +287,5 @@ pub(crate) fn progress(pass: usize, passes: usize) -> f64 {
         1.0
     } else {
         pass as f64 / passes as f64
-    }
-}
-
-/// A sequence that is running, however a backend keeps its place.
-pub trait Coroutine {
-    fn name(&self) -> &str;
-    fn is_done(&self) -> bool;
-}
-
-/// How both backends run sequences; only how one takes a step differs.
-pub trait Sequences {
-    type Run: Coroutine;
-
-    /// The sequences that are running, in the order they were started.
-    fn runs(&mut self) -> &mut Vec<Self::Run>;
-
-    /// Runs one frame of a sequence over the world, until it waits for the
-    /// next frame or ends, and gives back the world as it leaves it.
-    fn step(&mut self, run: &mut Self::Run, world: Value, dt: f64) -> Result<Value, RuntimeError>;
-
-    /// Starts a sequence, replacing one with the same name.
-    fn launch(&mut self, run: Self::Run) {
-        let runs = self.runs();
-        runs.retain(|r| r.name() != run.name());
-        runs.push(run);
-    }
-
-    /// Runs one frame of every sequence over the world, in the order they
-    /// were started, each over what the one before left. Sequences started
-    /// on the way join at the end. It gives back the world as the last one
-    /// left it; after an error, the rest wait for the next frame.
-    fn run_sequences(&mut self, world: Value, dt: f64) -> Result<Value, RuntimeError> {
-        let mut runs = std::mem::take(self.runs());
-        let mut result = Ok(world);
-        for run in &mut runs {
-            result = result.and_then(|world| self.step(run, world, dt));
-        }
-        runs.retain(|run| !run.is_done());
-        let started = std::mem::replace(self.runs(), runs);
-        for run in started {
-            self.launch(run);
-        }
-        result
-    }
-
-    /// Takes over the sequences running in `from`, the code before a reload,
-    /// except those this one already started. They keep the code they
-    /// started with, and look globals up by name here.
-    fn adopt_sequences(&mut self, from: &mut Self) {
-        let mut runs = std::mem::take(from.runs());
-        let own = self.runs();
-        runs.retain(|run| !own.iter().any(|r| r.name() == run.name()));
-        runs.append(own);
-        *own = runs;
-    }
-
-    fn stop_sequences(&mut self) {
-        self.runs().clear();
-    }
-
-    /// The names of the sequences that are running, in the order they run.
-    #[cfg(test)]
-    fn running(&mut self) -> Vec<String> {
-        self.runs().iter().map(|r| r.name().to_string()).collect()
     }
 }

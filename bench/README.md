@@ -6,10 +6,10 @@
 `target/bench`, and `target/bench/results.md` has them all.
 
 1. **Common problems**: programs that can be written both in ludo and in Lox,
-   on ludo's VM and interpreter and on three implementations of Lox.
-2. **Parser**: the Pratt parser against the precedence ladder, on each backend.
-3. **Pong**: a minute of game, on each backend.
-4. **Lists and structs**: problems of ludo alone, on each backend.
+   on ludo and on three implementations of Lox.
+2. **Parser**: the Pratt parser against the precedence ladder.
+3. **Pong**: a minute of game.
+4. **Lists and structs**: problems of ludo alone.
 
 The Lox implementations are fetched and built by `bench/setup.sh`, each at a
 fixed commit, into `target/bench/lox`. It needs `git`, `make`, a C compiler
@@ -50,7 +50,7 @@ their REPL.
 ## 2. Parser
 
 `ludo run` on a 30000 line program that `big.sh` writes, with
-`--parser=ladder` and `--parser=pratt`, on each backend. The program is lines
+`--parser=ladder` and `--parser=pratt`. The program is lines
 of expressions that go through every level of precedence, so in each pair only
 the parser changes.
 
@@ -70,47 +70,39 @@ every frame.
 ## Results
 
 On an AMD Ryzen 5 3600, with Rust 1.99.1, GCC 16.2.1 and Python 3.12.16, on
-2026-11-09.
+2026-11-09. They were taken when ludo still had a tree-walking interpreter
+next to the VM, before the code was simplified; they are the VM's times.
 
 ### 1. Common problems
 
-| | ludo VM | ludo interpreter | clox | plox | ploxb |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `fib` | 48.9 ± 4.6 ms | 58.9 ± 5.5 ms | 10.9 ± 1.7 ms | 5.42 ± 0.01 s | 3.32 ± 0.01 s |
-| `loops` | 24.3 ± 3.5 ms | 26.1 ± 5.1 ms | 5.6 ± 1.4 ms | 2.92 ± 0.02 s | 2.03 ± 0.02 s |
-| `mandelbrot` | 33.8 ± 3.7 ms | 54.4 ± 5.3 ms | 6.2 ± 1.7 ms | 3.76 ± 0.02 s | 2.48 ± 0.02 s |
-| `strings` | 54.0 ± 4.5 ms | 65.3 ± 7.2 ms | 16.8 ± 2.9 ms | 5.42 ± 0.02 s | 3.36 ± 0.02 s |
+| | ludo | clox | plox | ploxb |
+| --- | ---: | ---: | ---: | ---: |
+| `fib` | 48.9 ± 4.6 ms | 10.9 ± 1.7 ms | 5.42 ± 0.01 s | 3.32 ± 0.01 s |
+| `loops` | 24.3 ± 3.5 ms | 5.6 ± 1.4 ms | 2.92 ± 0.02 s | 2.03 ± 0.02 s |
+| `mandelbrot` | 33.8 ± 3.7 ms | 6.2 ± 1.7 ms | 3.76 ± 0.02 s | 2.48 ± 0.02 s |
+| `strings` | 54.0 ± 4.5 ms | 16.8 ± 2.9 ms | 5.42 ± 0.02 s | 3.36 ± 0.02 s |
 
-clox is 3 to 5 times faster than ludo's VM, and ludo's VM is 60 to 120 times
-faster than plox and ploxb. Most of that is the language each one is written
-in: C, Rust or Python. Between two implementations in the same language, the
-VM gains less: ludo's VM is 1.6 times faster than its interpreter on
-`mandelbrot`, about 1.2 times on `fib` and `strings`, and about the same on
-`loops`, where most calls come from `fold`. ploxb is 1.4 to 1.6 times faster
-than plox. That depends on the version of Python: on Python 3.14, plox runs
-`fib` in about 4.0 s and ploxb in about 3.8 s.
+clox is 3 to 5 times faster than ludo, and ludo is 60 to 120 times faster
+than plox and ploxb. Most of that is the language each one is written in: C,
+Rust or Python. Between a VM and a tree-walking interpreter in the same
+language the gap is much smaller: ploxb is 1.4 to 1.6 times faster than plox. That depends on the
+version of Python: on Python 3.14, plox runs `fib` in about 4.0 s and ploxb
+in about 3.8 s.
 
 ### 2. Parser
 
-| | Ladder | Pratt | |
-| --- | ---: | ---: | --- |
-| VM | 216.4 ± 3.4 ms | 202.7 ± 8.4 ms | Pratt 6% faster |
-| Interpreter | 193.7 ± 7.4 ms | 176.6 ± 5.7 ms | Pratt 9% faster |
-
-Pratt saves about 15 ms on either backend. The interpreter runs this program
-faster than the VM, because it does almost nothing but declare names, and the
-VM first compiles each line.
+| Ladder | Pratt | |
+| ---: | ---: | --- |
+| 216.4 ± 3.4 ms | 202.7 ± 8.4 ms | Pratt 6% faster |
 
 ### 3 and 4. Pong, lists and structs
 
-| | VM | Interpreter | |
-| --- | ---: | ---: | --- |
-| `pong` | 166.7 ± 5.9 ms | 175.6 ± 4.6 ms | VM 5% faster |
-| `lists` | 122.2 ± 5.7 ms | 109.6 ± 4.5 ms | VM 11% slower |
-| `structs` | 113.1 ± 5.9 ms | 110.3 ± 2.2 ms | about the same |
+| | Time |
+| --- | ---: |
+| `pong` | 166.7 ± 5.9 ms |
+| `lists` | 122.2 ± 5.7 ms |
+| `structs` | 113.1 ± 5.9 ms |
 
-The VM falls behind where natives call back into ludo many times, as `map`
-does. The likely reason, not yet profiled, is that each of those calls goes
-through `Caller`: it pushes the call onto the stack and enters the VM's loop
-again, which a call made by the bytecode does not. Where most of the time goes
-into building values, as structs and lists, both backends run about the same.
+In `lists`, natives call back into ludo many times, as `map` does. Each of
+those calls pushes the call onto the stack and enters the VM's loop again,
+which a call made by the bytecode does not.

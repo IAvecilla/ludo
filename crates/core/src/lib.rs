@@ -2,8 +2,6 @@ pub mod ast;
 pub mod checker;
 pub mod chunk;
 pub mod compiler;
-pub mod engine;
-pub mod interpreter;
 pub mod parser;
 pub mod prelude;
 pub mod runtime;

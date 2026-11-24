@@ -90,10 +90,8 @@ ludo play <file>        # play a game in a window
 ludo dis <file>         # show the bytecode of a program and trace it
 ```
 
-Programs compile to bytecode and run on a virtual machine. `ludo --interpreter`
-and `ludo run --interpreter <file>` run them on the tree-walking interpreter
-instead, to compare, and `ludo --trace` starts a REPL that shows the bytecode of
-each input and traces it as it runs.
+Programs compile to bytecode and run on a virtual machine. `ludo --trace`
+starts a REPL that shows the bytecode of each input and traces it as it runs.
 
 ### REPL mode
 
@@ -145,7 +143,7 @@ make run FILE=examples/pong.ludo
 make play FILE=examples/pong.ludo
 make test
 make lint
-make bench    # time ludo against clox, plox and ploxb, the parsers and the backends, see bench/README.md
+make bench    # time ludo against clox, plox and ploxb, and the two parsers, see bench/README.md
 ```
 
 ## Language

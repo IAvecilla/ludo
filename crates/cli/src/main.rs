@@ -5,10 +5,10 @@ use std::process::ExitCode;
 use ludo_core::ast::Stmt;
 use ludo_core::checker::Checker;
 use ludo_core::compiler::compile;
-use ludo_core::engine::{Backend, Engine, Failure as Fault};
 use ludo_core::parser::{parse_with, ExprParser, ParseError};
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::Value;
+use ludo_core::vm::{Failure as Fault, Vm};
 use ludo_play::{Game, Keys, HOST};
 
 const EX_USAGE: u8 = 64;
@@ -25,9 +25,6 @@ enum Failure {
 /// What the flags choose.
 #[derive(Default)]
 struct Options {
-    /// `--interpreter`: run on the tree-walking interpreter instead of the
-    /// VM, to compare.
-    backend: Backend,
     /// `--trace`: show the bytecode of each input of the REPL and trace it as
     /// it runs.
     trace: bool,
@@ -45,9 +42,6 @@ impl Options {
         let mut options = Options::default();
         for flag in flags {
             match (*flag, command) {
-                ("--interpreter", None | Some("run" | "play")) => {
-                    options.backend = Backend::Interpreter
-                }
                 ("--trace", None) => options.trace = true,
                 ("--parser=pratt", _) => options.parser = ExprParser::Pratt,
                 ("--parser=ladder", _) => options.parser = ExprParser::Ladder,
@@ -57,11 +51,9 @@ impl Options {
                 _ => return None,
             }
         }
-        // The trace shows bytecode, which only the VM runs, and a game is
-        // always parsed the usual way.
-        let traces_interpreter = options.trace && options.backend == Backend::Interpreter;
+        // A game is always parsed the usual way.
         let plays_ladder = command == Some("play") && options.parser != ExprParser::default();
-        (!traces_interpreter && !plays_ladder).then_some(options)
+        (!plays_ladder).then_some(options)
     }
 }
 
@@ -99,17 +91,14 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: ludo [--interpreter | --trace] [--parser=P]     start the REPL");
-    eprintln!("       ludo run [--interpreter] [--parser=P] FILE     run a program");
-    eprintln!(
-        "       ludo check [--parser=P] FILE                   check a program without running it"
-    );
-    eprintln!("       ludo play [--interpreter] [--frames=N] FILE    play a game file in a window");
-    eprintln!("       ludo dis [--parser=P] FILE                     compile to bytecode and trace it on the VM");
+    eprintln!("usage: ludo [--trace] [--parser=P]     start the REPL");
+    eprintln!("       ludo run [--parser=P] FILE      run a program");
+    eprintln!("       ludo check [--parser=P] FILE    check a program without running it");
+    eprintln!("       ludo play [--frames=N] FILE     play a game file in a window");
+    eprintln!("       ludo dis [--parser=P] FILE      compile to bytecode and trace it on the VM");
     eprintln!();
-    eprintln!("Programs compile to bytecode and run on the VM. With --interpreter they");
-    eprintln!("run on the tree-walking interpreter instead, to compare; with --trace the");
-    eprintln!("REPL shows the bytecode of each input and traces it as it runs.");
+    eprintln!("Programs compile to bytecode and run on the VM. With --trace the REPL");
+    eprintln!("shows the bytecode of each input and traces it as it runs.");
     eprintln!("--parser=ladder parses expressions with the precedence ladder instead of");
     eprintln!("Pratt, and --frames=N plays a game for N frames without a window; both are");
     eprintln!("there for the benchmarks.");
@@ -124,10 +113,10 @@ fn exit(result: Result<(), Failure>) -> ExitCode {
     }
 }
 
-/// A backend and a checker that last as long as a program, with the host
+/// A VM and a checker that last as long as a program, with the host
 /// prelude loaded so a game file sees what `play` gives it.
 struct Session {
-    engine: Engine,
+    vm: Vm,
     checker: Checker,
     parser: ExprParser,
     /// Whether it runs a file, whose errors say their line, and not the REPL.
@@ -137,7 +126,7 @@ struct Session {
 impl Session {
     fn new(options: &Options, file: bool) -> Self {
         let mut session = Session {
-            engine: Engine::new(options.backend),
+            vm: Vm::new(),
             checker: Checker::new(),
             parser: options.parser,
             file,
@@ -145,9 +134,7 @@ impl Session {
         if session.run(HOST, |_| {}).is_err() {
             unreachable!("the host prelude is valid");
         }
-        if let (Engine::Vm(vm), true) = (&mut session.engine, options.trace) {
-            vm.trace = true;
-        }
+        session.vm.trace = options.trace;
         session
     }
 
@@ -215,19 +202,17 @@ impl Session {
     /// Runs a statement. With the trace on, it first shows its bytecode and
     /// that of the function or sequence it declares.
     fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, Fault> {
-        match &mut self.engine {
-            Engine::Vm(vm) if vm.trace => {
-                let script = compile(stmt).map_err(Fault::Compile)?;
-                println!("== {stmt} ==\n{}", script.chunk);
-                for constant in &script.chunk.constants {
-                    if let Value::Compiled(function) = constant {
-                        println!("== {function} ==\n{}", function.chunk);
-                    }
-                }
-                vm.run(script).map_err(Fault::Runtime)
-            }
-            engine => engine.execute(stmt),
+        if !self.vm.trace {
+            return self.vm.interpret(stmt);
         }
+        let script = compile(stmt).map_err(Fault::Compile)?;
+        println!("== {stmt} ==\n{}", script.chunk);
+        for constant in &script.chunk.constants {
+            if let Value::Function(function) = constant {
+                println!("== {function} ==\n{}", function.chunk);
+            }
+        }
+        self.vm.run(script).map_err(Fault::Runtime)
     }
 }
 
@@ -246,7 +231,7 @@ fn disassemble(source: &str, parser: ExprParser) -> ExitCode {
 }
 
 fn play(path: &str, source: &str, options: &Options) -> ExitCode {
-    let mut game = match Game::load(source, options.backend) {
+    let mut game = match Game::load(source) {
         Ok(game) => game,
         Err(errors) => {
             for error in errors {
@@ -273,9 +258,9 @@ fn play(path: &str, source: &str, options: &Options) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Each input is compiled and run on its own, on a backend that lives as
-/// long as the REPL, so what one input binds the next ones see. On the VM
-/// it is the REPL of clox, of Python and of Lua.
+/// Each input is compiled and run on its own, on a VM that lives as long as
+/// the REPL, so what one input binds the next ones see, as in the REPL of
+/// clox, of Python and of Lua.
 fn run_repl(options: &Options) {
     let stdin = io::stdin();
     let mut session = Session::new(options, false);

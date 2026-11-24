@@ -1,5 +1,5 @@
-//! Checks a program before it runs, in one walk over its tree that neither
-//! backend depends on. It checks the names it uses, as jlox's resolver does
+//! Checks a program before it runs, in one walk over its tree that the VM
+//! does not depend on. It checks the names it uses, as jlox's resolver does
 //! in chapter 11 of the book: a name that is not declared, a call with the
 //! wrong number of arguments, a struct built with a field it does not have
 //! or without one it needs. And it checks the type of every value.
@@ -59,8 +59,8 @@ impl fmt::Display for CheckError {
     }
 }
 
-/// What the top level declares as it runs, kept apart by kind as the
-/// backends do.
+/// What the top level declares as it runs, kept apart by kind as the VM
+/// does.
 #[derive(Debug, Clone, Default)]
 struct Declared {
     /// The type of each function and value.
