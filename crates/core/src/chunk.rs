@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::ast::Variant;
+use crate::ast::{BinaryOp, Variant};
 use crate::value::Value;
 
 /// One instruction of the virtual machine. Operands live inside the variant
@@ -17,7 +17,6 @@ pub enum Op {
     GetGlobal(usize),
     /// Pushes a copy of the local in this stack slot.
     GetLocal(usize),
-    /// Discards the value on top of the stack.
     Pop,
     /// Discards this many values under the one on top: the locals of a block
     /// that ends, below the value of the block. clox has no such instruction
@@ -103,17 +102,9 @@ pub enum Op {
     End,
     Negate,
     Not,
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
+    /// Replaces the two values on top of the stack with the result of an
+    /// operator. `and` and `or` short circuit with jumps instead.
+    Binary(BinaryOp),
     /// Ends the function and leaves its result in place of the call. A
     /// function body always leaves a result; a top-level `let` or
     /// declaration leaves none.
@@ -176,12 +167,6 @@ pub struct Shape {
     pub fields: Vec<String>,
 }
 
-impl fmt::Display for Shape {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {{ {} }}", self.name, self.fields.join(", "))
-    }
-}
-
 /// A compiled piece of code: the instructions, the line each one came from
 /// and the constants and struct shapes they refer to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -223,60 +208,54 @@ impl Chunk {
         } else {
             format!("{:4}", self.lines[offset])
         };
+        let shape = |name: &str, index: usize, fields: String| {
+            let shape = &self.shapes[index];
+            format!("{name:<16} {index:4} {} {{ {fields} }}", shape.name)
+        };
+        let jump = |name: &str, distance: usize| {
+            format!("{name:<16} {distance:4} -> {}", offset + 1 + distance)
+        };
         let op = match self.code[offset] {
             Op::Constant(index) => self.constant_op("Constant", index),
             Op::DefineGlobal(index) => self.constant_op("DefineGlobal", index),
             Op::GetGlobal(index) => self.constant_op("GetGlobal", index),
-            Op::GetLocal(slot) => format!("{:<16} {slot:4}", "GetLocal"),
-            Op::PopBelow(count) => format!("{:<16} {count:4}", "PopBelow"),
-            Op::Call(argc) => format!("{:<16} {argc:4}", "Call"),
-            Op::List(count) => format!("{:<16} {count:4}", "List"),
-            Op::DefineStruct(shape) => {
-                format!("{:<16} {shape:4} {}", "DefineStruct", self.shapes[shape])
-            }
-            Op::Struct { shape, base } => {
-                let shown = &self.shapes[shape];
-                let base = if base { "_ | " } else { "" };
-                let fields = shown.fields.join(", ");
-                format!(
-                    "{:<16} {shape:4} {} {{ {base}{fields} }}",
-                    "Struct", shown.name
-                )
-            }
             Op::GetField(index) => self.constant_op("GetField", index),
-            Op::DefineEnum(shape) => {
-                let shown = &self.shapes[shape];
-                let symbols: Vec<String> = shown.fields.iter().map(|s| format!(":{s}")).collect();
-                let symbols = symbols.join(", ");
-                format!(
-                    "{:<16} {shape:4} {} {{ {symbols} }}",
-                    "DefineEnum", shown.name
-                )
-            }
             Op::MatchConstant(index) => self.constant_op("MatchConstant", index),
-            Op::MatchVariant(variant) => format!("{:<16} {:>4}", "MatchVariant", variant.name()),
             Op::DefineSequence(index) => self.constant_op("DefineSequence", index),
+            Op::GetLocal(n) => format!("{:<16} {n:4}", "GetLocal"),
+            Op::PopBelow(n) => format!("{:<16} {n:4}", "PopBelow"),
+            Op::Call(n) => format!("{:<16} {n:4}", "Call"),
+            Op::List(n) => format!("{:<16} {n:4}", "List"),
+            Op::OverPass(n) => format!("{:<16} {n:4}", "OverPass"),
+            Op::DefineStruct(index) => {
+                shape("DefineStruct", index, self.shapes[index].fields.join(", "))
+            }
+            Op::Struct { shape: index, base } => {
+                let base = if base { "_ | " } else { "" };
+                let fields = self.shapes[index].fields.join(", ");
+                shape("Struct", index, format!("{base}{fields}"))
+            }
+            Op::DefineEnum(index) => {
+                let symbols = &self.shapes[index].fields;
+                let symbols: Vec<String> = symbols.iter().map(|s| format!(":{s}")).collect();
+                shape("DefineEnum", index, symbols.join(", "))
+            }
+            Op::MatchVariant(variant) => format!("{:<16} {:>4}", "MatchVariant", variant.name()),
             Op::Start { name, argc } => {
                 format!("{:<16} {argc:4} {:?}", "Start", self.name(name))
             }
-            Op::OverPass(counters) => format!("{:<16} {counters:4}", "OverPass"),
             Op::OverLoop { counters, distance } => {
                 let target = offset + 1 - distance;
                 format!("{:<16} {counters:4} -> {target}", "OverLoop")
             }
             Op::SetField { state, field } => {
-                format!(
-                    "{:<16} {}.{}",
-                    "SetField",
-                    self.name(state),
-                    self.name(field)
-                )
+                let (state, field) = (self.name(state), self.name(field));
+                format!("{:<16} {state}.{field}", "SetField")
             }
             Op::CheckBool(test) => format!("{:<16} {test:>4}", "CheckBool"),
-            Op::Jump(jump) => format!("{:<16} {jump:4} -> {}", "Jump", offset + 1 + jump),
-            Op::JumpIfFalse(jump) => {
-                format!("{:<16} {jump:4} -> {}", "JumpIfFalse", offset + 1 + jump)
-            }
+            Op::Jump(distance) => jump("Jump", distance),
+            Op::JumpIfFalse(distance) => jump("JumpIfFalse", distance),
+            Op::Binary(op) => binary_name(op).to_string(),
             op => format!("{op:?}"),
         };
         format!("{offset:04} {line} {op}")
@@ -288,6 +267,24 @@ impl Chunk {
             v => v.to_string(),
         };
         format!("{name:<16} {index:4} {constant}")
+    }
+}
+
+/// The name of the instruction for an operator, as clox's `OP_` names.
+fn binary_name(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "Add",
+        BinaryOp::Sub => "Sub",
+        BinaryOp::Mul => "Mul",
+        BinaryOp::Div => "Div",
+        BinaryOp::Rem => "Rem",
+        BinaryOp::Eq => "Equal",
+        BinaryOp::Ne => "NotEqual",
+        BinaryOp::Lt => "Less",
+        BinaryOp::Le => "LessEqual",
+        BinaryOp::Gt => "Greater",
+        BinaryOp::Ge => "GreaterEqual",
+        BinaryOp::And | BinaryOp::Or => unreachable!("`and` and `or` compile to jumps"),
     }
 }
 

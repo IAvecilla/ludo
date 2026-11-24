@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::{
-    Arm, BinaryOp, EnumDecl, Expr, FnDecl, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
-    StructDecl, UnaryOp, Variant,
+    Arm, BinaryOp, Expr, FnDecl, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind, UnaryOp, Variant,
 };
-use crate::prelude::{constants, NATIVES};
-use crate::value::{Caller, Instance, Native, Value};
+use crate::chunk::Test;
+use crate::prelude::globals;
+use crate::value::{Caller, Instance, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -15,23 +15,32 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
+    /// Gives the error this line, unless a deeper call already gave it one.
     pub(crate) fn at(mut self, line: usize) -> Self {
         self.line.get_or_insert(line);
         self
     }
 }
 
+pub(crate) fn error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError {
+        message: message.into(),
+        line: None,
+    }
+}
+
 pub(crate) const MAX_CALL_DEPTH: usize = 200;
 
+/// A tree-walking interpreter, as jlox. Locals live in one list for every
+/// call, and `frame` is where those of the running function start.
 pub struct Interpreter {
     locals: Vec<(String, Value)>,
     frame: usize,
+    /// How many blocks deep the code runs: a `let` at 0 binds a global.
     nested: usize,
-    globals: HashMap<String, Value>,
     depth: usize,
-    structs: HashMap<String, Rc<StructDecl>>,
-    enums: HashMap<String, Rc<EnumDecl>>,
-    sequences: HashMap<String, Rc<SeqDecl>>,
+    globals: HashMap<String, Value>,
+    declared: Declarations<Rc<SeqDecl>>,
     runs: Vec<Run>,
 }
 
@@ -43,29 +52,15 @@ impl Default for Interpreter {
 
 impl Interpreter {
     pub fn new() -> Self {
-        let mut interpreter = Interpreter {
+        Interpreter {
             locals: Vec::new(),
             frame: 0,
             nested: 0,
-            globals: HashMap::new(),
             depth: 0,
-            structs: HashMap::new(),
-            enums: HashMap::new(),
-            sequences: HashMap::new(),
+            globals: globals(),
+            declared: Declarations::default(),
             runs: Vec::new(),
-        };
-        for native in NATIVES {
-            interpreter.define(*native);
         }
-        for (name, value) in constants() {
-            interpreter.globals.insert(name.to_string(), value);
-        }
-        interpreter
-    }
-
-    pub fn define(&mut self, native: Native) {
-        self.globals
-            .insert(native.name.to_string(), Value::Native(native));
     }
 
     pub fn call_function(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -78,13 +73,7 @@ impl Interpreter {
     }
 
     pub fn struct_shapes(&self) -> HashMap<String, Vec<String>> {
-        self.structs
-            .iter()
-            .map(|(name, decl)| {
-                let fields = decl.fields.iter().map(|f| f.name.clone()).collect();
-                (name.clone(), fields)
-            })
-            .collect()
+        self.declared.shapes()
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
@@ -97,39 +86,40 @@ impl Interpreter {
 
     pub fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
         let result = match &stmt.kind {
-            StmtKind::Let(name, value) => self.evaluate(value).map(|value| {
-                self.bind(name.clone(), value);
-                None
-            }),
+            StmtKind::Expr(expr) => {
+                return self.evaluate(expr).map(Some).map_err(|e| e.at(stmt.line))
+            }
+            StmtKind::Let(name, value) => self.evaluate(value).map(|value| self.bind(name, value)),
             StmtKind::Fn(decl) => {
                 self.globals
                     .insert(decl.name.clone(), Value::Function(decl.clone()));
-                Ok(None)
+                Ok(())
             }
             StmtKind::Struct(decl) => {
-                self.structs.insert(decl.name.clone(), decl.clone());
-                Ok(None)
+                let fields = decl.fields.iter().map(|f| f.name.clone()).collect();
+                self.declared.structs.insert(decl.name.clone(), fields);
+                Ok(())
             }
             StmtKind::Enum(decl) => {
-                self.enums.insert(decl.name.clone(), decl.clone());
-                Ok(None)
+                let symbols = decl.symbols.clone();
+                self.declared.enums.insert(decl.name.clone(), symbols);
+                Ok(())
             }
             // A union only tells the checker what a type can be.
-            StmtKind::Union(_) => Ok(None),
+            StmtKind::Union(_) => Ok(()),
             StmtKind::Sequence(decl) => {
-                self.sequences.insert(decl.name.clone(), decl.clone());
-                Ok(None)
+                let (name, sequence) = (decl.name.clone(), decl.clone());
+                self.declared.sequences.insert(name, sequence);
+                Ok(())
             }
-            StmtKind::Start(name, args) => self
-                .arguments(args)
-                .and_then(|args| self.launch(name, args))
-                .map(|()| None),
-            StmtKind::Expr(expr) => self.evaluate(expr).map(Some),
+            StmtKind::Start(name, args) => {
+                self.arguments(args).and_then(|args| self.start(name, args))
+            }
         };
-        result.map_err(|e| e.at(stmt.line))
+        result.map(|()| None).map_err(|e| e.at(stmt.line))
     }
 
-    pub fn evaluate(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
+    fn evaluate(&mut self, expr: &Expr) -> Result<Value, RuntimeError> {
         match expr {
             Expr::Int(v) => Ok(Value::Int(*v)),
             Expr::Float(v) => Ok(Value::Float(*v)),
@@ -150,7 +140,7 @@ impl Interpreter {
                 result
             }
             Expr::If(cond, then, otherwise) => {
-                if self.boolean(cond, |v| condition("if", v))? {
+                if self.boolean(cond, Test::If)? {
                     self.evaluate(then)
                 } else {
                     self.evaluate(otherwise)
@@ -161,12 +151,15 @@ impl Interpreter {
                 unary(*op, right)
             }
             Expr::Binary(left, op @ (BinaryOp::And | BinaryOp::Or), right) => {
-                let stop = *op == BinaryOp::Or;
-                let operand = |value: &Value| logical(*op, value);
-                if self.boolean(left, operand)? == stop {
+                // The value that ends the evaluation early: false for `and`.
+                let (test, stop) = match op {
+                    BinaryOp::And => (Test::And, false),
+                    _ => (Test::Or, true),
+                };
+                if self.boolean(left, test)? == stop {
                     return Ok(Value::Bool(stop));
                 }
-                Ok(Value::Bool(self.boolean(right, operand)?))
+                Ok(Value::Bool(self.boolean(right, test)?))
             }
             Expr::Binary(left, op, right) => {
                 let left = self.evaluate(left)?;
@@ -188,19 +181,10 @@ impl Interpreter {
     }
 
     fn variable(&self, name: &str) -> Result<Value, RuntimeError> {
-        if let Some(value) = self.lookup(name) {
-            return Ok(value.clone());
+        match self.lookup(name) {
+            Some(value) => Ok(value.clone()),
+            None => Err(self.declared.undefined(name)),
         }
-        let message = if self.structs.contains_key(name) {
-            struct_hint(name)
-        } else if self.sequences.contains_key(name) {
-            sequence_hint(name)
-        } else if let Some(decl) = self.enums.get(name) {
-            enum_hint(name, &decl.symbols[0])
-        } else {
-            format!("undefined variable `{name}`")
-        };
-        Err(error(message))
     }
 
     fn construct(
@@ -209,59 +193,31 @@ impl Interpreter {
         base: Option<&Expr>,
         fields: &[(String, Expr)],
     ) -> Result<Value, RuntimeError> {
-        let decl = self
-            .structs
-            .get(name)
-            .cloned()
-            .ok_or_else(|| error(format!("undefined struct `{name}`")))?;
+        let declared = Rc::clone(self.declared.fields(name)?);
+        let base = base.map(|b| self.evaluate(b)).transpose()?;
+        let fields = fields.iter().map(|(field, expr)| (field.as_str(), expr));
+        build_struct(name, &declared, base, fields, |expr| self.evaluate(expr))
+    }
 
-        let mut values: Vec<Option<Value>> = match base.map(|b| self.evaluate(b)).transpose()? {
-            Some(Value::Struct(instance)) if instance.name == name => instance
-                .fields
-                .iter()
-                .map(|(_, v)| Some(v.clone()))
-                .collect(),
-            Some(other) => {
-                return Err(error(format!(
-                    "`{name} {{ x | ... }}` needs a {name} as `x`, got {}",
-                    other.type_name()
-                )))
+    fn case(&mut self, value: &Expr, arms: &[Arm]) -> Result<Value, RuntimeError> {
+        let value = self.evaluate(value)?;
+        for arm in arms {
+            let outer = self.locals.len();
+            self.nested += 1;
+            let result = self.arm(arm, &value);
+            self.nested -= 1;
+            self.locals.truncate(outer);
+            if let Some(result) = result? {
+                return Ok(result);
             }
-            None => vec![None; decl.fields.len()],
-        };
-
-        for (field, expr) in fields {
-            let index = decl
-                .fields
-                .iter()
-                .position(|f| &f.name == field)
-                .ok_or_else(|| error(format!("`{name}` has no field `{field}`")))?;
-            values[index] = Some(self.evaluate(expr)?);
         }
-
-        let fields = decl
-            .fields
-            .iter()
-            .zip(values)
-            .map(|(field, value)| {
-                let value = value
-                    .ok_or_else(|| error(format!("missing field `{}` in `{name}`", field.name)))?;
-                Ok((field.name.clone(), value))
-            })
-            .collect::<Result<_, RuntimeError>>()?;
-        Ok(Value::Struct(Rc::new(Instance {
-            name: name.to_string(),
-            fields,
-        })))
+        Err(no_match(&value))
     }
 
     fn invoke(&mut self, decl: &FnDecl, args: Vec<Value>) -> Result<Value, RuntimeError> {
         if self.depth == MAX_CALL_DEPTH {
-            return Err(error(format!(
-                "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
-            )));
+            return Err(stack_overflow());
         }
-
         let caller = std::mem::replace(&mut self.frame, self.locals.len());
         for (param, value) in decl.params.iter().zip(args) {
             self.locals.push((param.name.clone(), value));
@@ -280,11 +236,11 @@ impl Interpreter {
         args.iter().map(|arg| self.evaluate(arg)).collect()
     }
 
-    fn bind(&mut self, name: String, value: Value) {
+    fn bind(&mut self, name: &str, value: Value) {
         if self.nested == 0 {
-            self.globals.insert(name, value);
+            self.globals.insert(name.to_string(), value);
         } else {
-            self.locals.push((name, value));
+            self.locals.push((name.to_string(), value));
         }
     }
 
@@ -297,32 +253,17 @@ impl Interpreter {
             .or_else(|| self.globals.get(name))
     }
 
-    fn case(&mut self, value: &Expr, arms: &[Arm]) -> Result<Value, RuntimeError> {
-        let value = self.evaluate(value)?;
-        for arm in arms {
-            let outer = self.locals.len();
-            self.nested += 1;
-            let result = self.arm(arm, &value);
-            self.nested -= 1;
-            self.locals.truncate(outer);
-            if let Some(result) = result? {
-                return Ok(result);
-            }
-        }
-        Err(no_match(&value))
-    }
-
     /// The value of a branch of a `case`, if its pattern matches `value` and
     /// its guard holds.
     fn arm(&mut self, arm: &Arm, value: &Value) -> Result<Option<Value>, RuntimeError> {
-        let mut bindings = Vec::new();
-        if !bind(&arm.pattern, value, &mut bindings) {
+        if !bind(&arm.pattern, value, &mut self.locals) {
             return Ok(None);
         }
-        self.locals.append(&mut bindings);
         if let Some(guard) = &arm.guard {
-            let holds = self.boolean(guard, |v| condition("when", v));
-            if !holds.map_err(|e| e.at(arm.line))? {
+            if !self
+                .boolean(guard, Test::When)
+                .map_err(|e| e.at(arm.line))?
+            {
                 return Ok(None);
             }
         }
@@ -334,12 +275,8 @@ impl Interpreter {
     /// Evaluates an expression that must give a Bool. It runs in a frame of
     /// its own so that its temporaries do not grow the frame of `evaluate`,
     /// which deep recursion stacks up.
-    fn boolean(
-        &mut self,
-        expr: &Expr,
-        check: impl Fn(&Value) -> Result<bool, RuntimeError>,
-    ) -> Result<bool, RuntimeError> {
-        check(&self.evaluate(expr)?)
+    fn boolean(&mut self, expr: &Expr, test: Test) -> Result<bool, RuntimeError> {
+        check_bool(test, &self.evaluate(expr)?)
     }
 }
 
@@ -355,44 +292,12 @@ impl Caller for Interpreter {
                 (native.fun)(self, &args)
             }
             Value::Compiled(_) => unreachable!("only the VM makes compiled functions"),
-            other => Err(error(format!(
-                "can only call functions, got {}",
-                other.type_name()
-            ))),
+            other => Err(not_callable(&other)),
         }
     }
 }
 
-/// The value of a field of a struct.
-pub(crate) fn field(target: &Value, name: &str) -> Result<Value, RuntimeError> {
-    match target {
-        Value::Struct(instance) => instance
-            .get(name)
-            .cloned()
-            .ok_or_else(|| error(format!("`{}` has no field `{name}`", instance.name))),
-        other => Err(error(format!("{} has no fields", other.type_name()))),
-    }
-}
-
-/// The condition of an `if` or the guard of a branch of `case`, after
-/// `when`, which must be a Bool: ludo has no truthiness.
-pub(crate) fn condition(keyword: &str, value: &Value) -> Result<bool, RuntimeError> {
-    match value {
-        Value::Bool(v) => Ok(*v),
-        v => Err(error(format!(
-            "the condition of `{keyword}` must be a Bool, got {}",
-            v.type_name()
-        ))),
-    }
-}
-
-/// Whether a value matches a literal pattern: a value of the literal's type
-/// equal to it. A value of another type does not match; it is no error.
-pub(crate) fn matches(value: &Value, literal: &Value) -> bool {
-    value.same_type(literal) && value == literal
-}
-
-/// Whether a value matches a pattern, adding what the pattern binds to
+/// Whether a value matches a pattern, pushing what the pattern binds to
 /// `bindings`.
 fn bind(pattern: &Pattern, value: &Value, bindings: &mut Vec<(String, Value)>) -> bool {
     match pattern {
@@ -410,25 +315,207 @@ fn bind(pattern: &Pattern, value: &Value, bindings: &mut Vec<(String, Value)>) -
     }
 }
 
-/// What a value of an `Option` or a `Result` holds if it is this variant:
-/// `Some(Some(x))` for a match with `x` inside, `Some(None)` for `None`, and
-/// `None` for another variant or another type, which is no match.
-pub(crate) fn contents(variant: Variant, value: &Value) -> Option<Option<Value>> {
-    match (variant, value) {
-        (Variant::Some, Value::Option(Some(held))) => Some(Some((**held).clone())),
-        (Variant::None, Value::Option(None)) => Some(None),
-        (Variant::Ok, Value::Result(Ok(held))) => Some(Some((**held).clone())),
-        (Variant::Error, Value::Result(Err(held))) => Some(Some((**held).clone())),
-        _ => None,
+/// A sequence that is running: the step it is at, how far along an `over`
+/// it is, and its locals, except the state, which is the world of the game.
+pub struct Run {
+    decl: Rc<SeqDecl>,
+    locals: Vec<(String, Value)>,
+    step: usize,
+    pass: usize,
+    passes: usize,
+}
+
+impl Coroutine for Run {
+    fn name(&self) -> &str {
+        &self.decl.name
+    }
+
+    fn is_done(&self) -> bool {
+        self.step == self.decl.body.len()
     }
 }
 
-pub(crate) fn no_match(value: &Value) -> RuntimeError {
-    let shown = match value {
-        Value::Str(v) => format!("{v:?}"),
-        v => v.to_string(),
-    };
-    error(format!("no branch of `case` matches {shown}"))
+impl Sequences for Interpreter {
+    type Run = Run;
+
+    fn runs(&mut self) -> &mut Vec<Run> {
+        &mut self.runs
+    }
+
+    /// Runs the steps of the sequence, with its locals and the world as its
+    /// state, until it makes a pass of an `over` and meets another, or ends.
+    fn step(&mut self, run: &mut Run, world: Value, dt: f64) -> Result<Value, RuntimeError> {
+        let decl = Rc::clone(&run.decl);
+        let state = decl.params[0].name.as_str();
+        let caller = std::mem::replace(&mut self.frame, self.locals.len());
+        self.locals.append(&mut run.locals);
+        self.locals.push((state.to_string(), world));
+        self.nested += 1;
+        let result = self.advance(run, dt);
+        self.nested -= 1;
+
+        // The newest binding of the state's name is the world it leaves.
+        let mut world = None;
+        for (name, value) in self.locals.split_off(self.frame) {
+            if name == state {
+                world = Some(value);
+            } else {
+                run.locals.push((name, value));
+            }
+        }
+        self.frame = caller;
+        result.map(|()| world.expect("a running sequence always has its state"))
+    }
+}
+
+impl Interpreter {
+    fn start(&mut self, name: &str, args: Vec<Value>) -> Result<(), RuntimeError> {
+        let decl = self.declared.sequence(name)?;
+        check_arity(&decl.name, decl.params.len(), args.len())?;
+        // The state comes from the world of each frame instead.
+        let params = decl.params[1..].iter().map(|param| param.name.clone());
+        let locals = params.zip(args.into_iter().skip(1)).collect();
+        self.launch(Run {
+            decl,
+            locals,
+            step: 0,
+            pass: 0,
+            passes: 0,
+        });
+        Ok(())
+    }
+
+    fn advance(&mut self, run: &mut Run, dt: f64) -> Result<(), RuntimeError> {
+        let decl = Rc::clone(&run.decl);
+        let mut spent = false;
+        while let Some(step) = decl.body.get(run.step) {
+            let StepKind::Over {
+                duration,
+                var,
+                body,
+            } = &step.kind
+            else {
+                self.execute_step(step)?;
+                run.step += 1;
+                continue;
+            };
+            if spent {
+                break;
+            }
+
+            if run.pass == 0 {
+                let duration = self.evaluate(duration);
+                run.passes = duration
+                    .and_then(|d| passes(d, dt))
+                    .map_err(|e| e.at(step.line))?;
+            }
+            run.pass += 1;
+            let t = progress(run.pass, run.passes);
+            self.over_pass(&decl.params[0].name, var.as_deref(), t, body)?;
+            spent = true;
+
+            if run.pass < run.passes {
+                break;
+            }
+            run.pass = 0;
+            run.step += 1;
+        }
+        Ok(())
+    }
+
+    /// Runs the body of an `over` once, as a block that only keeps the state.
+    fn over_pass(
+        &mut self,
+        state: &str,
+        var: Option<&str>,
+        t: f64,
+        body: &[Step],
+    ) -> Result<(), RuntimeError> {
+        let outer = self.locals.len();
+        if let Some(var) = var {
+            self.bind(var, Value::Float(t));
+        }
+        let result = body.iter().try_for_each(|step| self.execute_step(step));
+        let value = self.lookup(state).cloned();
+        self.locals.truncate(outer);
+        result?;
+        if let Some(value) = value {
+            self.bind(state, value);
+        }
+        Ok(())
+    }
+
+    fn execute_step(&mut self, step: &Step) -> Result<(), RuntimeError> {
+        match &step.kind {
+            StepKind::Stmt(stmt) => self.execute(stmt).map(drop),
+            StepKind::Set(target, field, expr) => self.evaluate(expr).and_then(|value| {
+                let state = self
+                    .lookup(target)
+                    .expect("a running sequence always has its state");
+                let updated = with_field(target, state, field, value)?;
+                self.bind(target, updated);
+                Ok(())
+            }),
+            StepKind::Over { .. } => unreachable!("the parser keeps `over` out of `over`"),
+        }
+        .map_err(|e| e.at(step.line))
+    }
+}
+
+// What follows is the meaning of ludo when it runs, which the VM shares, so
+// both backends give the same values and errors.
+
+/// What a program declares besides its globals, which both backends look up
+/// by name when they run, so a function can use what is declared after it:
+/// the fields of its structs, the symbols of its enums and its sequences.
+pub(crate) struct Declarations<S> {
+    pub structs: HashMap<String, Rc<[String]>>,
+    pub enums: HashMap<String, Vec<String>>,
+    pub sequences: HashMap<String, S>,
+}
+
+impl<S> Default for Declarations<S> {
+    fn default() -> Self {
+        Declarations {
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            sequences: HashMap::new(),
+        }
+    }
+}
+
+impl<S: Clone> Declarations<S> {
+    pub fn fields(&self, name: &str) -> Result<&Rc<[String]>, RuntimeError> {
+        self.structs
+            .get(name)
+            .ok_or_else(|| error(format!("undefined struct `{name}`")))
+    }
+
+    pub fn sequence(&self, name: &str) -> Result<S, RuntimeError> {
+        self.sequences
+            .get(name)
+            .cloned()
+            .ok_or_else(|| error(format!("undefined sequence `{name}`")))
+    }
+
+    pub fn shapes(&self) -> HashMap<String, Vec<String>> {
+        let shapes = self.structs.iter();
+        shapes.map(|(name, f)| (name.clone(), f.to_vec())).collect()
+    }
+
+    /// The error for a name that is not a variable, which says what it is if
+    /// it is declared as something else.
+    pub fn undefined(&self, name: &str) -> RuntimeError {
+        error(if self.structs.contains_key(name) {
+            struct_hint(name)
+        } else if self.sequences.contains_key(name) {
+            sequence_hint(name)
+        } else if let Some(symbols) = self.enums.get(name) {
+            enum_hint(name, &symbols[0])
+        } else {
+            format!("undefined variable `{name}`")
+        })
+    }
 }
 
 pub(crate) fn struct_hint(name: &str) -> String {
@@ -443,12 +530,39 @@ pub(crate) fn enum_hint(name: &str, symbol: &str) -> String {
     format!("`{name}` is an enum, not a value: its values are its symbols, like `:{symbol}`")
 }
 
-/// An operand of `and` or `or`, which must be a Bool.
-pub(crate) fn logical(op: BinaryOp, value: &Value) -> Result<bool, RuntimeError> {
-    match value {
-        Value::Bool(v) => Ok(*v),
-        v => Err(error(format!(
-            "operands of `{op}` must be Bool, got {}",
+pub(crate) fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RuntimeError> {
+    if expected == got {
+        return Ok(());
+    }
+    Err(error(format!(
+        "`{name}` expects {expected} argument{}, got {got}",
+        if expected == 1 { "" } else { "s" }
+    )))
+}
+
+pub(crate) fn stack_overflow() -> RuntimeError {
+    error(format!(
+        "stack overflow: more than {MAX_CALL_DEPTH} nested calls"
+    ))
+}
+
+pub(crate) fn not_callable(value: &Value) -> RuntimeError {
+    error(format!(
+        "can only call functions, got {}",
+        value.type_name()
+    ))
+}
+
+/// The Bool that `if`, `when`, `and` and `or` need: ludo has no truthiness.
+pub(crate) fn check_bool(test: Test, value: &Value) -> Result<bool, RuntimeError> {
+    match (value, test) {
+        (Value::Bool(v), _) => Ok(*v),
+        (v, Test::If | Test::When) => Err(error(format!(
+            "the condition of `{test}` must be a Bool, got {}",
+            v.type_name()
+        ))),
+        (v, Test::And | Test::Or) => Err(error(format!(
+            "operands of `{test}` must be Bool, got {}",
             v.type_name()
         ))),
     }
@@ -477,14 +591,19 @@ pub(crate) fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, R
     use BinaryOp::*;
     use Value::{Bool, Float, Int, Str};
 
+    let checked = |result: Option<i64>| {
+        result
+            .map(Int)
+            .ok_or_else(|| error(format!("integer overflow in `{op}`")))
+    };
     match (op, left, right) {
         (Div | Rem, Int(_), Int(0)) => Err(error("division by zero")),
 
-        (Add, Int(a), Int(b)) => checked(a.checked_add(b), op),
-        (Sub, Int(a), Int(b)) => checked(a.checked_sub(b), op),
-        (Mul, Int(a), Int(b)) => checked(a.checked_mul(b), op),
-        (Div, Int(a), Int(b)) => checked(a.checked_div(b), op),
-        (Rem, Int(a), Int(b)) => checked(a.checked_rem(b), op),
+        (Add, Int(a), Int(b)) => checked(a.checked_add(b)),
+        (Sub, Int(a), Int(b)) => checked(a.checked_sub(b)),
+        (Mul, Int(a), Int(b)) => checked(a.checked_mul(b)),
+        (Div, Int(a), Int(b)) => checked(a.checked_div(b)),
+        (Rem, Int(a), Int(b)) => checked(a.checked_rem(b)),
 
         (Add, Float(a), Float(b)) => Ok(Float(a + b)),
         (Sub, Float(a), Float(b)) => Ok(Float(a - b)),
@@ -526,217 +645,64 @@ pub(crate) fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, R
     }
 }
 
-pub(crate) fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RuntimeError> {
-    if expected == got {
-        return Ok(());
-    }
-    Err(error(format!(
-        "`{name}` expects {expected} argument{}, got {got}",
-        if expected == 1 { "" } else { "s" }
-    )))
-}
-
-fn checked(result: Option<i64>, op: BinaryOp) -> Result<Value, RuntimeError> {
-    result
-        .map(Value::Int)
-        .ok_or_else(|| error(format!("integer overflow in `{op}`")))
-}
-
-pub(crate) fn error(message: impl Into<String>) -> RuntimeError {
-    RuntimeError {
-        message: message.into(),
-        line: None,
-    }
-}
-
-struct Run {
-    decl: Rc<SeqDecl>,
-    locals: Vec<(String, Value)>,
-    state: Value,
-    step: usize,
-    pass: usize,
-    passes: usize,
-}
-
-impl Run {
-    fn is_done(&self) -> bool {
-        self.step == self.decl.body.len()
-    }
-
-    fn state_name(&self) -> &str {
-        &self.decl.params[0].name
-    }
-}
-
-impl Interpreter {
-    fn start(&mut self, name: &str, args: Vec<Value>) -> Result<Run, RuntimeError> {
-        let decl = self
-            .sequences
+/// The value of a field of a struct.
+pub(crate) fn field(target: &Value, name: &str) -> Result<Value, RuntimeError> {
+    match target {
+        Value::Struct(instance) => instance
             .get(name)
             .cloned()
-            .ok_or_else(|| error(format!("undefined sequence `{name}`")))?;
-        check_arity(&decl.name, decl.params.len(), args.len())?;
+            .ok_or_else(|| error(format!("`{}` has no field `{name}`", instance.name))),
+        other => Err(error(format!("{} has no fields", other.type_name()))),
+    }
+}
 
-        let mut args = args.into_iter();
-        let state = args.next().expect("a sequence has at least one parameter");
-        let locals = decl.params[1..]
+/// Builds a struct of type `name`, whose `declared` fields come from those
+/// of `base`, if it updates one, and the `fields` a literal gives in the
+/// order they are written. `value` gives the value of each of these once its
+/// field is known to be declared.
+pub(crate) fn build_struct<'a, T>(
+    name: &str,
+    declared: &[String],
+    base: Option<Value>,
+    fields: impl IntoIterator<Item = (&'a str, T)>,
+    mut value: impl FnMut(T) -> Result<Value, RuntimeError>,
+) -> Result<Value, RuntimeError> {
+    let mut slots: Vec<Option<Value>> = match base {
+        Some(Value::Struct(instance)) if instance.name == name => instance
+            .fields
             .iter()
-            .map(|param| param.name.clone())
-            .zip(args)
-            .collect();
-        Ok(Run {
-            decl,
-            locals,
-            state,
-            step: 0,
-            pass: 0,
-            passes: 0,
+            .map(|(_, v)| Some(v.clone()))
+            .collect(),
+        Some(other) => {
+            return Err(error(format!(
+                "`{name} {{ x | ... }}` needs a {name} as `x`, got {}",
+                other.type_name()
+            )))
+        }
+        None => vec![None; declared.len()],
+    };
+
+    for (field, given) in fields {
+        let index = declared
+            .iter()
+            .position(|f| f == field)
+            .ok_or_else(|| error(format!("`{name}` has no field `{field}`")))?;
+        slots[index] = Some(value(given)?);
+    }
+
+    let fields = declared
+        .iter()
+        .zip(slots)
+        .map(|(field, value)| {
+            let value =
+                value.ok_or_else(|| error(format!("missing field `{field}` in `{name}`")))?;
+            Ok((field.clone(), value))
         })
-    }
-
-    fn step(&mut self, run: &mut Run, dt: f64) -> Result<(), RuntimeError> {
-        let caller = std::mem::replace(&mut self.frame, self.locals.len());
-        self.locals.append(&mut run.locals);
-        self.locals
-            .push((run.state_name().to_string(), run.state.clone()));
-        self.nested += 1;
-        let result = self.advance(run, dt);
-        self.nested -= 1;
-
-        for (name, value) in self.locals.split_off(self.frame) {
-            if name == run.state_name() {
-                run.state = value;
-            } else {
-                run.locals.push((name, value));
-            }
-        }
-        self.frame = caller;
-        result
-    }
-
-    pub fn run_sequences(&mut self, world: Value, dt: f64) -> Result<Value, RuntimeError> {
-        let mut runs = std::mem::take(&mut self.runs);
-        let mut world = world;
-        let mut result = Ok(());
-        for run in &mut runs {
-            run.state = world;
-            result = self.step(run, dt);
-            world = run.state.clone();
-            if result.is_err() {
-                break;
-            }
-        }
-
-        runs.retain(|r| !r.is_done());
-        for run in std::mem::take(&mut self.runs) {
-            replace(&mut runs, run);
-        }
-        self.runs = runs;
-        result.map(|()| world)
-    }
-
-    pub fn adopt_sequences(&mut self, from: &mut Interpreter) {
-        let mut runs = std::mem::take(&mut from.runs);
-        runs.retain(|r| !self.runs.iter().any(|s| s.decl.name == r.decl.name));
-        runs.append(&mut self.runs);
-        self.runs = runs;
-    }
-
-    pub fn stop_sequences(&mut self) {
-        self.runs.clear();
-    }
-
-    fn launch(&mut self, name: &str, args: Vec<Value>) -> Result<(), RuntimeError> {
-        let run = self.start(name, args)?;
-        replace(&mut self.runs, run);
-        Ok(())
-    }
-
-    fn advance(&mut self, run: &mut Run, dt: f64) -> Result<(), RuntimeError> {
-        let decl = run.decl.clone();
-        let mut spent = false;
-        while let Some(step) = decl.body.get(run.step) {
-            let StepKind::Over {
-                duration,
-                var,
-                body,
-            } = &step.kind
-            else {
-                self.execute_step(step)?;
-                run.step += 1;
-                continue;
-            };
-            if spent {
-                break;
-            }
-
-            if run.pass == 0 {
-                run.passes = passes(self.evaluate(duration), dt).map_err(|e| e.at(step.line))?;
-            }
-            run.pass += 1;
-            let t = if run.pass == run.passes {
-                1.0
-            } else {
-                run.pass as f64 / run.passes as f64
-            };
-            self.over_pass(run.state_name(), var.as_deref(), t, body)?;
-
-            spent = true;
-
-            if run.pass < run.passes {
-                break;
-            }
-            run.pass = 0;
-            run.step += 1;
-        }
-        Ok(())
-    }
-
-    fn over_pass(
-        &mut self,
-        state: &str,
-        var: Option<&str>,
-        t: f64,
-        body: &[Step],
-    ) -> Result<(), RuntimeError> {
-        let outer = self.locals.len();
-        if let Some(var) = var {
-            self.bind(var.to_string(), Value::Float(t));
-        }
-        let result = body.iter().try_for_each(|step| self.execute_step(step));
-        let value = self.lookup(state).cloned();
-        self.locals.truncate(outer);
-        result?;
-        if let Some(value) = value {
-            self.bind(state.to_string(), value);
-        }
-        Ok(())
-    }
-
-    fn execute_step(&mut self, step: &Step) -> Result<(), RuntimeError> {
-        match &step.kind {
-            StepKind::Stmt(stmt) => self.execute(stmt).map(drop),
-            StepKind::Set(target, field, expr) => self.set_field(target, field, expr),
-            StepKind::Over { .. } => unreachable!("the parser keeps `over` out of `over`"),
-        }
-        .map_err(|e| e.at(step.line))
-    }
-
-    fn set_field(&mut self, target: &str, field: &str, expr: &Expr) -> Result<(), RuntimeError> {
-        let value = self.evaluate(expr)?;
-        let state = self
-            .lookup(target)
-            .expect("a running sequence always has its state");
-        let updated = with_field(target, state, field, value)?;
-        self.bind(target.to_string(), updated);
-        Ok(())
-    }
-
-    /// The names of the sequences that are running, in the order they run.
-    #[cfg(test)]
-    pub(crate) fn running(&self) -> Vec<&str> {
-        self.runs.iter().map(|r| r.decl.name.as_str()).collect()
-    }
+        .collect::<Result<_, RuntimeError>>()?;
+    Ok(Value::Struct(Rc::new(Instance {
+        name: name.to_string(),
+        fields,
+    })))
 }
 
 /// The state of a sequence with one of its fields replaced, for
@@ -747,15 +713,13 @@ pub(crate) fn with_field(
     field: &str,
     value: Value,
 ) -> Result<Value, RuntimeError> {
-    let mut instance = match state {
-        Value::Struct(instance) => (**instance).clone(),
-        other => {
-            return Err(error(format!(
-                "`{target}.{field} = ...` needs `{target}` to be a struct, got {}",
-                other.type_name()
-            )))
-        }
+    let Value::Struct(instance) = state else {
+        return Err(error(format!(
+            "`{target}.{field} = ...` needs `{target}` to be a struct, got {}",
+            state.type_name()
+        )));
     };
+    let mut instance = (**instance).clone();
     match instance.fields.iter_mut().find(|(f, _)| f == field) {
         Some((_, slot)) => *slot = value,
         None => return Err(error(format!("`{}` has no field `{field}`", instance.name))),
@@ -763,17 +727,36 @@ pub(crate) fn with_field(
     Ok(Value::Struct(Rc::new(instance)))
 }
 
-fn replace(runs: &mut Vec<Run>, run: Run) {
-    runs.retain(|r| r.decl.name != run.decl.name);
-    runs.push(run);
+/// Whether a value matches a literal pattern: a value of the literal's type
+/// equal to it. A value of another type does not match; it is no error.
+pub(crate) fn matches(value: &Value, literal: &Value) -> bool {
+    value.same_type(literal) && value == literal
+}
+
+/// What a value of an `Option` or a `Result` holds if it is this variant:
+/// `Some(Some(x))` for a match with `x` inside, `Some(None)` for `None`, and
+/// `None` for another variant or another type, which is no match.
+pub(crate) fn contents(variant: Variant, value: &Value) -> Option<Option<Value>> {
+    match (variant, value) {
+        (Variant::Some, Value::Option(Some(held)))
+        | (Variant::Ok, Value::Result(Ok(held)))
+        | (Variant::Error, Value::Result(Err(held))) => Some(Some((**held).clone())),
+        (Variant::None, Value::Option(None)) => Some(None),
+        _ => None,
+    }
+}
+
+pub(crate) fn no_match(value: &Value) -> RuntimeError {
+    let shown = match value {
+        Value::Str(v) => format!("{v:?}"),
+        v => v.to_string(),
+    };
+    error(format!("no branch of `case` matches {shown}"))
 }
 
 /// How many passes, one per frame, an `over` of this duration makes.
-pub(crate) fn passes(
-    duration: Result<Value, RuntimeError>,
-    dt: f64,
-) -> Result<usize, RuntimeError> {
-    match duration? {
+pub(crate) fn passes(duration: Value, dt: f64) -> Result<usize, RuntimeError> {
+    match duration {
         Value::Float(d) if d >= 0.0 && d.is_finite() => {
             Ok(((d / dt - 1e-9).ceil() as usize).max(1))
         }
@@ -787,498 +770,99 @@ pub(crate) fn passes(
     }
 }
 
+/// How far along an `over` is after this pass, `t`: exactly 1 at the last.
+pub(crate) fn progress(pass: usize, passes: usize) -> f64 {
+    if pass == passes {
+        1.0
+    } else {
+        pass as f64 / passes as f64
+    }
+}
+
+/// A sequence that is running, however a backend keeps its place.
+pub trait Coroutine {
+    fn name(&self) -> &str;
+    fn is_done(&self) -> bool;
+}
+
+/// How both backends run sequences; only how one takes a step differs.
+pub trait Sequences {
+    type Run: Coroutine;
+
+    /// The sequences that are running, in the order they were started.
+    fn runs(&mut self) -> &mut Vec<Self::Run>;
+
+    /// Runs one frame of a sequence over the world, until it waits for the
+    /// next frame or ends, and gives back the world as it leaves it.
+    fn step(&mut self, run: &mut Self::Run, world: Value, dt: f64) -> Result<Value, RuntimeError>;
+
+    /// Starts a sequence, replacing one with the same name.
+    fn launch(&mut self, run: Self::Run) {
+        let runs = self.runs();
+        runs.retain(|r| r.name() != run.name());
+        runs.push(run);
+    }
+
+    /// Runs one frame of every sequence over the world, in the order they
+    /// were started, each over what the one before left. Sequences started
+    /// on the way join at the end. It gives back the world as the last one
+    /// left it; after an error, the rest wait for the next frame.
+    fn run_sequences(&mut self, world: Value, dt: f64) -> Result<Value, RuntimeError> {
+        let mut runs = std::mem::take(self.runs());
+        let mut result = Ok(world);
+        for run in &mut runs {
+            result = result.and_then(|world| self.step(run, world, dt));
+        }
+        runs.retain(|run| !run.is_done());
+        let started = std::mem::replace(self.runs(), runs);
+        for run in started {
+            self.launch(run);
+        }
+        result
+    }
+
+    /// Takes over the sequences running in `from`, the code before a reload,
+    /// except those this one already started. They keep the code they
+    /// started with, and look globals up by name here.
+    fn adopt_sequences(&mut self, from: &mut Self) {
+        let mut runs = std::mem::take(from.runs());
+        let own = self.runs();
+        runs.retain(|run| !own.iter().any(|r| r.name() == run.name()));
+        runs.append(own);
+        *own = runs;
+    }
+
+    fn stop_sequences(&mut self) {
+        self.runs().clear();
+    }
+
+    /// The names of the sequences that are running, in the order they run.
+    #[cfg(test)]
+    fn running(&mut self) -> Vec<String> {
+        self.runs().iter().map(|r| r.name().to_string()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{parse, parse_expr};
+    use crate::parser::parse;
     use crate::scanner::scan_tokens;
 
-    fn load(source: &str) -> (Interpreter, Vec<Result<Option<Value>, RuntimeError>>) {
-        let tokens = scan_tokens(source).expect("source should scan cleanly");
-        let statements = parse(tokens).expect("source should parse cleanly");
+    #[test]
+    fn a_sequence_keeps_only_its_own_locals_between_frames() {
+        let source = "Ball :: struct { x: Float, y: Float }\n\
+                      drift :: sequence (b: Ball) {\n  let from = b.x\n  over 10.0s {\n    b.x = b.x + 1.0\n  }\n}\n\
+                      start drift(Ball { x: 0.0, y: 0.0 })\n\
+                      let ball = Ball { x: 0.0, y: 0.0 }";
         let mut interpreter = Interpreter::new();
-        let results = statements
-            .iter()
-            .map(|stmt| interpreter.execute(stmt))
-            .collect();
-        (interpreter, results)
-    }
-
-    fn outputs(source: &str) -> String {
-        let lines: Vec<String> = load(source)
-            .1
-            .into_iter()
-            .filter_map(|result| match result {
-                Ok(value) => value.map(|v| v.to_string()),
-                Err(error) => Some(format!("error: {}", error.message)),
-            })
-            .collect();
-        lines.join("\n")
-    }
-
-    fn runs(cases: &[(&str, &str)]) {
-        for (source, expected) in cases {
-            assert_eq!(outputs(source), *expected, "{source:?}");
+        for stmt in parse(scan_tokens(source).unwrap()).unwrap() {
+            interpreter.execute(&stmt).unwrap();
         }
-    }
-
-    #[test]
-    fn evaluates_expressions() {
-        runs(&[
-            (
-                "1 + 2 * 3\n7 / 2\n7 % 2\n7.0 / 2.0\n-3\n1.0 / 0.0",
-                "7\n3\n1\n3.5\n-3\ninf",
-            ),
-            (
-                "1 < 2\n\"a\" + \"b\"\n:jump == :jump\n!true\nfalse and 1 / 0 == 1\ntrue or 1 / 0 == 1",
-                "true\nab\ntrue\nfalse\nfalse\ntrue",
-            ),
-            (
-                "1 + 2.0\n1 == 1.0\n1 / 0\n9223372036854775807 + 1\n-true\n1 and true\nx",
-                "error: operands of `+` must be two Ints, two Floats or two Strings, got Int and Float\n\
-                 error: operands of `==` must be two values of the same type, got Int and Float\n\
-                 error: division by zero\n\
-                 error: integer overflow in `+`\n\
-                 error: operand of `-` must be an Int or a Float, got Bool\n\
-                 error: operands of `and` must be Bool, got Int\n\
-                 error: undefined variable `x`",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn let_and_blocks_scope_names() {
-        runs(&[
-            ("let x = 1\nlet x = x + 1\nx", "2"),
-            ("let x = 1\nlet x = 1 / 0\nx", "error: division by zero\n1"),
-            (
-                "let area = {\n  let w = 4\n  w * 5\n}\narea\nw",
-                "20\nerror: undefined variable `w`",
-            ),
-            (
-                "let x = 1\nlet y = {\n  let x = x + 10\n  x\n}\ny\nx",
-                "11\n1",
-            ),
-            (
-                "let x = 1\n{\n  let x = 2\n  x / 0\n}\nx",
-                "error: division by zero\n1",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_runtime_error_reports_the_inner_line() {
-        let line = |source: &str| {
-            let (_, results) = load(source);
-            results.into_iter().find_map(Result::err).unwrap().line
-        };
-        assert_eq!(line("let x = 1\n\nlet y = x / 0"), Some(3));
-        assert_eq!(line("let y = {\n  let x = 1 / 0\n  x\n}"), Some(2));
-        assert_eq!(line("f :: (x: Int) -> Int {\n  x / 0\n}\nf(1)"), Some(2));
-        assert_eq!(
-            line("boom :: (x: Int) -> Int {\n  1 / x\n}\n[0] |> map(boom)"),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn calls_functions() {
-        let add = "add :: (a: Int, b: Int) -> Int { a + b }\n";
-        let parity = "is_even :: (n: Int) -> Bool { n == 0 or is_odd(n - 1) }\n\
-                      is_odd :: (n: Int) -> Bool { n != 0 and is_even(n - 1) }\n";
-        runs(&[
-            (&format!("{add}add(2, 3)\n2 |> add(3)\n2.add(3)"), "5\n5\n5"),
-            (&format!("{parity}is_even(10)\nis_odd(7)"), "true\ntrue"),
-            ("scaled :: (x: Int) -> Int { x * SCALE }\nlet SCALE = 10\nscaled(3)", "30"),
-            (
-                "peek :: () -> Int { secret }\n{\n  let secret = 1\n  peek()\n}",
-                "error: undefined variable `secret`",
-            ),
-            ("let x = 100\nid :: (x: Int) -> Int { x }\nid(1)\nx", "1\n100"),
-            (
-                "double :: (x: Int) -> Int { x * 2 }\ntwice :: (f: Fn, x: Int) -> Int { f(f(x)) }\ntwice(double, 3)\ndouble",
-                "12\n<fn double>",
-            ),
-            (
-                &format!("{add}id :: (x: Int) -> Int {{ x }}\nadd(1)\nid(1, 2)\nlet n = 1\nn(2)\nid == id"),
-                "error: `add` expects 2 arguments, got 1\n\
-                 error: `id` expects 1 argument, got 2\n\
-                 error: can only call functions, got Int\n\
-                 error: functions cannot be compared",
-            ),
-            (
-                "let x = 1\nboom :: (x: Int) -> Int { x / 0 }\nboom(5)\nx",
-                "error: division by zero\n1",
-            ),
-        ]);
-        assert_eq!(
-            outputs("loop_forever :: (n: Int) -> Int { loop_forever(n + 1) }\nloop_forever(0)"),
-            format!("error: stack overflow: more than {MAX_CALL_DEPTH} nested calls")
-        );
-    }
-
-    #[test]
-    fn if_evaluates_only_the_branch_it_takes() {
-        runs(&[
-            (
-                "if 1 < 2 { :yes } else { 1 / 0 }\nif false { 1 / 0 } else { :no }",
-                ":yes\n:no",
-            ),
-            (
-                "sign :: (n: Int) -> Symbol {\n  if n < 0 { :neg } else if n == 0 { :zero } else { :pos }\n}\nsign(0)",
-                ":zero",
-            ),
-            (
-                "fact :: (n: Int) -> Int { if n == 0 { 1 } else { n * fact(n - 1) } }\nfact(10)",
-                "3628800",
-            ),
-            ("if 1 { 2 } else { 3 }", "error: the condition of `if` must be a Bool, got Int"),
-        ]);
-    }
-
-    #[test]
-    fn builds_reads_and_updates_structs() {
-        let ball = "Ball :: struct { x: Float, y: Float }\n";
-        runs(&[
-            (
-                &format!("{ball}let b = Ball {{ y: 2.0, x: 1.0 }}\nb\nb.y\nBall {{ b | y: 5.0 }}\nb == Ball {{ x: 1.0, y: 2.0 }}"),
-                "Ball { x: 1.0, y: 2.0 }\n2.0\nBall { x: 1.0, y: 5.0 }\ntrue",
-            ),
-            (
-                "Label :: struct { text: String }\nLabel { text: \"hi\" }\nEmpty :: struct {}\nEmpty {}",
-                "Label { text: \"hi\" }\nEmpty {}",
-            ),
-            (
-                &format!("{ball}Paddle :: struct {{ y: Float }}\nlet n = 1\ns :: sequence (n: Int) {{}}\n\
-                          Ball {{ x: 1.0, y: 2.0 }} == Paddle {{ y: 2.0 }}\n\
-                          Ball {{ x: 1.0 }}\n\
-                          Ball {{ x: 1.0, y: 2.0, z: 3.0 }}\n\
-                          Wall {{ y: 1.0 }}\n\
-                          Ball {{ 1 | x: 2.0 }}\n\
-                          n.x\n\
-                          Ball\n\
-                          s(1)"),
-                "error: operands of `==` must be two values of the same type, got Ball and Paddle\n\
-                 error: missing field `y` in `Ball`\n\
-                 error: `Ball` has no field `z`\n\
-                 error: undefined struct `Wall`\n\
-                 error: `Ball { x | ... }` needs a Ball as `x`, got Int\n\
-                 error: Int has no fields\n\
-                 error: `Ball` is a struct, not a value: build one with `Ball { ... }`\n\
-                 error: `s` is a sequence, not a function: it runs over time and cannot be called",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn calls_natives() {
-        runs(&[
-            (
-                "abs(-3)\nmin(2.0, 1.5)\nclamp(5, 0, 3)\nto_int(-2.7)\nto_float(3)\nto_string(3) + \"!\"\nconcat([1], [2, 3])",
-                "3\n1.5\n3\n-2\n3.0\n3!\n[1, 2, 3]",
-            ),
-            ("[\"a\", :b]\n[1, 2] == [1, 2]\n[:a, :b] |> contains(:b)\n[1] |> contains(1.0)", "[\"a\", :b]\ntrue\ntrue\nfalse"),
-            ("abs\nlet abs = 1\nabs + 1", "<fn abs>\n2"),
-            ("3 |> print |> abs", "3"),
-            (
-                "abs(true)\nclamp(1, 3, 0)\nmin(1)\nabs == abs",
-                "error: `abs` expects an Int or a Float, got Bool\n\
-                 error: `clamp` expects its lower bound to be at most its upper bound\n\
-                 error: `min` expects 2 arguments, got 1\n\
-                 error: functions cannot be compared",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn lists_are_traversed_with_map_filter_and_fold() {
-        let fns = "double :: (x: Int) -> Int { x * 2 }\n\
-                   even :: (x: Int) -> Bool { x % 2 == 0 }\n\
-                   add :: (a: Int, b: Int) -> Int { a + b }\n";
-        runs(&[
-            (
-                &format!("{fns}range(0, 5)\nrange(3, 1)\n[] |> fold(7, add)"),
-                "[0, 1, 2, 3, 4]\n[]\n7",
-            ),
-            (
-                &format!("{fns}range(0, 10) |> filter(even) |> map(double) |> fold(0, add)\n[-1, 2] |> map(abs)"),
-                "40\n[1, 2]",
-            ),
-            (&format!("{fns}range(1, 1001) |> fold(0, add)"), "500500"),
-            (
-                &format!("{fns}1 |> map(double)\n[1] |> filter(double)\n[1] |> map(add)\nrange(0, 1.0)\nrange(0, 2000000)"),
-                "error: `map` expects a List, got Int\n\
-                 error: `filter` expects a function that returns a Bool, got Int\n\
-                 error: `add` expects 2 arguments, got 1\n\
-                 error: `range` expects two Ints, got Int and Float\n\
-                 error: `range` can make at most 1000000 numbers, got 2000000",
-            ),
-        ]);
-    }
-
-    #[test]
-    fn the_host_calls_and_adds_functions() {
-        fn twice(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
-            match &args[0] {
-                Value::Int(n) => Ok(Value::Int(n * 2)),
-                other => Ok(other.clone()),
-            }
+        let mut world = interpreter.globals["ball"].clone();
+        for _ in 0..20 {
+            world = interpreter.run_sequences(world, 0.25).unwrap();
         }
-        let (mut interpreter, _) = load("add :: (a: Int, b: Int) -> Int { a + b }\nlet n = 1");
-        interpreter.define(Native {
-            name: "twice",
-            arity: 1,
-            fun: twice,
-        });
-        let mut call = |name: &str, args: Vec<Value>| {
-            interpreter.call_function(name, args).map_err(|e| e.message)
-        };
-        assert_eq!(
-            call("add", vec![Value::Int(2), Value::Int(3)]),
-            Ok(Value::Int(5))
-        );
-        assert_eq!(call("twice", vec![Value::Int(4)]), Ok(Value::Int(8)));
-        assert_eq!(
-            call("n", vec![]),
-            Err("can only call functions, got Int".into())
-        );
-        assert_eq!(
-            call("nope", vec![]),
-            Err("undefined function `nope`".into())
-        );
-        assert_eq!(interpreter.arity("add"), Some(2));
-        assert_eq!(interpreter.arity("twice"), Some(1));
-        assert_eq!(interpreter.arity("n"), None);
-    }
-
-    fn load_with_ball(source: &str) -> Interpreter {
-        let source = format!("Ball :: struct {{ x: Float, y: Float }}\n{source}");
-        let mut interpreter = Interpreter::new();
-        for stmt in parse(scan_tokens(&source).unwrap()).expect("source should parse") {
-            interpreter.execute(&stmt).expect("source should run");
-        }
-        interpreter
-    }
-
-    fn start(source: &str, args: &[&str]) -> (Interpreter, Result<Run, RuntimeError>) {
-        let mut interpreter = load_with_ball(source);
-        let args = args
-            .iter()
-            .map(|arg| {
-                let expr = parse_expr(scan_tokens(arg).unwrap()).unwrap();
-                interpreter.evaluate(&expr).unwrap()
-            })
-            .collect();
-        let run = interpreter.start("s", args);
-        (interpreter, run)
-    }
-
-    fn ball(x: f64) -> Value {
-        Value::Struct(Rc::new(Instance {
-            name: "Ball".into(),
-            fields: vec![
-                ("x".into(), Value::Float(x)),
-                ("y".into(), Value::Float(0.0)),
-            ],
-        }))
-    }
-
-    fn x(value: &Value) -> String {
-        match value {
-            Value::Struct(ball) => ball.fields[0].1.to_string(),
-            other => other.to_string(),
-        }
-    }
-
-    fn frames(source: &str, args: &[&str], dt: f64, count: usize) -> String {
-        let (mut interpreter, run) = start(source, args);
-        let mut run = run.unwrap();
-        let frames: Vec<String> = (0..count)
-            .map(|_| {
-                interpreter.step(&mut run, dt).expect("step should run");
-                let done = if run.is_done() { " done" } else { "" };
-                format!("{}{done}", x(&run.state))
-            })
-            .collect();
-        frames.join(", ")
-    }
-
-    fn worlds(interpreter: &mut Interpreter, x0: f64, count: usize) -> String {
-        let mut world = ball(x0);
-        let worlds: Vec<String> = (0..count)
-            .map(|_| {
-                world = interpreter.run_sequences(world.clone(), 0.25).unwrap();
-                x(&world)
-            })
-            .collect();
-        worlds.join(", ")
-    }
-
-    fn running(interpreter: &Interpreter) -> Vec<&str> {
-        interpreter
-            .runs
-            .iter()
-            .map(|r| r.decl.name.as_str())
-            .collect()
-    }
-
-    const START: &str = "Ball { x: 0.0, y: 0.0 }";
-
-    #[test]
-    fn wait_and_over_take_whole_steps() {
-        let cases = [
-            ("b.x = 1.0\n  b.x = b.x + 1.0", 1, "2.0 done"),
-            ("wait 1.0s\n  b.x = 5.0", 4, "0.0, 0.0, 0.0, 5.0 done"),
-            (
-                "over 1.0s as t {\n    b.x = t\n  }",
-                4,
-                "0.25, 0.5, 0.75, 1.0 done",
-            ),
-            ("over 0.3s as t {\n    b.x = t\n  }", 2, "0.5, 1.0 done"),
-            ("wait 0.0s\n  b.x = 1.0", 1, "1.0 done"),
-            (
-                "b.x = 1.0\n  wait 0.5s\n  b.x = 2.0\n  wait 0.25s\n  b.x = 3.0",
-                3,
-                "1.0, 2.0, 3.0 done",
-            ),
-            ("b.x = b.x + 1.0", 3, "1.0 done, 1.0 done, 1.0 done"),
-            (
-                "over 0.5s as t {\n    b.x = half(t) |> min(0.3)\n  }",
-                2,
-                "0.25, 0.3 done",
-            ),
-        ];
-        for (body, count, expected) in cases {
-            let source = format!(
-                "half :: (x: Float) -> Float {{ x / 2.0 }}\ns :: sequence (b: Ball) {{\n  {body}\n}}"
-            );
-            assert_eq!(frames(&source, &[START], 0.25, count), expected, "{body:?}");
-        }
-
-        let at_60 = frames(
-            "s :: sequence (b: Ball) {\n  over 0.1s as t {\n    b.x = t\n  }\n}",
-            &[START],
-            1.0 / 60.0,
-            6,
-        );
-        assert!(at_60.ends_with("0.8333333333333334, 1.0 done"), "{at_60}");
-
-        assert_eq!(
-            frames(
-                "s :: sequence (b: Ball, to: Float) {\n  let from = b.x\n  over 0.5s as t {\n    let d = to - from\n    b.x = from + d * t\n  }\n}",
-                &["Ball { x: 10.0, y: 0.0 }", "20.0"],
-                0.25,
-                2
-            ),
-            "15.0, 20.0 done"
-        );
-    }
-
-    #[test]
-    fn reports_errors_in_steps() {
-        let cases = [
-            (
-                "b: Ball",
-                "wait 1",
-                0.25,
-                "a duration must be a Float in seconds, got Int",
-                Some(3),
-            ),
-            (
-                "b: Ball",
-                "wait -1.0s",
-                0.25,
-                "a duration must be a finite number of seconds, at least 0s, got -1.0",
-                Some(3),
-            ),
-            (
-                "b: Ball",
-                "b.z = 1.0",
-                0.25,
-                "`Ball` has no field `z`",
-                Some(3),
-            ),
-            (
-                "b: Int",
-                "b.z = 1.0",
-                0.25,
-                "`b.z = ...` needs `b` to be a struct, got Int",
-                Some(3),
-            ),
-        ];
-        for (param, body, dt, message, line) in cases {
-            let arg = if param == "b: Int" { "1" } else { START };
-            let source = format!("s :: sequence ({param}) {{\n  {body}\n}}");
-            let (mut interpreter, run) = start(&source, &[arg]);
-            let error = interpreter.step(&mut run.unwrap(), dt).unwrap_err();
-            assert_eq!(
-                (error.message.as_str(), error.line),
-                (message, line),
-                "{body:?}"
-            );
-        }
-
-        let message = |run: Result<Run, RuntimeError>| run.err().unwrap().message;
-        assert_eq!(
-            message(Interpreter::new().start("s", vec![])),
-            "undefined sequence `s`"
-        );
-        assert_eq!(
-            message(start("s :: sequence (n: Int) {}", &[]).1),
-            "`s` expects 1 argument, got 0"
-        );
-    }
-
-    #[test]
-    fn running_sequences_step_over_the_current_world() {
-        let mut interpreter = load_with_ball(
-            "push :: sequence (b: Ball, by: Float) {\n  wait 0.5s\n  b.x = b.x + by\n}\nkick :: (b: Ball) -> Ball {\n  start push(b, 10.0)\n  b\n}",
-        );
-        interpreter.call_function("kick", vec![ball(0.0)]).unwrap();
-        assert_eq!(running(&interpreter), ["push"]);
-        assert_eq!(worlds(&mut interpreter, 1.0, 2), "1.0, 11.0");
-        assert_eq!(running(&interpreter).len(), 0);
-
-        let mut interpreter = load_with_ball(&format!(
-            "s :: sequence (b: Ball) {{\n  over 1.0s {{\n    b.x = b.x + 1.0\n  }}\n}}\nstart s({START})"
-        ));
-        assert_eq!(
-            worlds(&mut interpreter, 100.0, 4),
-            "101.0, 102.0, 103.0, 104.0"
-        );
-
-        let mut interpreter = load_with_ball(&format!(
-            "double :: sequence (b: Ball) {{\n  b.x = b.x * 2.0\n}}\ninc :: sequence (b: Ball) {{\n  b.x = b.x + 1.0\n}}\nstart double({START})\nstart inc({START})"
-        ));
-        assert_eq!(worlds(&mut interpreter, 3.0, 1), "7.0");
-
-        let mut interpreter = load_with_ball(&format!(
-            "second :: sequence (b: Ball) {{\n  b.x = b.x + 10.0\n}}\nfirst :: sequence (b: Ball) {{\n  b.x = 1.0\n  start second(b)\n}}\nstart first({START})"
-        ));
-        assert_eq!(worlds(&mut interpreter, 0.0, 1), "1.0");
-        assert_eq!(running(&interpreter), ["second"]);
-        assert_eq!(worlds(&mut interpreter, 1.0, 1), "11.0");
-    }
-
-    #[test]
-    fn starting_a_running_sequence_replaces_it() {
-        let restart = format!("start mark({START}, 2.0)");
-        let mut interpreter = load_with_ball(&format!(
-            "mark :: sequence (b: Ball, to: Float) {{\n  wait 0.5s\n  b.x = to\n}}\nstart mark({START}, 1.0)"
-        ));
-        assert_eq!(worlds(&mut interpreter, 0.0, 1), "0.0");
-        let stmt = &parse(scan_tokens(&restart).unwrap()).unwrap()[0];
-        interpreter.execute(stmt).unwrap();
-        assert_eq!(running(&interpreter).len(), 1);
-        assert_eq!(worlds(&mut interpreter, 0.0, 2), "0.0, 2.0");
-    }
-
-    #[test]
-    fn a_sequence_does_not_keep_old_states_alive() {
-        let mut interpreter = load_with_ball(&format!(
-            "drift :: sequence (b: Ball) {{\n  let from = b.x\n  over 10.0s {{\n    b.x = b.x + 1.0\n  }}\n}}\nstart drift({START})"
-        ));
-        worlds(&mut interpreter, 0.0, 20);
         let names: Vec<&str> = interpreter.runs[0]
             .locals
             .iter()
