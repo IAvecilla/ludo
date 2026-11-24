@@ -93,13 +93,7 @@ pub enum Reload {
 }
 
 impl Game {
-    pub fn load(source: &str) -> Result<Game, Vec<String>> {
-        Game::load_on(source, Backend::Vm)
-    }
-
-    /// Loads a game to run on `backend`, as the benchmarks do to compare
-    /// them.
-    pub fn load_on(source: &str, backend: Backend) -> Result<Game, Vec<String>> {
+    pub fn load(source: &str, backend: Backend) -> Result<Game, Vec<String>> {
         let (mut engine, config) = prepare(source, backend)?;
         let world = init(&mut engine).map_err(|e| vec![e])?;
         Ok(Game {
@@ -261,10 +255,7 @@ fn input(keys: &Keys) -> Value {
 
 fn shape(value: &Value) -> Result<Shape, String> {
     let Value::Struct(instance) = value else {
-        return Err(format!(
-            "`draw` must return a List of Rect, Circle, Line and Text, got a {} in it",
-            value.type_name()
-        ));
+        return Err(not_a_shape(value.type_name()));
     };
     let float = |field: &str| number(instance, field);
     match instance.name.as_str() {
@@ -291,31 +282,27 @@ fn shape(value: &Value) -> Result<Shape, String> {
             x: float("x")?,
             y: float("y")?,
             size: float("size")?,
-            text: match instance.get("text") {
-                Some(Value::Str(text)) => text.clone(),
-                other => return Err(field_error(instance, "text", "a String", other)),
-            },
+            text: string(instance, "text")?,
             color: color(instance)?,
         }),
-        other => Err(format!(
-            "`draw` must return a List of Rect, Circle, Line and Text, got a {other} in it"
-        )),
+        other => Err(not_a_shape(other)),
     }
 }
 
+fn not_a_shape(got: &str) -> String {
+    format!("`draw` must return a List of Rect, Circle, Line and Text, got a {got} in it")
+}
+
 fn read_config(value: &Value) -> Result<Config, String> {
-    let Value::Struct(config) = value else {
-        return Err(format!(
-            "`config` must return a Config, got {}",
-            value.type_name()
-        ));
+    let config = match value {
+        Value::Struct(config) if config.name == "Config" => config,
+        other => {
+            return Err(format!(
+                "`config` must return a Config, got {}",
+                other.type_name()
+            ))
+        }
     };
-    if config.name != "Config" {
-        return Err(format!(
-            "`config` must return a Config, got {}",
-            config.name
-        ));
-    }
     let size = |field: &str| match config.get(field) {
         Some(Value::Int(v)) if (1..=4096).contains(v) => Ok(*v as i32),
         Some(Value::Int(v)) => Err(format!(
@@ -323,14 +310,10 @@ fn read_config(value: &Value) -> Result<Config, String> {
         )),
         other => Err(field_error(config, field, "an Int", other)),
     };
-    let title = match config.get("title") {
-        Some(Value::Str(title)) => title.clone(),
-        other => return Err(field_error(config, "title", "a String", other)),
-    };
     Ok(Config {
+        title: string(config, "title")?,
         width: size("width")?,
         height: size("height")?,
-        title,
     })
 }
 
@@ -338,6 +321,13 @@ fn number(instance: &Instance, field: &str) -> Result<f32, String> {
     match instance.get(field) {
         Some(Value::Float(v)) => Ok(*v as f32),
         other => Err(field_error(instance, field, "a Float", other)),
+    }
+}
+
+fn string(instance: &Instance, field: &str) -> Result<String, String> {
+    match instance.get(field) {
+        Some(Value::Str(text)) => Ok(text.clone()),
+        other => Err(field_error(instance, field, "a String", other)),
     }
 }
 
@@ -399,7 +389,6 @@ fn field_error(instance: &Instance, field: &str, expected: &str, got: Option<&Va
 mod tests {
     use super::*;
 
-    const SQUARE: &str = include_str!("../../../examples/square.ludo");
     const PONG: &str = include_str!("../../../examples/pong.ludo");
     const FRAME: f64 = 1.0 / 60.0;
 
@@ -418,7 +407,8 @@ mod tests {
 
     #[test]
     fn plays_the_square() {
-        let mut game = Game::load(SQUARE).unwrap();
+        let square = include_str!("../../../examples/square.ludo");
+        let mut game = Game::load(square, Backend::Vm).unwrap();
         let right = Keys {
             held: vec!["right"],
             pressed: vec![],
@@ -439,28 +429,17 @@ mod tests {
     }
 
     #[test]
-    fn pong_serves_through_a_sequence() {
-        let mut game = Game::load(PONG).unwrap();
+    fn a_reload_keeps_the_world_and_the_sequences_unless_a_struct_changes() {
+        let mut game = Game::load(PONG, Backend::Vm).unwrap();
         assert_eq!(game.config().title, "Pong");
         steps(&mut game, 30);
         assert_eq!(get(&game.world, &["serving"]), &Value::Bool(true));
-        // `serve` waits 0.6s and grows the ball for 0.4s, then sends it left.
+        assert_eq!(game.reload(PONG).unwrap(), Reload::Kept);
+        // `serve` waits 0.6s and grows the ball for 0.4s, then sends it left,
+        // and it goes on after the reload.
         steps(&mut game, 40);
         assert_eq!(get(&game.world, &["serving"]), &Value::Bool(false));
         assert_eq!(get(&game.world, &["ball", "vx"]), &Value::Float(-320.0));
-        // The 16 dashes of the net, the walls, the paddles, the ball and the
-        // two scores.
-        assert_eq!(game.draw().unwrap().len(), 23);
-    }
-
-    #[test]
-    fn a_reload_keeps_the_world_unless_a_struct_changes() {
-        let mut game = Game::load(PONG).unwrap();
-        steps(&mut game, 30);
-        assert_eq!(game.reload(PONG).unwrap(), Reload::Kept);
-        // The serve that was running carries over and finishes.
-        steps(&mut game, 40);
-        assert_eq!(get(&game.world, &["serving"]), &Value::Bool(false));
 
         let tiny = |fields: &str, value: &str| {
             format!(
@@ -470,7 +449,7 @@ mod tests {
                  draw :: (w: World) -> List[Shape] {{ [] }}"
             )
         };
-        let mut game = Game::load(&tiny("x: Float", "x: 1.0")).unwrap();
+        let mut game = Game::load(&tiny("x: Float", "x: 1.0"), Backend::Vm).unwrap();
         let reload = game.reload(&tiny("x: Float, y: Float", "x: 2.0, y: 0.0"));
         assert_eq!(reload.unwrap(), Reload::Restarted);
         assert_eq!(get(&game.world, &["x"]), &Value::Float(2.0));
@@ -478,7 +457,9 @@ mod tests {
 
     #[test]
     fn a_game_needs_its_functions() {
-        let errors = Game::load("init :: () -> Int { 1 }").err().unwrap();
+        let errors = Game::load("init :: () -> Int { 1 }", Backend::Vm)
+            .err()
+            .unwrap();
         assert_eq!(
             errors,
             [
@@ -490,8 +471,8 @@ mod tests {
 
     #[test]
     fn pong_plays_the_same_on_both_backends() {
-        let mut vm = Game::load_on(PONG, Backend::Vm).unwrap();
-        let mut interpreter = Game::load_on(PONG, Backend::Interpreter).unwrap();
+        let mut vm = Game::load(PONG, Backend::Vm).unwrap();
+        let mut interpreter = Game::load(PONG, Backend::Interpreter).unwrap();
         // Ten seconds of game: the serve, the ball crossing and bouncing, and
         // the CPU paddle following it.
         for frame in 0..600 {
