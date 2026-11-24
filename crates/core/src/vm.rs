@@ -3,12 +3,12 @@ use std::rc::Rc;
 
 use crate::ast::UnaryOp;
 use crate::chunk::{Chunk, Function, Op, Shape};
-use crate::interpreter::{
+use crate::prelude::globals;
+use crate::runtime::{
     binary, build_struct, check_arity, check_bool, contents, error, field, matches, no_match,
     not_callable, passes, progress, stack_overflow, unary, with_field, Coroutine, Declarations,
     RuntimeError, Sequences, MAX_CALL_DEPTH,
 };
-use crate::prelude::globals;
 use crate::value::{Caller, Value};
 
 /// A call in progress: the function, the next instruction it runs and where

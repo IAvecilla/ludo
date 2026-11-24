@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use crate::ast::Stmt;
 use crate::compiler::{compile, CompileError};
-use crate::interpreter::{Interpreter, RuntimeError, Sequences};
+use crate::interpreter::Interpreter;
+use crate::runtime::{RuntimeError, Sequences};
 use crate::value::Value;
 use crate::vm::Vm;
 

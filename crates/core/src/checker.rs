@@ -22,8 +22,8 @@ use crate::ast::{
     Arm, BinaryOp, Expr, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
     TypeExpr, UnaryOp, Variant,
 };
-use crate::interpreter::{check_arity, enum_hint, sequence_hint, struct_hint};
 use crate::prelude::{constants, NATIVES};
+use crate::runtime::{check_arity, enum_hint, sequence_hint, struct_hint};
 use crate::types::{Type, Vars};
 
 /// Whether an error is about a name or about a type.

@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::ast::{FnDecl, Literal};
 use crate::chunk::Function;
-use crate::interpreter::RuntimeError;
+use crate::runtime::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {

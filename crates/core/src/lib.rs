@@ -6,6 +6,7 @@ pub mod engine;
 pub mod interpreter;
 pub mod parser;
 pub mod prelude;
+pub mod runtime;
 pub mod scanner;
 pub mod token;
 pub mod types;

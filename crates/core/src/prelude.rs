@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::interpreter::{error, RuntimeError};
+use crate::runtime::{error, RuntimeError};
 use crate::value::{Caller, Native, Value};
 
 const MAX_RANGE: i64 = 1_000_000;

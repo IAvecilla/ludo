@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use ludo_core::checker::Checker;
 use ludo_core::engine::{Backend, Engine, Failure};
-use ludo_core::interpreter::RuntimeError;
 use ludo_core::parser::parse;
+use ludo_core::runtime::RuntimeError;
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::{Instance, Value};
 
