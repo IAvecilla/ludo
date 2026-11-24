@@ -1,6 +1,9 @@
 // Leap: climb as high as you can. Every platform you land on throws you up
 // again, the arrows or A and D steer, and leaving the screen by one side
 // brings you back by the other. Falling off the bottom starts a new climb.
+//
+// Higher up, platforms get narrower, more of them move from side to side and
+// more crumble after one bounce. Springs throw you ten rows up.
 
 Player :: struct {
     x: Float, y: Float,
@@ -9,12 +12,23 @@ Player :: struct {
     facing: Float,
 }
 
-Platform :: struct { x: Float, y: Float, w: Float }
+Kind :: enum { :plain, :moving, :crumbly, :spring }
+
+// `n` is the number of its row, see `noise`.
+Platform :: struct { n: Int, x: Float, y: Float, w: Float, kind: Kind }
 
 // Heights are measured downwards, as on the screen, so climbing makes y
 // smaller. `camera` is the height at the top of the screen, `top` the
-// highest the player has been, and `base` picks the platforms of this climb.
-World :: struct { player: Player, camera: Float, top: Float, base: Int, time: Float }
+// highest the player has been, `base` picks the platforms of this climb, and
+// `broken` has the rows whose crumbly platform broke.
+World :: struct {
+    player: Player,
+    camera: Float,
+    top: Float,
+    base: Int,
+    time: Float,
+    broken: List[Int],
+}
 
 let width = 480.0
 let height = 720.0
@@ -25,12 +39,14 @@ let run_speed = 320.0
 let run_accel = 2000.0      // full speed in a sixth of a second
 let gravity = 1600.0
 let bounce = 920.0          // each bounce goes about 260 pixels up
+let spring = 1500.0         // and from a spring, about 700, ten rows
 
 let row = 72.0              // the height between two rows of platforms
 let floor_y = 680.0         // the floor is row 0, and row k is k rows above it
 let rows = 100000           // the rows of one climb
-let platform_w = 64.0
+let platform_w = 64.0       // and 16 less, high enough
 let platform_h = 12.0
+let sweep_speed = 70.0      // how fast a moving platform starts going
 
 config :: () -> Config {
     Config { width: to_int(width), height: to_int(height), title: "Leap" }
@@ -48,6 +64,7 @@ climb :: (base: Int) -> World {
         top: y,
         base: base,
         time: 0.0,
+        broken: [],
     }
 }
 
@@ -70,22 +87,54 @@ has_platform :: (n: Int) -> Bool {
     k % 3 == 0 or noise(n) % 100 < 90 - min(k / 4, 55)
 }
 
-platform :: (n: Int) -> Platform {
+// The kind of a platform is made up from its number too. The rows that
+// always have one never crumble, so the way up is never cut.
+kind_of :: (n: Int) -> Kind {
+    let k = n % rows
+    let roll = noise(n + 13) % 100
+    let moving = min(k / 8, 30)
+    let crumbly = if k % 3 == 0 { 0 } else { min(k / 10, 25) }
+    if k < 12 {
+        :plain
+    } else if roll < 4 {
+        :spring
+    } else if roll < 4 + moving {
+        :moving
+    } else if roll < 4 + moving + crumbly {
+        :crumbly
+    } else {
+        :plain
+    }
+}
+
+platform :: (n: Int, time: Float) -> Platform {
     let k = n % rows
     if k == 0 {
-        Platform { x: 0.0, y: floor_y, w: width }
+        Platform { n: n, x: 0.0, y: floor_y, w: width, kind: :plain }
     } else {
-        let x = noise(n + 7) % to_int(width - platform_w)
-        Platform { x: to_float(x), y: floor_y - to_float(k) * row, w: platform_w }
+        let w = platform_w - to_float(min(k / 25, 16))
+        let x = to_float(noise(n + 7) % to_int(width - w))
+        let kind = kind_of(n)
+        let x = if kind == :moving { sweep(x, w, time, k) } else { x }
+        Platform { n: n, x: x, y: floor_y - to_float(k) * row, w: w, kind: kind }
     }
+}
+
+// A moving platform goes from side to side and back, starting from where it
+// would stand, and faster the higher it is.
+sweep :: (x: Float, w: Float, time: Float, k: Int) -> Float {
+    let span = width - w
+    let speed = sweep_speed + to_float(min(k, 400)) / 4.0
+    let along = (x + time * speed) % (2.0 * span)
+    if along < span { along } else { 2.0 * span - along }
 }
 
 on_screen :: (w: World) -> List[Platform] {
     let lowest = clamp(to_int((floor_y - w.camera - height) / row), 0, rows - 1)
     let highest = clamp(to_int((floor_y - w.camera) / row) + 1, 0, rows - 1)
     range(w.base + lowest, w.base + highest + 1)
-        |> filter(has_platform)
-        |> map(platform)
+        |> filter(fn(n: Int) -> Bool { has_platform(n) and !(w.broken |> contains(n)) })
+        |> map(fn(n: Int) -> Platform { platform(n, w.time) })
 }
 
 update :: (w: World, input: Input, dt: Float) -> World {
@@ -93,9 +142,12 @@ update :: (w: World, input: Input, dt: Float) -> World {
         |> steer(input, dt)
         |> fly(dt)
         |> wrap()
-    let p = on_screen(w) |> fold(p, land)
+    let w = case on_screen(w) |> find(fn(pl: Platform) -> Bool { lands(p, pl) }) {
+        Some(pl) -> bounce_on(World { w | player: p }, pl)
+        None -> World { w | player: p }
+    }
+    let p = w.player
     let w = World { w |
-        player: p,
         camera: min(w.camera, p.y - height * 0.45),
         top: min(w.top, p.y),
         time: w.time + dt,
@@ -138,15 +190,20 @@ wrap :: (p: Player) -> Player {
 }
 
 // Platforms only stop the player from above: going up, it passes through.
-land :: (p: Player, platform: Platform) -> Player {
+lands :: (p: Player, pl: Platform) -> Bool {
     let falling = p.vy > 0.0
-    let crossed = p.last_y + player_h <= platform.y and p.y + player_h >= platform.y
-    let above = p.x + player_w > platform.x and p.x < platform.x + platform.w
-    if falling and crossed and above {
-        Player { p | y: platform.y - player_h, vy: -bounce }
-    } else {
-        p
-    }
+    let crossed = p.last_y + player_h <= pl.y and p.y + player_h >= pl.y
+    let above = p.x + player_w > pl.x and p.x < pl.x + pl.w
+    falling and crossed and above
+}
+
+// A crumbly platform breaks after the bounce, so it is not there to fall
+// back on.
+bounce_on :: (w: World, pl: Platform) -> World {
+    let speed = if pl.kind == :spring { spring } else { bounce }
+    let player = Player { w.player | y: pl.y - player_h, vy: -speed }
+    let broken = if pl.kind == :crumbly { concat(w.broken, [pl.n]) } else { w.broken }
+    World { w | player: player, broken: broken }
 }
 
 score :: (w: World) -> Int {
@@ -171,11 +228,34 @@ sky :: () -> List[Shape] {
     [Rect { x: 0.0, y: 0.0, w: width, h: height, color: rgb(22, 24, 44) }]
 }
 
-paint :: (platform: Platform, camera: Float) -> List[Shape] {
-    let y = platform.y - camera
+// Each kind has the same body and its own top: green, blue for one that
+// moves, orange and cracked in two for one that crumbles, and green with a
+// yellow spring on it.
+paint :: (pl: Platform, camera: Float) -> List[Shape] {
+    let y = pl.y - camera
+    case pl.kind {
+        :plain -> slab(pl.x, y, pl.w, rgb(120, 200, 140))
+        :moving -> slab(pl.x, y, pl.w, rgb(110, 170, 250))
+        :crumbly -> {
+            let half = pl.w / 2.0 - 2.0
+            concat(slab(pl.x, y, half, rgb(230, 150, 80)), slab(pl.x + half + 4.0, y, half, rgb(230, 150, 80)))
+        }
+        :spring -> concat(slab(pl.x, y, pl.w, rgb(120, 200, 140)), coil(pl.x + pl.w / 2.0, y))
+    }
+}
+
+slab :: (x: Float, y: Float, w: Float, top: Color) -> List[Shape] {
     [
-        Rect { x: platform.x, y: y, w: platform.w, h: platform_h, color: rgb(64, 70, 110) },
-        Rect { x: platform.x, y: y, w: platform.w, h: 4.0, color: rgb(120, 200, 140) },
+        Rect { x: x, y: y, w: w, h: platform_h, color: rgb(64, 70, 110) },
+        Rect { x: x, y: y, w: w, h: 4.0, color: top },
+    ]
+}
+
+coil :: (x: Float, y: Float) -> List[Shape] {
+    [
+        Rect { x: x - 7.0, y: y - 10.0, w: 14.0, h: 10.0, color: rgb(250, 220, 90) },
+        Line { x1: x - 7.0, y1: y - 6.0, x2: x + 7.0, y2: y - 6.0, thickness: 2.0, color: rgb(150, 120, 40) },
+        Line { x1: x - 7.0, y1: y - 2.0, x2: x + 7.0, y2: y - 2.0, thickness: 2.0, color: rgb(150, 120, 40) },
     ]
 }
 
