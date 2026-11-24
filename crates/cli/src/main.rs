@@ -1,9 +1,9 @@
+use std::fmt::Display;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use ludo_core::ast::Stmt;
 use ludo_core::checker::Checker;
-use ludo_core::chunk::Function;
 use ludo_core::compiler::compile;
 use ludo_core::engine::{Backend, Engine, Failure as Fault};
 use ludo_core::parser::{parse_with, ExprParser, ParseError};
@@ -39,22 +39,29 @@ struct Options {
 }
 
 impl Options {
-    fn parse(flags: &[&str]) -> Option<Options> {
+    /// Reads the flags of a command, or of the REPL if there is none, and
+    /// gives nothing if one of them does not apply to it.
+    fn parse(command: Option<&str>, flags: &[&str]) -> Option<Options> {
         let mut options = Options::default();
         for flag in flags {
-            match *flag {
-                "--interpreter" => options.backend = Backend::Interpreter,
-                "--trace" => options.trace = true,
-                "--parser=pratt" => options.parser = ExprParser::Pratt,
-                "--parser=ladder" => options.parser = ExprParser::Ladder,
-                _ => options.frames = Some(flag.strip_prefix("--frames=")?.parse().ok()?),
+            match (*flag, command) {
+                ("--interpreter", None | Some("run" | "play")) => {
+                    options.backend = Backend::Interpreter
+                }
+                ("--trace", None) => options.trace = true,
+                ("--parser=pratt", _) => options.parser = ExprParser::Pratt,
+                ("--parser=ladder", _) => options.parser = ExprParser::Ladder,
+                (_, Some("play")) => {
+                    options.frames = Some(flag.strip_prefix("--frames=")?.parse().ok()?)
+                }
+                _ => return None,
             }
         }
-        // The trace shows bytecode, which only the VM runs.
-        if options.trace && options.backend == Backend::Interpreter {
-            return None;
-        }
-        Some(options)
+        // The trace shows bytecode, which only the VM runs, and a game is
+        // always parsed the usual way.
+        let traces_interpreter = options.trace && options.backend == Backend::Interpreter;
+        let plays_ladder = command == Some("play") && options.parser != ExprParser::default();
+        (!traces_interpreter && !plays_ladder).then_some(options)
     }
 }
 
@@ -64,51 +71,57 @@ fn main() -> ExitCode {
         .iter()
         .map(String::as_str)
         .partition(|arg| arg.starts_with("--"));
-    let options = Options::parse(&flags);
-
-    let default_parser = |o: &Options| o.parser == ExprParser::default();
-    match (args.as_slice(), options) {
-        ([], Some(o)) if o.frames.is_none() => {
-            run_repl(&o);
-            ExitCode::SUCCESS
+    let command = match args.as_slice() {
+        [] => None,
+        [command @ ("run" | "check" | "play" | "dis"), path] => Some((*command, *path)),
+        _ => return usage(),
+    };
+    let Some(options) = Options::parse(command.map(|(command, _)| command), &flags) else {
+        return usage();
+    };
+    let Some((command, path)) = command else {
+        run_repl(&options);
+        return ExitCode::SUCCESS;
+    };
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(err) => {
+            eprintln!("could not read `{path}`: {err}");
+            return ExitCode::from(EX_USAGE);
         }
-        (["run", path], Some(o)) if !o.trace && o.frames.is_none() => {
-            read(path).map_or_else(|code| code, |source| run_file(&source, &o))
-        }
-        (["check", path], Some(o))
-            if o.backend == Backend::Vm && !o.trace && o.frames.is_none() =>
-        {
-            read(path).map_or_else(|code| code, |source| check_file(&source, &o))
-        }
-        (["play", path], Some(o)) if !o.trace && default_parser(&o) => {
-            read(path).map_or_else(|code| code, |source| play(path, &source, &o))
-        }
-        (["dis", path], Some(o)) if o.backend == Backend::Vm && !o.trace && o.frames.is_none() => {
-            read(path).map_or_else(|code| code, |source| disassemble(&source, &o))
-        }
-        _ => {
-            eprintln!("usage: ludo [--interpreter | --trace] [--parser=P]     start the REPL");
-            eprintln!("       ludo run [--interpreter] [--parser=P] FILE     run a program");
-            eprintln!("       ludo check [--parser=P] FILE                   check a program without running it");
-            eprintln!("       ludo play [--interpreter] [--frames=N] FILE    play a game file in a window");
-            eprintln!("       ludo dis [--parser=P] FILE                     compile to bytecode and trace it on the VM");
-            eprintln!();
-            eprintln!("Programs compile to bytecode and run on the VM. With --interpreter they");
-            eprintln!("run on the tree-walking interpreter instead, to compare; with --trace the");
-            eprintln!("REPL shows the bytecode of each input and traces it as it runs.");
-            eprintln!("--parser=ladder parses expressions with the precedence ladder instead of");
-            eprintln!("Pratt, and --frames=N plays a game for N frames without a window; both are");
-            eprintln!("there for the benchmarks.");
-            ExitCode::from(EX_USAGE)
-        }
+    };
+    match command {
+        "run" => exit(Session::new(&options, true).run(&source, |_| {})),
+        "check" => exit(Session::new(&options, true).check(&source).map(drop)),
+        "dis" => disassemble(&source, options.parser),
+        _ => play(path, &source, &options),
     }
 }
 
-fn read(path: &str) -> Result<String, ExitCode> {
-    std::fs::read_to_string(path).map_err(|err| {
-        eprintln!("could not read `{path}`: {err}");
-        ExitCode::from(EX_USAGE)
-    })
+fn usage() -> ExitCode {
+    eprintln!("usage: ludo [--interpreter | --trace] [--parser=P]     start the REPL");
+    eprintln!("       ludo run [--interpreter] [--parser=P] FILE     run a program");
+    eprintln!(
+        "       ludo check [--parser=P] FILE                   check a program without running it"
+    );
+    eprintln!("       ludo play [--interpreter] [--frames=N] FILE    play a game file in a window");
+    eprintln!("       ludo dis [--parser=P] FILE                     compile to bytecode and trace it on the VM");
+    eprintln!();
+    eprintln!("Programs compile to bytecode and run on the VM. With --interpreter they");
+    eprintln!("run on the tree-walking interpreter instead, to compare; with --trace the");
+    eprintln!("REPL shows the bytecode of each input and traces it as it runs.");
+    eprintln!("--parser=ladder parses expressions with the precedence ladder instead of");
+    eprintln!("Pratt, and --frames=N plays a game for N frames without a window; both are");
+    eprintln!("there for the benchmarks.");
+    ExitCode::from(EX_USAGE)
+}
+
+fn exit(result: Result<(), Failure>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
+        Err(_) => ExitCode::from(EX_DATAERR),
+    }
 }
 
 /// A backend and a checker that last as long as a program, with the host
@@ -117,16 +130,19 @@ struct Session {
     engine: Engine,
     checker: Checker,
     parser: ExprParser,
+    /// Whether it runs a file, whose errors say their line, and not the REPL.
+    file: bool,
 }
 
 impl Session {
-    fn new(options: &Options) -> Self {
+    fn new(options: &Options, file: bool) -> Self {
         let mut session = Session {
             engine: Engine::new(options.backend),
             checker: Checker::new(),
             parser: options.parser,
+            file,
         };
-        if session.run(HOST, true).is_err() {
+        if session.run(HOST, |_| {}).is_err() {
             unreachable!("the host prelude is valid");
         }
         if let (Engine::Vm(vm), true) = (&mut session.engine, options.trace) {
@@ -135,26 +151,32 @@ impl Session {
         session
     }
 
-    /// Scans, parses and checks a program, and runs it if it has no errors.
-    /// In a file every error says its line; in the REPL an input that ends
-    /// too soon is incomplete, to go on with the next line.
-    fn run(&mut self, source: &str, file: bool) -> Result<(), Failure> {
-        let at = |line: usize| match file {
-            true => format!("[line {line}] "),
-            false => String::new(),
+    fn error(&self, line: Option<usize>, kind: impl Display, message: &str) {
+        let at = match line {
+            Some(line) if self.file => format!("[line {line}] "),
+            _ => String::new(),
         };
-        let statements = self.check(source, file)?;
-        for stmt in &statements {
+        eprintln!("{at}{kind} Error: {message}");
+    }
+
+    fn parse_errors(&self, errors: &[ParseError]) {
+        for error in errors {
+            self.error(Some(error.line), "Parsing", &error.message);
+        }
+    }
+
+    /// Checks a program and, if it has no errors, runs it, giving `show` what
+    /// each statement leaves.
+    fn run(&mut self, source: &str, show: impl Fn(Option<Value>)) -> Result<(), Failure> {
+        for stmt in &self.check(source)? {
             match self.execute(stmt) {
-                Ok(Some(value)) if !file => println!("{value}"),
-                Ok(_) => {}
+                Ok(value) => show(value),
                 Err(Fault::Compile(error)) => {
-                    eprintln!("{}Compile Error: {}", at(error.line), error.message);
+                    self.error(Some(error.line), "Compile", &error.message);
                     return Err(Failure::Static);
                 }
                 Err(Fault::Runtime(error)) => {
-                    let line = error.line.map(at).unwrap_or_default();
-                    eprintln!("{line}Runtime Error: {}", error.message);
+                    self.error(error.line, "Runtime", &error.message);
                     return Err(Failure::Runtime);
                 }
             }
@@ -162,67 +184,69 @@ impl Session {
         Ok(())
     }
 
-    /// Scans, parses and checks a program, giving its statements.
-    fn check(&mut self, source: &str, file: bool) -> Result<Vec<Stmt>, Failure> {
-        let at = |line: usize| match file {
-            true => format!("[line {line}] "),
-            false => String::new(),
-        };
+    /// Scans, parses and checks a program, giving its statements. In the REPL
+    /// an input that ends too soon is incomplete, to go on with the next line.
+    fn check(&mut self, source: &str) -> Result<Vec<Stmt>, Failure> {
         let tokens = scan_tokens(source).map_err(|errors| {
             for error in &errors {
-                eprintln!("{}Scanning Error: {}", at(error.line), error.message);
+                self.error(Some(error.line), "Scanning", &error.message);
             }
             Failure::Static
         })?;
         let statements = match parse_with(tokens, self.parser) {
             Ok(statements) => statements,
-            Err(errors) if !file && errors.last().is_some_and(|e| e.at_end) => {
+            Err(errors) if !self.file && errors.last().is_some_and(|e| e.at_end) => {
                 return Err(Failure::Incomplete(errors));
             }
             Err(errors) => {
-                report(&errors, file);
+                self.parse_errors(&errors);
                 return Err(Failure::Static);
             }
         };
         if let Err(errors) = self.checker.check(&statements) {
             for error in &errors {
-                eprintln!("{}{} Error: {}", at(error.line), error.kind, error.message);
+                self.error(Some(error.line), error.kind, &error.message);
             }
             return Err(Failure::Static);
         }
         Ok(statements)
     }
 
-    /// Runs a statement. With the trace on, it first shows its bytecode.
+    /// Runs a statement. With the trace on, it first shows its bytecode and
+    /// that of the function or sequence it declares.
     fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, Fault> {
-        if let Engine::Vm(vm) = &mut self.engine {
-            if vm.trace {
+        match &mut self.engine {
+            Engine::Vm(vm) if vm.trace => {
                 let script = compile(stmt).map_err(Fault::Compile)?;
-                listing(stmt, &script);
-                return vm.run(script).map_err(Fault::Runtime);
+                println!("== {stmt} ==\n{}", script.chunk);
+                for constant in &script.chunk.constants {
+                    if let Value::Compiled(function) = constant {
+                        println!("== {function} ==\n{}", function.chunk);
+                    }
+                }
+                vm.run(script).map_err(Fault::Runtime)
             }
+            engine => engine.execute(stmt),
         }
-        self.engine.execute(stmt)
     }
 }
 
-fn run_file(source: &str, options: &Options) -> ExitCode {
-    match Session::new(options).run(source, true) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(Failure::Static | Failure::Incomplete(_)) => ExitCode::from(EX_DATAERR),
-        Err(Failure::Runtime) => ExitCode::from(EX_SOFTWARE),
-    }
-}
-
-fn check_file(source: &str, options: &Options) -> ExitCode {
-    match Session::new(options).check(source, true) {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::from(EX_DATAERR),
-    }
+fn disassemble(source: &str, parser: ExprParser) -> ExitCode {
+    let options = Options {
+        trace: true,
+        parser,
+        ..Options::default()
+    };
+    exit(
+        Session::new(&options, true).run(source, |value| match value {
+            Some(value) => println!("=> {value}\n"),
+            None => println!(),
+        }),
+    )
 }
 
 fn play(path: &str, source: &str, options: &Options) -> ExitCode {
-    let game = match Game::load_on(source, options.backend) {
+    let mut game = match Game::load(source, options.backend) {
         Ok(game) => game,
         Err(errors) => {
             for error in errors {
@@ -231,23 +255,15 @@ fn play(path: &str, source: &str, options: &Options) -> ExitCode {
             return ExitCode::from(EX_DATAERR);
         }
     };
-    match options.frames {
-        Some(frames) => headless(game, frames),
-        None => {
-            ludo_play::play(game, path.to_string());
-            ExitCode::SUCCESS
-        }
-    }
-}
-
-/// Plays a game for a number of frames without a window and with no key
-/// down, as fast as it can: each frame runs `update`, the sequences and
-/// `draw`. It is what the benchmarks time.
-fn headless(mut game: Game, frames: usize) -> ExitCode {
-    let keys = Keys::default();
+    let Some(frames) = options.frames else {
+        ludo_play::play(game, path.to_string());
+        return ExitCode::SUCCESS;
+    };
+    // Without a window and with no key down, as fast as it can: each frame
+    // runs `update`, the sequences and `draw`. It is what the benchmarks time.
     for _ in 0..frames {
         let frame = game
-            .step(&keys, 1.0 / 60.0)
+            .step(&Keys::default(), 1.0 / 60.0)
             .and_then(|()| game.draw().map(drop));
         if let Err(error) = frame {
             eprintln!("{error}");
@@ -257,53 +273,12 @@ fn headless(mut game: Game, frames: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn disassemble(source: &str, options: &Options) -> ExitCode {
-    let mut session = Session::new(&Options {
-        trace: true,
-        parser: options.parser,
-        ..Options::default()
-    });
-    let Ok(statements) = session.check(source, true) else {
-        return ExitCode::from(EX_DATAERR);
-    };
-    for stmt in &statements {
-        match session.execute(stmt) {
-            Ok(Some(value)) => println!("=> {value}\n"),
-            Ok(None) => println!(),
-            Err(Fault::Compile(error)) => {
-                eprintln!("{error}");
-                return ExitCode::from(EX_DATAERR);
-            }
-            Err(Fault::Runtime(error)) => {
-                let line = error
-                    .line
-                    .map(|l| format!("[line {l}] "))
-                    .unwrap_or_default();
-                eprintln!("{line}Runtime Error: {}", error.message);
-                return ExitCode::from(EX_SOFTWARE);
-            }
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// Shows the bytecode of a statement and of the function or sequence it
-/// declares.
-fn listing(stmt: &Stmt, script: &Function) {
-    println!("== {stmt} ==\n{}", script.chunk);
-    for constant in &script.chunk.constants {
-        if let Value::Compiled(function) = constant {
-            println!("== {function} ==\n{}", function.chunk);
-        }
-    }
-}
-
 /// Each input is compiled and run on its own, on a backend that lives as
 /// long as the REPL, so what one input binds the next ones see. On the VM
 /// it is the REPL of clox, of Python and of Lua.
 fn run_repl(options: &Options) {
     let stdin = io::stdin();
-    let mut session = Session::new(options);
+    let mut session = Session::new(options, false);
     let mut source = String::new();
 
     loop {
@@ -324,22 +299,16 @@ fn run_repl(options: &Options) {
         let blank = line.trim().is_empty();
         source.push_str(&line);
 
-        match session.run(&source, false) {
+        let show = |value: Option<Value>| {
+            if let Some(value) = value {
+                println!("{value}");
+            }
+        };
+        match session.run(&source, show) {
             Err(Failure::Incomplete(_)) if !blank => continue,
-            Err(Failure::Incomplete(errors)) => report(&errors, false),
+            Err(Failure::Incomplete(errors)) => session.parse_errors(&errors),
             _ => {}
         }
         source.clear();
-    }
-}
-
-fn report(errors: &[ParseError], file: bool) {
-    for error in errors {
-        let at = if file {
-            format!("[line {}] ", error.line)
-        } else {
-            String::new()
-        };
-        eprintln!("{at}Parsing Error: {}", error.message);
     }
 }

@@ -67,7 +67,7 @@ async fn run(mut game: Game, path: String) {
 
         if failure.is_none() {
             elapsed += f64::from(get_frame_time());
-            for key in just_pressed() {
+            for key in keys(is_key_pressed) {
                 if !pending.contains(&key) {
                     pending.push(key);
                 }
@@ -75,7 +75,7 @@ async fn run(mut game: Game, path: String) {
             let mut steps = 0;
             while elapsed >= DT && steps < MAX_STEPS_PER_FRAME {
                 let keys = Keys {
-                    held: held(),
+                    held: keys(is_key_down).collect(),
                     pressed: std::mem::take(&mut pending),
                 };
                 if let Err(error) = game.step(&keys, DT) {
@@ -167,16 +167,10 @@ fn modified_at(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn held() -> Vec<&'static str> {
+/// The names of the keys that are down, or that went down in this frame.
+fn keys(is: fn(KeyCode) -> bool) -> impl Iterator<Item = &'static str> {
     KEYS.iter()
-        .filter(|(code, _)| is_key_down(*code))
-        .map(|(_, name)| *name)
-        .collect()
-}
-
-fn just_pressed() -> impl Iterator<Item = &'static str> {
-    KEYS.iter()
-        .filter(|(code, _)| is_key_pressed(*code))
+        .filter(move |(code, _)| is(*code))
         .map(|(_, name)| *name)
 }
 
