@@ -83,11 +83,9 @@ platform :: (n: Int) -> Platform {
 on_screen :: (w: World) -> List[Platform] {
     let lowest = clamp(to_int((floor_y - w.camera - height) / row), 0, rows - 1)
     let highest = clamp(to_int((floor_y - w.camera) / row) + 1, 0, rows - 1)
-    range(w.base + lowest, w.base + highest + 1) |> fold([], add_row)
-}
-
-add_row :: (platforms: List[Platform], n: Int) -> List[Platform] {
-    if has_platform(n) { concat(platforms, [platform(n)]) } else { platforms }
+    range(w.base + lowest, w.base + highest + 1)
+        |> filter(has_platform)
+        |> map(platform)
 }
 
 update :: (w: World, input: Input, dt: Float) -> World {
@@ -160,25 +158,25 @@ next_base :: (w: World) -> Int {
     (w.base / rows + to_int(w.time * 60.0) % 997 + 1) % 1000 * rows
 }
 
-// Drawing a platform needs the camera, and a function passed to fold sees
-// only its arguments, so the camera goes along with the shapes.
-Canvas :: struct { camera: Float, shapes: List[Shape] }
-
+// Drawing a platform needs the camera, which the closure given to `map`
+// keeps. The shapes of each platform are a list, and `fold` joins them.
 draw :: (w: World) -> List[Shape] {
-    let canvas = on_screen(w) |> fold(Canvas { camera: w.camera, shapes: sky() }, paint)
-    concat(canvas.shapes, concat(hero(w.player, w.camera), hud(w)))
+    let platforms = on_screen(w)
+        |> map(fn(p: Platform) -> List[Shape] { paint(p, w.camera) })
+        |> fold(sky(), concat)
+    concat(platforms, concat(hero(w.player, w.camera), hud(w)))
 }
 
 sky :: () -> List[Shape] {
     [Rect { x: 0.0, y: 0.0, w: width, h: height, color: rgb(22, 24, 44) }]
 }
 
-paint :: (c: Canvas, platform: Platform) -> Canvas {
-    let y = platform.y - c.camera
-    Canvas { c | shapes: concat(c.shapes, [
+paint :: (platform: Platform, camera: Float) -> List[Shape] {
+    let y = platform.y - camera
+    [
         Rect { x: platform.x, y: y, w: platform.w, h: platform_h, color: rgb(64, 70, 110) },
         Rect { x: platform.x, y: y, w: platform.w, h: 4.0, color: rgb(120, 200, 140) },
-    ]) }
+    ]
 }
 
 // Near a side, the player shows on both, as it goes through.
