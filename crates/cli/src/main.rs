@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use ludo_core::ast::Stmt;
 use ludo_core::checker::Checker;
-use ludo_core::chunk::Function;
+use ludo_core::chunk::{Chunk, Function};
 use ludo_core::compiler::compile;
 use ludo_core::engine::{Backend, Engine, Failure as Fault};
 use ludo_core::parser::{parse_with, ExprParser, ParseError};
@@ -287,13 +287,26 @@ fn disassemble(source: &str, options: &Options) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Shows the bytecode of a statement and of the function or sequence it
-/// declares.
+/// Shows the bytecode of a statement and of every function in it: the
+/// function or sequence it declares, and those written with `fn` inside, with
+/// the locals each of those keeps.
 fn listing(stmt: &Stmt, script: &Function) {
     println!("== {stmt} ==\n{}", script.chunk);
-    for constant in &script.chunk.constants {
+    functions(&script.chunk);
+}
+
+fn functions(chunk: &Chunk) {
+    for constant in &chunk.constants {
         if let Value::Compiled(function) = constant {
-            println!("== {function} ==\n{}", function.chunk);
+            match function.captured.as_slice() {
+                [] => println!("== {function} ==\n{}", function.chunk),
+                kept => println!(
+                    "== {function} keeping {} ==\n{}",
+                    kept.join(", "),
+                    function.chunk
+                ),
+            }
+            functions(&function.chunk);
         }
     }
 }

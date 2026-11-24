@@ -605,6 +605,7 @@ impl Pass {
             Expr::Binary(left, op, right) => self.binary(left, *op, right),
             Expr::Field(target, name) => self.field(target, name),
             Expr::Struct { name, base, fields } => self.structure(name, base.as_deref(), fields),
+            Expr::Lambda(decl) => self.lambda(decl),
         };
         if let Some((want, what)) = expected {
             self.expect(&ty, want, what);
@@ -639,6 +640,25 @@ impl Pass {
                 self.join_or_error(&then, &otherwise, "the branches of `if`")
             }
         }
+    }
+
+    /// The type of a function written with `fn`. Its body sees the locals
+    /// around it, and the top level as the body of a declared function does,
+    /// since it runs when it is called.
+    fn lambda(&mut self, decl: &FnDecl) -> Type {
+        let signature = self.signature(decl);
+        let Type::Function(params, ret) = &signature else {
+            unreachable!("a function has a function type")
+        };
+        let outer = self.body;
+        self.body = outer.or(Some("function"));
+        let locals = decl.params.iter().map(|p| p.name.clone());
+        self.scopes
+            .push(locals.zip(params.iter().cloned()).collect());
+        self.check(&decl.body, ret, "the value of the `fn`");
+        self.scopes.pop();
+        self.body = outer;
+        signature
     }
 
     fn condition(&mut self, cond: &Expr, keyword: &str) {
@@ -1205,6 +1225,42 @@ mod tests {
             "s :: sequence (b: Ball, to: Float) {\n  let from = b.x\n  over 1.0s as t {\n    b.x = from + to * t\n  }\n}\nBall :: struct { x: Float }",
             "range(0, 3) |> map(Some)\nprint(None)",
             "twice :: (f: (Int) -> Int, x: Int) -> Int { f(f(x)) }",
+        ]);
+    }
+
+    #[test]
+    fn a_lambda_sees_the_locals_around_it() {
+        passes(&[
+            "let double = fn(x: Int) -> Int { x * 2 }\nprint(double(2))",
+            "adder :: (n: Int) -> (Int) -> Int {\n  fn(x: Int) -> Int { x + n }\n}",
+            "scaled :: (xs: List[Int], k: Int) -> List[Int] {\n  xs |> map(fn(x: Int) -> Int { x * k })\n}",
+            "print(range(0, 3) |> map(fn(x: Int) -> String { to_string(x) }))",
+            // Like a function body, it runs when it is called.
+            "let f = fn() -> Int { later() }\nlater :: () -> Int { 1 }",
+        ]);
+        rejects(&[
+            (
+                "let f = fn(x: Int) -> Int { \"a\" }",
+                "[line 1] the value of the `fn` must be Int, got String",
+            ),
+            (
+                "print([1] |> map(fn(x: String) -> Int { 1 }))",
+                "[line 1] argument 2 of `map` must be (Int) -> _, got (String) -> Int",
+            ),
+            ("let f = fn(x: Int) -> Int { y }", "[line 1] undefined name `y`"),
+            (
+                "let f = fn() -> Int { speed }\nlet speed = 2",
+                "[line 1] `speed` is declared after this function, on line 2: a function can only use a top level `let` declared before it",
+            ),
+            (
+                "let f = fn(x: Int) -> Int { x }\nprint(f(1, 2))",
+                "[line 2] `f` expects 1 argument, got 2",
+            ),
+            // A declared function still sees only its parameters.
+            (
+                "peek :: () -> Int { hidden }\nlet r = {\n  let hidden = 1\n  peek()\n}",
+                "[line 1] undefined name `hidden`",
+            ),
         ]);
     }
 

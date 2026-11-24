@@ -35,6 +35,12 @@ pub enum Op {
     /// Calls the value below this many arguments on top of the stack, and
     /// leaves the result in place of the call.
     Call(usize),
+    /// Makes a closure of the function below this many values on top of the
+    /// stack, which it keeps. clox's `OP_CLOSURE` keeps upvalues that point
+    /// at the variables; in ludo values never change, so a copy is enough,
+    /// and there is no `OP_GET_UPVALUE`, `OP_SET_UPVALUE` or
+    /// `OP_CLOSE_UPVALUE`.
+    Closure(usize),
     /// Builds a list from this many values on top of the stack.
     List(usize),
     /// Declares the struct in this shape. Literals look it up by name when
@@ -127,6 +133,10 @@ pub enum Op {
 pub struct Function {
     pub name: Option<String>,
     pub arity: usize,
+    /// For a function written with `fn`, the names of the locals around it
+    /// that it keeps. When it is called they go on the stack after the
+    /// arguments, so the body reads them as more locals.
+    pub captured: Vec<String>,
     pub chunk: Chunk,
 }
 
@@ -139,6 +149,7 @@ impl Function {
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.name {
+            Some(name) if name == "fn" => f.write_str("<fn>"),
             Some(name) => write!(f, "<fn {name}>"),
             None => f.write_str("<script>"),
         }
@@ -230,6 +241,7 @@ impl Chunk {
             Op::GetLocal(slot) => format!("{:<16} {slot:4}", "GetLocal"),
             Op::PopBelow(count) => format!("{:<16} {count:4}", "PopBelow"),
             Op::Call(argc) => format!("{:<16} {argc:4}", "Call"),
+            Op::Closure(count) => format!("{:<16} {count:4}", "Closure"),
             Op::List(count) => format!("{:<16} {count:4}", "List"),
             Op::DefineStruct(shape) => {
                 format!("{:<16} {shape:4} {}", "DefineStruct", self.shapes[shape])

@@ -223,6 +223,7 @@ impl Scanner {
             "or" => TokenKind::Or,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "fn" => TokenKind::Fn,
 
             "sequence" => TokenKind::Sequence,
             "over" => TokenKind::Over,
@@ -331,6 +332,7 @@ mod tests {
                 r#"Sequence Ident("sequencer") Over Ident("overflow") Ident("on") Ident("only")"#,
             ),
             ("_ _unused", r#"Ident("_") Ident("_unused")"#),
+            ("fn fns", r#"Fn Ident("fns")"#),
         ]);
     }
 
