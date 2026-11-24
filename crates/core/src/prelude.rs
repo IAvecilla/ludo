@@ -1,4 +1,6 @@
-/// This module defines the standard native functions available in the ludo language.
+//! The native functions of ludo, which both backends and the checker share.
+
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::interpreter::{error, RuntimeError};
@@ -40,6 +42,15 @@ pub fn constants() -> [(&'static str, Value); 1] {
     [("None", Value::Option(None))]
 }
 
+/// The globals a program starts with: the natives and the constants.
+pub(crate) fn globals() -> HashMap<String, Value> {
+    let natives = NATIVES.iter().map(|n| (n.name, Value::Native(*n)));
+    natives
+        .chain(constants())
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+}
+
 fn some(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     Ok(Value::Option(Some(Rc::new(args[0].clone()))))
 }
@@ -58,10 +69,7 @@ fn print(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn map(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Value::List(items) = &args[0] else {
-        return Err(not_a_list("map", &args[0]));
-    };
-    let mapped = items
+    let mapped = list("map", &args[0])?
         .iter()
         .map(|item| caller.call(args[1].clone(), vec![item.clone()]))
         .collect::<Result<Vec<_>, _>>()?;
@@ -69,20 +77,10 @@ fn map(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn filter(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Value::List(items) = &args[0] else {
-        return Err(not_a_list("filter", &args[0]));
-    };
     let mut kept = Vec::new();
-    for item in items.iter() {
-        match caller.call(args[1].clone(), vec![item.clone()])? {
-            Value::Bool(true) => kept.push(item.clone()),
-            Value::Bool(false) => {}
-            other => {
-                return Err(error(format!(
-                    "`filter` expects a function that returns a Bool, got {}",
-                    other.type_name()
-                )))
-            }
+    for item in list("filter", &args[0])? {
+        if holds(caller, "filter", &args[1], item)? {
+            kept.push(item.clone());
         }
     }
     Ok(Value::List(Rc::new(kept)))
@@ -90,31 +88,20 @@ fn filter(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError
 
 /// The first item for which the function gives true, if any.
 fn find(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Value::List(items) = &args[0] else {
-        return Err(not_a_list("find", &args[0]));
-    };
-    for item in items.iter() {
-        match caller.call(args[1].clone(), vec![item.clone()])? {
-            Value::Bool(true) => return Ok(Value::Option(Some(Rc::new(item.clone())))),
-            Value::Bool(false) => {}
-            other => {
-                return Err(error(format!(
-                    "`find` expects a function that returns a Bool, got {}",
-                    other.type_name()
-                )))
-            }
+    for item in list("find", &args[0])? {
+        if holds(caller, "find", &args[1], item)? {
+            return Ok(Value::Option(Some(Rc::new(item.clone()))));
         }
     }
     Ok(Value::Option(None))
 }
 
 fn fold(caller: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Value::List(items) = &args[0] else {
-        return Err(not_a_list("fold", &args[0]));
-    };
-    items.iter().try_fold(args[1].clone(), |acc, item| {
-        caller.call(args[2].clone(), vec![acc, item.clone()])
-    })
+    list("fold", &args[0])?
+        .iter()
+        .try_fold(args[1].clone(), |acc, item| {
+            caller.call(args[2].clone(), vec![acc, item.clone()])
+        })
 }
 
 fn range(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
@@ -215,12 +202,7 @@ fn parse_int(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> 
 
 fn concat(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
     match (&args[0], &args[1]) {
-        (Value::List(a), Value::List(b)) => {
-            let mut items = Vec::with_capacity(a.len() + b.len());
-            items.extend(a.iter().cloned());
-            items.extend(b.iter().cloned());
-            Ok(Value::List(Rc::new(items)))
-        }
+        (Value::List(a), Value::List(b)) => Ok(Value::List(Rc::new([&a[..], b].concat()))),
         (a, b) => Err(error(format!(
             "`concat` expects two Lists, got {} and {}",
             a.type_name(),
@@ -230,17 +212,34 @@ fn concat(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
 }
 
 fn contains(_: &mut dyn Caller, args: &[Value]) -> Result<Value, RuntimeError> {
-    let Value::List(items) = &args[0] else {
-        return Err(not_a_list("contains", &args[0]));
-    };
-    Ok(Value::Bool(items.contains(&args[1])))
+    Ok(Value::Bool(list("contains", &args[0])?.contains(&args[1])))
 }
 
-fn not_a_list(name: &str, value: &Value) -> RuntimeError {
-    error(format!(
-        "`{name}` expects a List, got {}",
-        value.type_name()
-    ))
+/// The items of the List a native takes first.
+fn list<'a>(name: &str, value: &'a Value) -> Result<&'a [Value], RuntimeError> {
+    match value {
+        Value::List(items) => Ok(items),
+        v => Err(error(format!(
+            "`{name}` expects a List, got {}",
+            v.type_name()
+        ))),
+    }
+}
+
+/// Whether the function a native like `filter` takes gives true for `item`.
+fn holds(
+    caller: &mut dyn Caller,
+    name: &str,
+    test: &Value,
+    item: &Value,
+) -> Result<bool, RuntimeError> {
+    match caller.call(test.clone(), vec![item.clone()])? {
+        Value::Bool(v) => Ok(v),
+        other => Err(error(format!(
+            "`{name}` expects a function that returns a Bool, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 fn numbers(name: &str, args: &[&Value]) -> RuntimeError {

@@ -2,8 +2,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
-    Arm, BinaryOp, Expr, FnDecl, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind, UnaryOp,
-    Variant,
+    Arm, BinaryOp, Expr, Param, Pattern, Step, StepKind, Stmt, StmtKind, UnaryOp, Variant,
 };
 use crate::chunk::{Chunk, Function, Op, Shape, Test};
 use crate::value::Value;
@@ -33,11 +32,7 @@ pub fn compile(stmt: &Stmt) -> Result<Function, CompileError> {
         _ => compiler.statement(stmt)?,
     }
     compiler.emit(Op::Return);
-    Ok(Function {
-        name: None,
-        arity: 0,
-        chunk: compiler.chunk,
-    })
+    Ok(compiler.finish(None))
 }
 
 /// A local variable while its block is being compiled.
@@ -52,6 +47,7 @@ struct Local {
 struct Compiler {
     chunk: Chunk,
     line: usize,
+    arity: usize,
     /// The locals in scope, innermost last, so the newest of several with
     /// the same name is found first.
     locals: Vec<Local>,
@@ -72,6 +68,7 @@ impl Compiler {
         Compiler {
             chunk: Chunk::default(),
             line,
+            arity: 0,
             locals: Vec::new(),
             scope_depth: 0,
             height: 0,
@@ -79,50 +76,186 @@ impl Compiler {
         }
     }
 
-    /// Compiles a function with a compiler of its own, as clox does. Its
-    /// parameters are its first locals, from slot 0 up: the frame starts at
-    /// the first argument, as in ploxb, and the function sits right below.
-    fn function(decl: &FnDecl, line: usize) -> Result<Function, CompileError> {
+    /// A compiler of its own for each function, as in clox. Its parameters
+    /// are its first locals, from slot 0 up: the frame starts at the first
+    /// argument, as in ploxb, and the function sits right below.
+    fn function(line: usize, params: &[Param]) -> Self {
         let mut compiler = Compiler::new(line);
-        compiler.parameters(&decl.params);
-        compiler.expression(&decl.body)?;
-        compiler.emit(Op::Return);
-        Ok(Function {
-            name: Some(decl.name.clone()),
-            arity: decl.params.len(),
-            chunk: compiler.chunk,
-        })
-    }
-
-    /// Compiles a sequence like a function whose body is its steps. Its
-    /// state, the first parameter, sits in slot 0, where the VM puts the
-    /// world before each frame and reads it back after. It ends with `End`
-    /// instead of `Return`, so the state stays for the VM to read.
-    fn sequence(decl: &SeqDecl, line: usize) -> Result<Function, CompileError> {
-        let mut compiler = Compiler::new(line);
-        compiler.parameters(&decl.params);
-        compiler.state = decl.params.first().map(|param| param.name.clone());
-        for step in &decl.body {
-            compiler.step(step)?;
-        }
-        compiler.emit(Op::End);
-        Ok(Function {
-            name: Some(decl.name.clone()),
-            arity: decl.params.len(),
-            chunk: compiler.chunk,
-        })
-    }
-
-    fn parameters(&mut self, params: &[Param]) {
-        self.scope_depth = 1;
+        compiler.arity = params.len();
+        compiler.scope_depth = 1;
         for param in params {
-            self.locals.push(Local {
-                name: param.name.clone(),
-                depth: 1,
-                slot: self.height,
-            });
-            self.height += 1;
+            compiler.height += 1;
+            compiler.add_local(&param.name);
         }
+        compiler
+    }
+
+    fn finish(self, name: Option<&str>) -> Function {
+        Function {
+            name: name.map(str::to_string),
+            arity: self.arity,
+            chunk: self.chunk,
+        }
+    }
+
+    /// Declares the value on top of the stack as a local.
+    fn add_local(&mut self, name: &str) {
+        self.locals.push(Local {
+            name: name.to_string(),
+            depth: self.scope_depth,
+            slot: self.height - 1,
+        });
+    }
+
+    fn emit(&mut self, op: Op) {
+        self.chunk.write(op, self.line);
+        self.height = self
+            .height
+            .checked_add_signed(stack_effect(op, &self.chunk))
+            .expect("the compiler never pops an empty stack");
+    }
+
+    fn constant(&mut self, value: Value) {
+        let index = self.chunk.add_constant(value);
+        self.emit(Op::Constant(index));
+    }
+
+    /// Stores a global's name as a string constant, for the instructions
+    /// that look it up when they run.
+    fn identifier_constant(&mut self, name: &str) -> usize {
+        self.chunk.add_constant(Value::Str(name.to_string()))
+    }
+
+    /// Emits a jump whose target is not known yet, and returns where it is
+    /// so `patch_jump` can fill it in.
+    fn emit_jump(&mut self, jump: fn(usize) -> Op) -> usize {
+        self.emit(jump(usize::MAX));
+        self.chunk.code.len() - 1
+    }
+
+    /// Points the jump at `at` to the next instruction to be emitted.
+    fn patch_jump(&mut self, at: usize) {
+        let distance = self.chunk.code.len() - at - 1;
+        match &mut self.chunk.code[at] {
+            Op::Jump(target) | Op::JumpIfFalse(target) => *target = distance,
+            op => unreachable!("only jumps are patched, got {op:?}"),
+        }
+    }
+
+    fn begin_scope(&mut self) {
+        self.scope_depth += 1;
+    }
+
+    /// Forgets the locals of the scope that ends, and says how many there
+    /// were.
+    fn close_scope(&mut self) -> usize {
+        self.scope_depth -= 1;
+        let inner = self.locals.iter().rev();
+        let count = inner.take_while(|l| l.depth > self.scope_depth).count();
+        self.locals.truncate(self.locals.len() - count);
+        count
+    }
+
+    /// Drops the locals of the block that ends, which sit right below its
+    /// value on the stack.
+    fn end_scope(&mut self) {
+        let count = self.close_scope();
+        if count > 0 {
+            self.emit(Op::PopBelow(count));
+        }
+    }
+
+    /// Drops the locals of a scope that leaves no value, like the body of an
+    /// `over`, with a `Pop` each as clox does.
+    fn drop_scope(&mut self) {
+        for _ in 0..self.close_scope() {
+            self.emit(Op::Pop);
+        }
+    }
+
+    /// The slot of the innermost local with this name. Without one, the name
+    /// is a global.
+    fn resolve_local(&self, name: &str) -> Option<usize> {
+        let local = self.locals.iter().rev().find(|local| local.name == name);
+        local.map(|local| local.slot)
+    }
+
+    /// Compiles a statement, which leaves the stack as it found it except
+    /// for the new local of a `let` inside a block.
+    fn statement(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        let outer = std::mem::replace(&mut self.line, stmt.line);
+        match &stmt.kind {
+            StmtKind::Let(name, value) if self.scope_depth == 0 => {
+                let global = self.identifier_constant(name);
+                self.expression(value)?;
+                self.emit(Op::DefineGlobal(global));
+            }
+            // The value stays where it was pushed and becomes the local. It
+            // is declared only now, so its own initializer still sees the
+            // outer variable with that name.
+            StmtKind::Let(name, value) => {
+                self.expression(value)?;
+                self.add_local(name);
+            }
+            StmtKind::Expr(expr) => {
+                self.expression(expr)?;
+                self.emit(Op::Pop);
+            }
+            // The parser only lets functions be declared at the top level, so
+            // they are always globals.
+            StmtKind::Fn(decl) => {
+                let global = self.identifier_constant(&decl.name);
+                let mut compiler = Compiler::function(stmt.line, &decl.params);
+                compiler.expression(&decl.body)?;
+                compiler.emit(Op::Return);
+                let function = compiler.finish(Some(&decl.name));
+                self.constant(Value::Compiled(Rc::new(function)));
+                self.emit(Op::DefineGlobal(global));
+            }
+            // Only the names of the fields matter when the program runs.
+            StmtKind::Struct(decl) => {
+                let fields = decl.fields.iter().map(|f| f.name.clone()).collect();
+                let shape = self.shape(&decl.name, fields);
+                self.emit(Op::DefineStruct(shape));
+            }
+            StmtKind::Enum(decl) => {
+                let shape = self.shape(&decl.name, decl.symbols.clone());
+                self.emit(Op::DefineEnum(shape));
+            }
+            // A union only tells the checker what a type can be.
+            StmtKind::Union(_) => {}
+            // A sequence compiles like a function whose body is its steps.
+            // Its state, the first parameter, sits in slot 0, where the VM
+            // puts the world before each frame and reads it back after. It
+            // ends with `End` instead of `Return`, so the state stays there.
+            StmtKind::Sequence(decl) => {
+                let name = self.identifier_constant(&decl.name);
+                let mut compiler = Compiler::function(stmt.line, &decl.params);
+                compiler.state = decl.params.first().map(|param| param.name.clone());
+                for step in &decl.body {
+                    compiler.step(step)?;
+                }
+                compiler.emit(Op::End);
+                let sequence = compiler.finish(Some(&decl.name));
+                self.constant(Value::Compiled(Rc::new(sequence)));
+                self.emit(Op::DefineSequence(name));
+            }
+            StmtKind::Start(name, args) => {
+                for arg in args {
+                    self.expression(arg)?;
+                }
+                let name = self.identifier_constant(name);
+                let argc = args.len();
+                self.emit(Op::Start { name, argc });
+            }
+        }
+        self.line = outer;
+        Ok(())
+    }
+
+    fn shape(&mut self, name: &str, fields: Vec<String>) -> usize {
+        let name = name.to_string();
+        self.chunk.add_shape(Shape { name, fields })
     }
 
     /// Compiles a step of a sequence, which, like a statement, leaves the
@@ -175,11 +308,7 @@ impl Compiler {
         self.begin_scope();
         self.emit(Op::OverPass(counters));
         // `t` is a local of the body, with no name when there is no `as`.
-        self.locals.push(Local {
-            name: var.unwrap_or_default().to_string(),
-            depth: self.scope_depth,
-            slot: self.height - 1,
-        });
+        self.add_local(var.unwrap_or_default());
         for step in body {
             self.step(step)?;
         }
@@ -190,106 +319,6 @@ impl Compiler {
         self.emit(Op::Pop);
         self.emit(Op::Pop);
         Ok(())
-    }
-
-    fn emit(&mut self, op: Op) {
-        self.chunk.write(op, self.line);
-        self.height = self
-            .height
-            .checked_add_signed(stack_effect(op, &self.chunk))
-            .expect("the compiler never pops an empty stack");
-    }
-
-    /// Compiles a statement, which leaves the stack as it found it except
-    /// for the new local of a `let` inside a block.
-    fn statement(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
-        let outer = std::mem::replace(&mut self.line, stmt.line);
-        match &stmt.kind {
-            StmtKind::Let(name, value) if self.scope_depth == 0 => {
-                let global = self.identifier_constant(name);
-                self.expression(value)?;
-                self.emit(Op::DefineGlobal(global));
-            }
-            StmtKind::Let(name, value) => {
-                // The value stays where it was pushed and becomes the local.
-                // It is declared only now, so its own initializer still sees
-                // the outer variable with that name.
-                self.expression(value)?;
-                self.locals.push(Local {
-                    name: name.clone(),
-                    depth: self.scope_depth,
-                    slot: self.height - 1,
-                });
-            }
-            StmtKind::Expr(expr) => {
-                self.expression(expr)?;
-                self.emit(Op::Pop);
-            }
-            // The parser only lets functions be declared at the top level, so
-            // they are always globals.
-            // Only the names of the fields matter when the program runs; their
-            // types are for the checker to come.
-            StmtKind::Struct(decl) => {
-                let shape = self.chunk.add_shape(Shape {
-                    name: decl.name.clone(),
-                    fields: decl.fields.iter().map(|f| f.name.clone()).collect(),
-                });
-                self.emit(Op::DefineStruct(shape));
-            }
-            StmtKind::Fn(decl) => {
-                let global = self.identifier_constant(&decl.name);
-                let function = Compiler::function(decl, stmt.line)?;
-                self.constant(Value::Compiled(Rc::new(function)));
-                self.emit(Op::DefineGlobal(global));
-            }
-            // A union only tells the checker what a type can be.
-            StmtKind::Union(_) => {}
-            StmtKind::Enum(decl) => {
-                let shape = self.chunk.add_shape(Shape {
-                    name: decl.name.clone(),
-                    fields: decl.symbols.clone(),
-                });
-                self.emit(Op::DefineEnum(shape));
-            }
-            StmtKind::Sequence(decl) => {
-                let name = self.identifier_constant(&decl.name);
-                let sequence = Compiler::sequence(decl, stmt.line)?;
-                self.constant(Value::Compiled(Rc::new(sequence)));
-                self.emit(Op::DefineSequence(name));
-            }
-            StmtKind::Start(name, args) => {
-                for arg in args {
-                    self.expression(arg)?;
-                }
-                let name = self.identifier_constant(name);
-                self.emit(Op::Start {
-                    name,
-                    argc: args.len(),
-                });
-            }
-        }
-        self.line = outer;
-        Ok(())
-    }
-
-    fn begin_scope(&mut self) {
-        self.scope_depth += 1;
-    }
-
-    /// Drops the locals of the block that ends, which sit right below its
-    /// value on the stack.
-    fn end_scope(&mut self) {
-        self.scope_depth -= 1;
-        let count = self
-            .locals
-            .iter()
-            .rev()
-            .take_while(|local| local.depth > self.scope_depth)
-            .count();
-        self.locals.truncate(self.locals.len() - count);
-        if count > 0 {
-            self.emit(Op::PopBelow(count));
-        }
     }
 
     /// Compiles a `case`. Its value stays on the stack as a hidden local while
@@ -373,11 +402,7 @@ impl Compiler {
     fn pattern(&mut self, pattern: &Pattern, mismatches: &mut Vec<usize>) {
         match pattern {
             Pattern::Wildcard => self.emit(Op::Pop),
-            Pattern::Bind(name) => self.locals.push(Local {
-                name: name.clone(),
-                depth: self.scope_depth,
-                slot: self.height - 1,
-            }),
+            Pattern::Bind(name) => self.add_local(name),
             Pattern::Literal(literal) => {
                 let index = self.chunk.add_constant(Value::from(literal));
                 self.emit(Op::MatchConstant(index));
@@ -393,57 +418,6 @@ impl Compiler {
                 }
             }
         }
-    }
-
-    /// Emits a jump whose target is not known yet, and returns where it is
-    /// so `patch_jump` can fill it in.
-    fn emit_jump(&mut self, jump: fn(usize) -> Op) -> usize {
-        self.emit(jump(usize::MAX));
-        self.chunk.code.len() - 1
-    }
-
-    /// Points the jump at `at` to the next instruction to be emitted.
-    fn patch_jump(&mut self, at: usize) {
-        let distance = self.chunk.code.len() - at - 1;
-        match &mut self.chunk.code[at] {
-            Op::Jump(target) | Op::JumpIfFalse(target) => *target = distance,
-            op => unreachable!("only jumps are patched, got {op:?}"),
-        }
-    }
-
-    /// Drops the locals of a scope that leaves no value, like the body of an
-    /// `over`, with a `Pop` each as clox does.
-    fn drop_scope(&mut self) {
-        self.scope_depth -= 1;
-        while self
-            .locals
-            .last()
-            .is_some_and(|local| local.depth > self.scope_depth)
-        {
-            self.locals.pop();
-            self.emit(Op::Pop);
-        }
-    }
-
-    /// The slot of the innermost local with this name. Without one, the name
-    /// is a global.
-    fn resolve_local(&self, name: &str) -> Option<usize> {
-        self.locals
-            .iter()
-            .rev()
-            .find(|local| local.name == name)
-            .map(|local| local.slot)
-    }
-
-    fn constant(&mut self, value: Value) {
-        let index = self.chunk.add_constant(value);
-        self.emit(Op::Constant(index));
-    }
-
-    /// Stores a global's name as a string constant, for the instructions
-    /// that look it up when they run.
-    fn identifier_constant(&mut self, name: &str) -> usize {
-        self.chunk.add_constant(Value::Str(name.to_string()))
     }
 
     fn expression(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -488,7 +462,7 @@ impl Compiler {
             Expr::Binary(left, op, right) => {
                 self.expression(left)?;
                 self.expression(right)?;
-                self.emit(binary(*op));
+                self.emit(Op::Binary(*op));
             }
             Expr::Ident(name) => match self.resolve_local(name) {
                 Some(slot) => self.emit(Op::GetLocal(slot)),
@@ -553,34 +527,13 @@ impl Compiler {
                 for (_, value) in fields {
                     self.expression(value)?;
                 }
-                let shape = self.chunk.add_shape(Shape {
-                    name: name.clone(),
-                    fields: fields.iter().map(|(field, _)| field.clone()).collect(),
-                });
-                self.emit(Op::Struct {
-                    shape,
-                    base: base.is_some(),
-                });
+                let names = fields.iter().map(|(field, _)| field.clone()).collect();
+                let shape = self.shape(name, names);
+                let base = base.is_some();
+                self.emit(Op::Struct { shape, base });
             }
         }
         Ok(())
-    }
-}
-
-fn binary(op: BinaryOp) -> Op {
-    match op {
-        BinaryOp::Add => Op::Add,
-        BinaryOp::Sub => Op::Sub,
-        BinaryOp::Mul => Op::Mul,
-        BinaryOp::Div => Op::Div,
-        BinaryOp::Rem => Op::Rem,
-        BinaryOp::Eq => Op::Equal,
-        BinaryOp::Ne => Op::NotEqual,
-        BinaryOp::Lt => Op::Less,
-        BinaryOp::Le => Op::LessEqual,
-        BinaryOp::Gt => Op::Greater,
-        BinaryOp::Ge => Op::GreaterEqual,
-        BinaryOp::And | BinaryOp::Or => unreachable!("`and` and `or` short circuit"),
     }
 }
 
@@ -592,6 +545,7 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
         Op::Negate | Op::Not | Op::CheckBool(_) | Op::Jump(_) | Op::JumpIfFalse(_) | Op::Return => {
             0
         }
+        Op::DefineGlobal(_) | Op::Pop | Op::Binary(_) => -1,
         Op::PopBelow(count) => -(count as isize),
         // It takes the callee and its arguments, and leaves the result.
         Op::Call(argc) => -(argc as isize),
@@ -611,19 +565,6 @@ fn stack_effect(op: Op, chunk: &Chunk) -> isize {
         Op::OverStart => 1,
         Op::OverPass(_) => 1,
         Op::DefineSequence(_) | Op::SetField { .. } | Op::SetState => -1,
-        Op::DefineGlobal(_)
-        | Op::Pop
-        | Op::Add
-        | Op::Sub
-        | Op::Mul
-        | Op::Div
-        | Op::Rem
-        | Op::Equal
-        | Op::NotEqual
-        | Op::Less
-        | Op::LessEqual
-        | Op::Greater
-        | Op::GreaterEqual => -1,
     }
 }
 
@@ -633,250 +574,208 @@ mod tests {
     use crate::parser::parse;
     use crate::scanner::scan_tokens;
 
-    fn compiled(source: &str) -> Result<Chunk, CompileError> {
+    /// The bytecode of the first statement of `source`, followed by that of
+    /// the functions it declares, as `ludo dis` shows it.
+    fn listing(source: &str) -> String {
         let statements = parse(scan_tokens(source).unwrap()).unwrap();
-        compile(&statements[0]).map(|script| script.chunk)
-    }
-
-    #[test]
-    fn compiles_operands_before_their_operator() {
-        let chunk = compiled("-(1 + 2) * 3").unwrap();
-        assert_eq!(
-            chunk.code,
-            [
-                Op::Constant(0),
-                Op::Constant(1),
-                Op::Add,
-                Op::Negate,
-                Op::Constant(2),
-                Op::Mul,
-                Op::Return
-            ]
-        );
-        assert_eq!(
-            chunk.constants,
-            [Value::Int(1), Value::Int(2), Value::Int(3)]
-        );
-    }
-
-    #[test]
-    fn disassembles_a_chunk() {
-        let chunk = compiled("\n\"a\" + \"b\" == \"ab\"").unwrap();
-        assert_eq!(
-            chunk.to_string(),
-            "0000    2 Constant            0 \"a\"\n\
-             0001    | Constant            1 \"b\"\n\
-             0002    | Add\n\
-             0003    | Constant            2 \"ab\"\n\
-             0004    | Equal\n\
-             0005    | Return\n"
-        );
-    }
-
-    #[test]
-    fn names_globals_with_string_constants() {
-        let chunk = compiled("let speed = 2 * dt").unwrap();
-        assert_eq!(
-            chunk.to_string(),
-            "0000    1 Constant            1 2\n\
-             0001    | GetGlobal           2 \"dt\"\n\
-             0002    | Mul\n\
-             0003    | DefineGlobal        0 \"speed\"\n\
-             0004    | Return\n"
-        );
-    }
-
-    #[test]
-    fn locals_live_in_stack_slots_above_temporaries() {
-        let chunk = compiled("let r = 1 + {\n  let a = 2\n  a * a\n}").unwrap();
-        assert_eq!(
-            chunk.to_string(),
-            "0000    1 Constant            1 1\n\
-             0001    2 Constant            2 2\n\
-             0002    3 GetLocal            1\n\
-             0003    | GetLocal            1\n\
-             0004    | Mul\n\
-             0005    | PopBelow            1\n\
-             0006    1 Add\n\
-             0007    | DefineGlobal        0 \"r\"\n\
-             0008    | Return\n"
-        );
-    }
-
-    #[test]
-    fn if_jumps_over_the_branch_it_does_not_take() {
-        let chunk = compiled("if c { 1 } else { 2 }").unwrap();
-        assert_eq!(
-            chunk.to_string(),
-            "0000    1 GetGlobal           0 \"c\"\n\
-             0001    | CheckBool          if\n\
-             0002    | JumpIfFalse         3 -> 6\n\
-             0003    | Pop\n\
-             0004    | Constant            1 1\n\
-             0005    | Jump                2 -> 8\n\
-             0006    | Pop\n\
-             0007    | Constant            2 2\n\
-             0008    | Return\n"
-        );
-    }
-
-    #[test]
-    fn or_jumps_to_the_end_when_the_left_side_is_true() {
-        let chunk = compiled("a or b").unwrap();
-        assert_eq!(
-            chunk.to_string(),
-            "0000    1 GetGlobal           0 \"a\"\n\
-             0001    | CheckBool          or\n\
-             0002    | JumpIfFalse         1 -> 4\n\
-             0003    | Jump                3 -> 7\n\
-             0004    | Pop\n\
-             0005    | GetGlobal           1 \"b\"\n\
-             0006    | CheckBool          or\n\
-             0007    | Return\n"
-        );
-    }
-
-    #[test]
-    fn a_function_has_its_own_chunk_with_its_parameters_from_slot_0() {
-        let script = compiled("add :: (a: Int, b: Int) -> Int { a + b }").unwrap();
-        assert_eq!(
-            script.to_string(),
-            "0000    1 Constant            1 <fn add>\n\
-             0001    | DefineGlobal        0 \"add\"\n\
-             0002    | Return\n"
-        );
-        let Value::Compiled(add) = &script.constants[1] else {
-            panic!("the function should be a constant of the script");
-        };
-        assert_eq!(
-            add.chunk.to_string(),
-            "0000    1 GetLocal            0\n\
-             0001    | GetLocal            1\n\
-             0002    | Add\n\
-             0003    | Return\n"
-        );
-        assert_eq!(
-            compiled("add(1, 2)").unwrap().to_string(),
-            "0000    1 GetGlobal           0 \"add\"\n\
-             0001    | Constant            1 1\n\
-             0002    | Constant            2 2\n\
-             0003    | Call                2\n\
-             0004    | Return\n"
-        );
-    }
-
-    #[test]
-    fn a_struct_literal_puts_its_values_on_the_stack_before_building_it() {
-        assert_eq!(
-            compiled("Ball :: struct { x: Float, y: Float }")
-                .unwrap()
-                .to_string(),
-            "0000    1 DefineStruct        0 Ball { x, y }\n\
-             0001    | Return\n"
-        );
-        assert_eq!(
-            compiled("Ball { b | y: b.y + 1.0 }").unwrap().to_string(),
-            "0000    1 GetGlobal           0 \"b\"\n\
-             0001    | GetGlobal           1 \"b\"\n\
-             0002    | GetField            2 \"y\"\n\
-             0003    | Constant            3 1.0\n\
-             0004    | Add\n\
-             0005    | Struct              0 Ball { _ | y }\n\
-             0006    | Return\n"
-        );
-    }
-
-    #[test]
-    fn a_sequence_loops_over_its_passes() {
-        let script =
-            compiled("s :: sequence (b: Ball) {\n  over 0.5s as t {\n    b.x = t\n  }\n}").unwrap();
-        let Value::Compiled(sequence) = &script.constants[1] else {
-            panic!("the sequence should be a constant of the script");
-        };
-        assert_eq!(
-            sequence.chunk.to_string(),
-            "0000    2 Yield\n\
-             0001    | Constant            0 0.5\n\
-             0002    | OverStart\n\
-             0003    | OverPass            1\n\
-             0004    3 GetLocal            3\n\
-             0005    | SetField         b.x\n\
-             0006    2 Pop\n\
-             0007    | OverLoop            1 -> 3\n\
-             0008    | Pop\n\
-             0009    | Pop\n\
-             0010    1 End\n"
-        );
-    }
-
-    #[test]
-    fn compiles_the_examples() {
-        for source in [
-            include_str!("../../../examples/square.ludo"),
-            include_str!("../../../examples/pong.ludo"),
-        ] {
-            for stmt in parse(scan_tokens(source).unwrap()).unwrap() {
-                compile(&stmt).unwrap_or_else(|e| panic!("{e}"));
+        let script = compile(&statements[0]).unwrap();
+        let mut listing = script.chunk.to_string();
+        for constant in &script.chunk.constants {
+            if let Value::Compiled(function) = constant {
+                listing += &format!("== {function} ==\n{}", function.chunk);
             }
+        }
+        listing
+    }
+
+    fn disassembles(cases: &[(&str, &str)]) {
+        for (source, expected) in cases {
+            assert_eq!(listing(source), *expected, "{source:?}");
         }
     }
 
     #[test]
-    fn a_case_tests_each_branch_and_drops_what_a_failed_one_pushed() {
-        assert_eq!(
-            compiled("case s { :a -> 1, n when n > 2 -> n, _ -> 0 }")
-                .unwrap()
-                .to_string(),
-            "0000    1 GetGlobal           0 \"s\"\n\
-             0001    | GetLocal            0\n\
-             0002    | MatchConstant       1 :a\n\
-             0003    | JumpIfFalse         3 -> 7\n\
-             0004    | Pop\n\
-             0005    | Constant            2 1\n\
-             0006    | Jump               16 -> 23\n\
-             0007    | Pop\n\
-             0008    | GetLocal            0\n\
-             0009    | GetLocal            1\n\
-             0010    | Constant            3 2\n\
-             0011    | Greater\n\
-             0012    | CheckBool        when\n\
-             0013    | JumpIfFalse         4 -> 18\n\
-             0014    | Pop\n\
-             0015    | GetLocal            1\n\
-             0016    | PopBelow            1\n\
-             0017    | Jump                5 -> 23\n\
-             0018    | Pop\n\
-             0019    | Pop\n\
-             0020    | Constant            4 0\n\
-             0021    | Jump                1 -> 23\n\
-             0022    | NoMatch\n\
-             0023    | PopBelow            1\n\
-             0024    | Return\n"
-        );
+    fn compiles_expressions_and_globals() {
+        disassembles(&[
+            (
+                "\n\"a\" + \"b\" == \"ab\"",
+                "0000    2 Constant            0 \"a\"\n\
+                 0001    | Constant            1 \"b\"\n\
+                 0002    | Add\n\
+                 0003    | Constant            2 \"ab\"\n\
+                 0004    | Equal\n\
+                 0005    | Return\n",
+            ),
+            (
+                "let speed = 2 * dt",
+                "0000    1 Constant            1 2\n\
+                 0001    | GetGlobal           2 \"dt\"\n\
+                 0002    | Mul\n\
+                 0003    | DefineGlobal        0 \"speed\"\n\
+                 0004    | Return\n",
+            ),
+            // A block's locals live in stack slots above the temporaries
+            // under it, and go below its value when it ends.
+            (
+                "let r = 1 + {\n  let a = 2\n  a * a\n}",
+                "0000    1 Constant            1 1\n\
+                 0001    2 Constant            2 2\n\
+                 0002    3 GetLocal            1\n\
+                 0003    | GetLocal            1\n\
+                 0004    | Mul\n\
+                 0005    | PopBelow            1\n\
+                 0006    1 Add\n\
+                 0007    | DefineGlobal        0 \"r\"\n\
+                 0008    | Return\n",
+            ),
+        ]);
     }
 
     #[test]
-    fn a_nested_pattern_is_a_chain_of_tests() {
-        let chunk = compiled("case r { Ok(Some(n)) -> n, _ -> 0 }").unwrap();
-        assert_eq!(
-            chunk.to_string(),
-            "0000    1 GetGlobal           0 \"r\"\n\
-             0001    | GetLocal            0\n\
-             0002    | MatchVariant       Ok\n\
-             0003    | JumpIfFalse         7 -> 11\n\
-             0004    | Pop\n\
-             0005    | MatchVariant     Some\n\
-             0006    | JumpIfFalse         4 -> 11\n\
-             0007    | Pop\n\
-             0008    | GetLocal            1\n\
-             0009    | PopBelow            1\n\
-             0010    | Jump                4 -> 15\n\
-             0011    | Pop\n\
-             0012    | Constant            1 0\n\
-             0013    | Jump                1 -> 15\n\
-             0014    | NoMatch\n\
-             0015    | PopBelow            1\n\
-             0016    | Return\n"
-        );
+    fn jumps_over_what_does_not_run() {
+        disassembles(&[
+            (
+                "if c { 1 } else { 2 }",
+                "0000    1 GetGlobal           0 \"c\"\n\
+                 0001    | CheckBool          if\n\
+                 0002    | JumpIfFalse         3 -> 6\n\
+                 0003    | Pop\n\
+                 0004    | Constant            1 1\n\
+                 0005    | Jump                2 -> 8\n\
+                 0006    | Pop\n\
+                 0007    | Constant            2 2\n\
+                 0008    | Return\n",
+            ),
+            (
+                "a or b",
+                "0000    1 GetGlobal           0 \"a\"\n\
+                 0001    | CheckBool          or\n\
+                 0002    | JumpIfFalse         1 -> 4\n\
+                 0003    | Jump                3 -> 7\n\
+                 0004    | Pop\n\
+                 0005    | GetGlobal           1 \"b\"\n\
+                 0006    | CheckBool          or\n\
+                 0007    | Return\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn functions_and_sequences_have_their_own_chunks() {
+        disassembles(&[
+            (
+                "add :: (a: Int, b: Int) -> Int { a + b }",
+                "0000    1 Constant            1 <fn add>\n\
+                 0001    | DefineGlobal        0 \"add\"\n\
+                 0002    | Return\n\
+                 == <fn add> ==\n\
+                 0000    1 GetLocal            0\n\
+                 0001    | GetLocal            1\n\
+                 0002    | Add\n\
+                 0003    | Return\n",
+            ),
+            (
+                "add(1, 2)",
+                "0000    1 GetGlobal           0 \"add\"\n\
+                 0001    | Constant            1 1\n\
+                 0002    | Constant            2 2\n\
+                 0003    | Call                2\n\
+                 0004    | Return\n",
+            ),
+            (
+                "s :: sequence (b: Ball) {\n  over 0.5s as t {\n    b.x = t\n  }\n}",
+                "0000    1 Constant            1 <fn s>\n\
+                 0001    | DefineSequence      0 \"s\"\n\
+                 0002    | Return\n\
+                 == <fn s> ==\n\
+                 0000    2 Yield\n\
+                 0001    | Constant            0 0.5\n\
+                 0002    | OverStart\n\
+                 0003    | OverPass            1\n\
+                 0004    3 GetLocal            3\n\
+                 0005    | SetField         b.x\n\
+                 0006    2 Pop\n\
+                 0007    | OverLoop            1 -> 3\n\
+                 0008    | Pop\n\
+                 0009    | Pop\n\
+                 0010    1 End\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_struct_literal_puts_its_values_on_the_stack_before_building_it() {
+        disassembles(&[
+            (
+                "Ball :: struct { x: Float, y: Float }",
+                "0000    1 DefineStruct        0 Ball { x, y }\n\
+                 0001    | Return\n",
+            ),
+            (
+                "Ball { b | y: b.y + 1.0 }",
+                "0000    1 GetGlobal           0 \"b\"\n\
+                 0001    | GetGlobal           1 \"b\"\n\
+                 0002    | GetField            2 \"y\"\n\
+                 0003    | Constant            3 1.0\n\
+                 0004    | Add\n\
+                 0005    | Struct              0 Ball { _ | y }\n\
+                 0006    | Return\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_case_tests_each_branch_and_drops_what_a_failed_one_pushed() {
+        disassembles(&[
+            (
+                "case s { :a -> 1, n when n > 2 -> n, _ -> 0 }",
+                "0000    1 GetGlobal           0 \"s\"\n\
+                 0001    | GetLocal            0\n\
+                 0002    | MatchConstant       1 :a\n\
+                 0003    | JumpIfFalse         3 -> 7\n\
+                 0004    | Pop\n\
+                 0005    | Constant            2 1\n\
+                 0006    | Jump               16 -> 23\n\
+                 0007    | Pop\n\
+                 0008    | GetLocal            0\n\
+                 0009    | GetLocal            1\n\
+                 0010    | Constant            3 2\n\
+                 0011    | Greater\n\
+                 0012    | CheckBool        when\n\
+                 0013    | JumpIfFalse         4 -> 18\n\
+                 0014    | Pop\n\
+                 0015    | GetLocal            1\n\
+                 0016    | PopBelow            1\n\
+                 0017    | Jump                5 -> 23\n\
+                 0018    | Pop\n\
+                 0019    | Pop\n\
+                 0020    | Constant            4 0\n\
+                 0021    | Jump                1 -> 23\n\
+                 0022    | NoMatch\n\
+                 0023    | PopBelow            1\n\
+                 0024    | Return\n",
+            ),
+            // A nested pattern is a chain of tests.
+            (
+                "case r { Ok(Some(n)) -> n, _ -> 0 }",
+                "0000    1 GetGlobal           0 \"r\"\n\
+                 0001    | GetLocal            0\n\
+                 0002    | MatchVariant       Ok\n\
+                 0003    | JumpIfFalse         7 -> 11\n\
+                 0004    | Pop\n\
+                 0005    | MatchVariant     Some\n\
+                 0006    | JumpIfFalse         4 -> 11\n\
+                 0007    | Pop\n\
+                 0008    | GetLocal            1\n\
+                 0009    | PopBelow            1\n\
+                 0010    | Jump                4 -> 15\n\
+                 0011    | Pop\n\
+                 0012    | Constant            1 0\n\
+                 0013    | Jump                1 -> 15\n\
+                 0014    | NoMatch\n\
+                 0015    | PopBelow            1\n\
+                 0016    | Return\n",
+            ),
+        ]);
     }
 }
