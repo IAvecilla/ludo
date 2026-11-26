@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use crate::ast::{BinaryOp, UnaryOp, Variant};
 use crate::chunk::Test;
-use crate::value::{Instance, Value};
+use crate::value::{Instance, Layout, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeError {
@@ -164,84 +164,66 @@ pub(crate) fn binary(op: BinaryOp, left: Value, right: Value) -> Result<Value, R
     }
 }
 
+// The checker has made sure that fields are only read and set on structs
+// that have them, and that a literal names fields of its struct, all of them
+// when it updates no other.
+
 /// The value of a field of a struct.
-pub(crate) fn field(target: &Value, name: &str) -> Result<Value, RuntimeError> {
-    match target {
-        Value::Struct(instance) => instance
-            .get(name)
-            .cloned()
-            .ok_or_else(|| error(format!("`{}` has no field `{name}`", instance.name))),
-        other => Err(error(format!("{} has no fields", other.type_name()))),
-    }
-}
-
-/// Builds a struct of type `name`, whose `declared` fields come from those
-/// of `base`, if it updates one, and the `fields` a literal gives in the
-/// order they are written.
-pub(crate) fn build_struct<'a>(
-    name: &str,
-    declared: &[String],
-    base: Option<Value>,
-    fields: impl IntoIterator<Item = (&'a str, Value)>,
-) -> Result<Value, RuntimeError> {
-    let mut slots: Vec<Option<Value>> = match base {
-        Some(Value::Struct(instance)) if instance.name == name => instance
-            .fields
-            .iter()
-            .map(|(_, v)| Some(v.clone()))
-            .collect(),
-        Some(other) => {
-            return Err(error(format!(
-                "`{name} {{ x | ... }}` needs a {name} as `x`, got {}",
-                other.type_name()
-            )))
-        }
-        None => vec![None; declared.len()],
+pub(crate) fn field(target: &Value, name: &str) -> Value {
+    let Value::Struct(instance) = target else {
+        unreachable!("only structs have fields")
     };
-
-    for (field, given) in fields {
-        let index = declared
-            .iter()
-            .position(|f| f == field)
-            .ok_or_else(|| error(format!("`{name}` has no field `{field}`")))?;
-        slots[index] = Some(given);
-    }
-
-    let fields = declared
-        .iter()
-        .zip(slots)
-        .map(|(field, value)| {
-            let value =
-                value.ok_or_else(|| error(format!("missing field `{field}` in `{name}`")))?;
-            Ok((field.clone(), value))
-        })
-        .collect::<Result<_, RuntimeError>>()?;
-    Ok(Value::Struct(Rc::new(Instance {
-        name: name.to_string(),
-        fields,
-    })))
+    instance
+        .get(name)
+        .expect("the struct has the field")
+        .clone()
 }
 
-/// The state of a sequence with one of its fields replaced, for
-/// `target.field = value`.
-pub(crate) fn with_field(
-    target: &str,
-    state: &Value,
-    field: &str,
-    value: Value,
-) -> Result<Value, RuntimeError> {
+/// Builds a struct with this `layout` from the `values` a literal gives to
+/// the fields it `names`, and those of `base` for the rest, if it updates
+/// one.
+pub(crate) fn build_struct(
+    layout: &Rc<Layout>,
+    base: Option<Value>,
+    names: &[impl AsRef<str>],
+    values: Vec<Value>,
+) -> Value {
+    let declared = layout.fields.iter().map(String::as_str);
+    let fields = match base {
+        // With no base the literal gives every field, and usually in the
+        // order the struct declares them: then its values are the fields.
+        None if declared.eq(names.iter().map(AsRef::as_ref)) => values,
+        base => {
+            let mut fields = match base {
+                Some(Value::Struct(base)) => base.values.clone(),
+                // Each one is replaced below.
+                _ => vec![Value::Bool(false); layout.fields.len()],
+            };
+            for (name, value) in names.iter().zip(values) {
+                fields[slot(layout, name.as_ref())] = value;
+            }
+            fields
+        }
+    };
+    Value::Struct(Rc::new(Instance {
+        layout: Rc::clone(layout),
+        values: fields,
+    }))
+}
+
+/// A struct with one of its fields replaced, for `target.field = value` in a
+/// sequence.
+pub(crate) fn with_field(state: &Value, field: &str, value: Value) -> Value {
     let Value::Struct(instance) = state else {
-        return Err(error(format!(
-            "`{target}.{field} = ...` needs `{target}` to be a struct, got {}",
-            state.type_name()
-        )));
+        unreachable!("the state of a sequence whose fields are set is a struct")
     };
     let mut instance = (**instance).clone();
-    match instance.fields.iter_mut().find(|(f, _)| f == field) {
-        Some((_, slot)) => *slot = value,
-        None => return Err(error(format!("`{}` has no field `{field}`", instance.name))),
-    }
-    Ok(Value::Struct(Rc::new(instance)))
+    instance.values[slot(&instance.layout, field)] = value;
+    Value::Struct(Rc::new(instance))
+}
+
+fn slot(layout: &Layout, field: &str) -> usize {
+    layout.position(field).expect("the struct has the field")
 }
 
 /// Whether a value matches a literal pattern: a value of the literal's type

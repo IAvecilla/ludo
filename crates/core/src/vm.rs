@@ -10,7 +10,7 @@ use crate::runtime::{
     no_match, not_callable, passes, progress, sequence_hint, stack_overflow, struct_hint, unary,
     with_field, RuntimeError, MAX_CALL_DEPTH,
 };
-use crate::value::{Closure, Value};
+use crate::value::{Closure, Layout, Value};
 
 /// A call in progress: the function, the next instruction it runs and where
 /// its frame starts on the stack. clox keeps the function in slot 0; here,
@@ -44,13 +44,13 @@ impl Run {
 /// structs, the symbols of its enums and its sequences.
 #[derive(Default)]
 struct Declarations {
-    structs: HashMap<String, Rc<[String]>>,
+    structs: HashMap<String, Rc<Layout>>,
     enums: HashMap<String, Vec<String>>,
     sequences: HashMap<String, Rc<Function>>,
 }
 
 impl Declarations {
-    fn fields(&self, name: &str) -> Result<&Rc<[String]>, RuntimeError> {
+    fn layout(&self, name: &str) -> Result<&Rc<Layout>, RuntimeError> {
         self.structs
             .get(name)
             .ok_or_else(|| error(format!("undefined struct `{name}`")))
@@ -168,7 +168,17 @@ impl Vm {
     /// reload changed the shape of the world.
     pub fn struct_shapes(&self) -> HashMap<String, Vec<String>> {
         let shapes = self.declared.structs.iter();
-        shapes.map(|(name, f)| (name.clone(), f.to_vec())).collect()
+        shapes
+            .map(|(name, l)| (name.clone(), l.fields.clone()))
+            .collect()
+    }
+
+    /// Builds a struct declared by the program, from its fields by name, as
+    /// a literal of it does.
+    pub fn build(&self, name: &str, fields: Vec<(&str, Value)>) -> Result<Value, RuntimeError> {
+        let (names, values): (Vec<&str>, Vec<Value>) = fields.into_iter().unzip();
+        let layout = self.declared.layout(name)?;
+        Ok(build_struct(layout, None, &names, values))
     }
 
     /// Runs one frame of every sequence over the world, in the order they
@@ -352,16 +362,18 @@ impl Vm {
             }
             Op::DefineStruct(shape) => {
                 let Shape { name, fields } = &chunk.shapes[shape];
-                let fields = Rc::from(fields.as_slice());
-                self.declared.structs.insert(name.clone(), fields);
+                let layout = Layout {
+                    name: name.clone(),
+                    fields: fields.clone(),
+                };
+                self.declared.structs.insert(name.clone(), Rc::new(layout));
             }
             Op::Struct { shape, base } => {
                 let Shape { name, fields } = &chunk.shapes[shape];
                 let values = self.stack.split_off(self.stack.len() - fields.len());
                 let base = base.then(|| self.pop());
-                let declared = self.declared.fields(name)?;
-                let given = fields.iter().map(String::as_str).zip(values);
-                let instance = build_struct(name, declared, base, given)?;
+                let layout = self.declared.layout(name)?;
+                let instance = build_struct(layout, base, fields, values);
                 self.push(instance);
             }
             Op::DefineEnum(shape) => {
@@ -383,7 +395,7 @@ impl Vm {
             }
             Op::GetField(index) => {
                 let target = self.pop();
-                self.push(field(&target, chunk.name(index))?);
+                self.push(field(&target, chunk.name(index)));
             }
             Op::DefineSequence(index) => {
                 let Value::Function(sequence) = self.pop() else {
@@ -421,10 +433,9 @@ impl Vm {
                     self.frame().ip -= distance;
                 }
             }
-            Op::SetField { state, field } => {
+            Op::SetField { field, .. } => {
                 let value = self.pop();
-                let target = chunk.name(state);
-                self.stack[base] = with_field(target, &self.stack[base], chunk.name(field), value)?;
+                self.stack[base] = with_field(&self.stack[base], chunk.name(field), value);
             }
             Op::SetState => self.stack[base] = self.pop(),
             Op::End => return Ok(Some(Exit::End)),
@@ -569,7 +580,7 @@ mod tests {
     use super::*;
     use crate::parser::parse;
     use crate::scanner::scan_tokens;
-    use crate::value::Instance;
+    use crate::value::{Instance, Layout};
 
     /// A VM that runs ludo source as the REPL and `play` do.
     struct Machine(Vm);
@@ -902,26 +913,16 @@ mod tests {
             ),
             (
                 &format!(
-                    "{ball}Paddle :: struct {{ y: Float }}\nlet n = 1\nState :: enum {{ :idle }}\n\
+                    "{ball}Paddle :: struct {{ y: Float }}\nState :: enum {{ :idle }}\n\
                      Ball {{ x: 1.0, y: 2.0 }} == Paddle {{ y: 2.0 }}\n\
-                     Ball {{ x: 1.0 }}\n\
-                     Ball {{ x: 1.0, y: 2.0, z: 3.0 }}\n\
                      Wall {{ y: 1.0 }}\n\
-                     Ball {{ 1 | x: 2.0 }}\n\
-                     n.x\n\
-                     Ball {{ x: 1.0, y: 2.0 }}.z\n\
                      Ball\n\
                      State"
                 ),
-                "[line 5] error: operands of `==` must be two values of the same type, got Ball and Paddle\n\
-                 [line 6] error: missing field `y` in `Ball`\n\
-                 [line 7] error: `Ball` has no field `z`\n\
-                 [line 8] error: undefined struct `Wall`\n\
-                 [line 9] error: `Ball { x | ... }` needs a Ball as `x`, got Int\n\
-                 [line 10] error: Int has no fields\n\
-                 [line 11] error: `Ball` has no field `z`\n\
-                 [line 12] error: `Ball` is a struct, not a value: build one with `Ball { ... }`\n\
-                 [line 13] error: `State` is an enum, not a value: its values are its symbols, like `:idle`",
+                "[line 4] error: operands of `==` must be two values of the same type, got Ball and Paddle\n\
+                 [line 5] error: undefined struct `Wall`\n\
+                 [line 6] error: `Ball` is a struct, not a value: build one with `Ball { ... }`\n\
+                 [line 7] error: `State` is an enum, not a value: its values are its symbols, like `:idle`",
             ),
         ]);
     }
@@ -993,18 +994,19 @@ mod tests {
     const START: &str = "Ball { x: 0.0, y: 0.0 }";
 
     fn ball(x: f64) -> Value {
-        Value::Struct(Rc::new(Instance {
+        let layout = Layout {
             name: "Ball".into(),
-            fields: vec![
-                ("x".into(), Value::Float(x)),
-                ("y".into(), Value::Float(0.0)),
-            ],
+            fields: vec!["x".into(), "y".into()],
+        };
+        Value::Struct(Rc::new(Instance {
+            layout: Rc::new(layout),
+            values: vec![Value::Float(x), Value::Float(0.0)],
         }))
     }
 
     fn x(world: &Value) -> String {
         match world {
-            Value::Struct(ball) => ball.fields[0].1.to_string(),
+            Value::Struct(ball) => ball.values[0].to_string(),
             other => other.to_string(),
         }
     }
@@ -1124,18 +1126,11 @@ mod tests {
                 "wait -1.0s",
                 "a duration must be a finite number of seconds, at least 0s, got -1.0",
             ),
-            ("b.z = 1.0", "`Ball` has no field `z`"),
         ];
         for (steps, message) in cases {
             let frames = sequence("b: Ball", steps, "").frames(ball(0.0), 0.25, 1);
             assert_eq!(frames, format!("[line 4] error: {message}"));
         }
-        let frames = sequence("b: Int", "b.z = 1.0", "").frames(Value::Int(1), 0.25, 1);
-        assert_eq!(
-            frames,
-            "[line 4] error: `b.z = ...` needs `b` to be a struct, got Int"
-        );
-
         assert_eq!(
             Machine::new("").run("s :: sequence (n: Int) {}\nstart s()\nstart t(1)\ns(1)"),
             "[line 2] error: `s` expects 1 argument, got 0\n\

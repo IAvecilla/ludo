@@ -128,7 +128,8 @@ impl Game {
     }
 
     pub fn step(&mut self, keys: &Keys, dt: f64) -> Result<(), String> {
-        let args = vec![self.world.clone(), input(keys), Value::Float(dt)];
+        let input = input(&self.vm, keys).map_err(|e| runtime("the input", e))?;
+        let args = vec![self.world.clone(), input, Value::Float(dt)];
         let world = self
             .vm
             .call_function("update", args)
@@ -228,22 +229,20 @@ fn runtime(during: &str, error: RuntimeError) -> String {
     }
 }
 
-fn input(keys: &Keys) -> Value {
+/// The `Input` that `host.ludo` declares, for the keys of this step.
+fn input(vm: &Vm, keys: &Keys) -> Result<Value, RuntimeError> {
     let symbols = |names: &[&str]| {
         let symbols = names.iter().map(|name| Value::Symbol(name.to_string()));
         Value::List(Rc::new(symbols.collect()))
     };
     let mut fields = vec![
-        ("held".to_string(), symbols(&keys.held)),
-        ("pressed".to_string(), symbols(&keys.pressed)),
+        ("held", symbols(&keys.held)),
+        ("pressed", symbols(&keys.pressed)),
     ];
     for name in ["up", "down", "left", "right", "w", "a", "s", "d", "space"] {
-        fields.push((name.to_string(), Value::Bool(keys.held.contains(&name))));
+        fields.push((name, Value::Bool(keys.held.contains(&name))));
     }
-    Value::Struct(Rc::new(Instance {
-        name: "Input".to_string(),
-        fields,
-    }))
+    vm.build("Input", fields)
 }
 
 fn shape(value: &Value) -> Result<Shape, String> {
@@ -251,7 +250,7 @@ fn shape(value: &Value) -> Result<Shape, String> {
         return Err(not_a_shape(value.type_name()));
     };
     let float = |field: &str| number(instance, field);
-    match instance.name.as_str() {
+    match instance.name() {
         "Rect" => Ok(Shape::Rect {
             x: float("x")?,
             y: float("y")?,
@@ -288,7 +287,7 @@ fn not_a_shape(got: &str) -> String {
 
 fn read_config(value: &Value) -> Result<Config, String> {
     let config = match value {
-        Value::Struct(config) if config.name == "Config" => config,
+        Value::Struct(config) if config.name() == "Config" => config,
         other => {
             return Err(format!(
                 "`config` must return a Config, got {}",
@@ -327,7 +326,7 @@ fn string(instance: &Instance, field: &str) -> Result<String, String> {
 fn color(instance: &Instance) -> Result<Rgba, String> {
     match instance.get("color") {
         Some(Value::Symbol(name)) => named(name),
-        Some(Value::Struct(color)) if color.name == "Color" => {
+        Some(Value::Struct(color)) if color.name() == "Color" => {
             let channel = |field: &str| match color.get(field) {
                 Some(Value::Int(v)) if (0..=255).contains(v) => Ok(*v as u8),
                 Some(Value::Int(v)) => Err(format!(
@@ -371,10 +370,10 @@ fn field_error(instance: &Instance, field: &str, expected: &str, got: Option<&Va
     match got {
         Some(value) => format!(
             "`{}.{field}` must be {expected}, got {}",
-            instance.name,
+            instance.name(),
             value.type_name()
         ),
-        None => format!("`{}` has no field `{field}`", instance.name),
+        None => format!("`{}` has no field `{field}`", instance.name()),
     }
 }
 

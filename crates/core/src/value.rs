@@ -35,15 +35,44 @@ pub struct Closure {
     pub captured: Vec<Value>,
 }
 
+/// The name of a struct and its fields in the order it declares them. Every
+/// instance points to the one of its struct, so it keeps only its values, as
+/// clox's instances keep the names of their fields in strings they share.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+impl Layout {
+    pub fn position(&self, field: &str) -> Option<usize> {
+        self.fields.iter().position(|f| f == field)
+    }
+}
+
+/// A struct: its layout and the value of each field, in the same order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Instance {
-    pub name: String,
-    pub fields: Vec<(String, Value)>,
+    pub layout: Rc<Layout>,
+    pub values: Vec<Value>,
 }
 
 impl Instance {
+    pub fn name(&self) -> &str {
+        &self.layout.name
+    }
+
     pub fn get(&self, field: &str) -> Option<&Value> {
-        self.fields.iter().find(|(f, _)| f == field).map(|(_, v)| v)
+        self.layout.position(field).map(|i| &self.values[i])
+    }
+
+    /// Each field with its value.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.layout
+            .fields
+            .iter()
+            .map(String::as_str)
+            .zip(&self.values)
     }
 }
 
@@ -71,7 +100,7 @@ impl Value {
             Value::Str(_) => "String",
             Value::Symbol(_) => "Symbol",
             Value::Function(_) | Value::Closure(_) | Value::Native(_) => "Function",
-            Value::Struct(instance) => &instance.name,
+            Value::Struct(instance) => instance.name(),
             Value::List(_) => "List",
             Value::Option(_) => "Option",
             Value::Result(_) => "Result",
@@ -87,7 +116,7 @@ impl Value {
 
     pub fn same_type(&self, other: &Value) -> bool {
         match (self, other) {
-            (Value::Struct(a), Value::Struct(b)) => a.name == b.name,
+            (Value::Struct(a), Value::Struct(b)) => a.name() == b.name(),
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
@@ -118,13 +147,13 @@ impl fmt::Display for Value {
             Value::Closure(_) => f.write_str("<fn>"),
             Value::Native(native) => write!(f, "<fn {}>", native.name),
             Value::Struct(instance) => {
-                write!(f, "{} {{", instance.name)?;
-                for (i, (field, value)) in instance.fields.iter().enumerate() {
+                write!(f, "{} {{", instance.name())?;
+                for (i, (field, value)) in instance.fields().enumerate() {
                     let sep = if i == 0 { " " } else { ", " };
                     write!(f, "{sep}{field}: ")?;
                     nested(f, value)?;
                 }
-                if instance.fields.is_empty() {
+                if instance.values.is_empty() {
                     f.write_str("}")
                 } else {
                     f.write_str(" }")
