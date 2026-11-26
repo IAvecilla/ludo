@@ -81,13 +81,13 @@ On an Apple M3 Max with macOS 26.7, with Rust 1.100, Apple clang 21, Python
 
 | | ludo | clox | plox | ploxb | lua | luajit | gleam |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fib` | 28.7 ± 5.4 ms | 8.2 ± 0.4 ms | 2.88 ± 0.01 s | 1.77 ± 0.01 s | 4.2 ± 0.2 ms | 2.1 ± 0.3 ms | 101.3 ± 5.6 ms |
-| `loops` | 13.4 ± 0.6 ms | 4.3 ± 0.2 ms | 1.62 ± 0.02 s | 1.03 ± 0.01 s | 2.5 ± 0.1 ms | 1.6 ± 0.1 ms | 101.7 ± 3.3 ms |
-| `mandelbrot` | 17.7 ± 0.6 ms | 4.4 ± 0.3 ms | 2.09 ± 0.06 s | 1.40 ± 0.00 s | 3.2 ± 0.4 ms | 2.0 ± 0.2 ms | 105.5 ± 5.1 ms |
-| `strings` | 33.3 ± 1.1 ms | 14.1 ± 0.7 ms | 2.98 ± 0.02 s | 1.93 ± 0.01 s | 7.1 ± 0.5 ms | 3.6 ± 0.3 ms | 111.4 ± 6.2 ms |
+| `fib` | 29.2 ± 1.8 ms | 7.9 ± 0.3 ms | 2.87 ± 0.03 s | 1.92 ± 0.12 s | 4.4 ± 0.2 ms | 2.1 ± 0.3 ms | 98.8 ± 1.7 ms |
+| `loops` | 13.8 ± 0.8 ms | 4.3 ± 0.2 ms | 1.60 ± 0.02 s | 1.02 ± 0.01 s | 2.6 ± 0.1 ms | 1.6 ± 0.1 ms | 98.1 ± 1.2 ms |
+| `mandelbrot` | 17.5 ± 0.8 ms | 4.4 ± 0.2 ms | 2.02 ± 0.01 s | 1.42 ± 0.02 s | 3.1 ± 0.1 ms | 1.9 ± 0.1 ms | 99.4 ± 3.4 ms |
+| `strings` | 31.6 ± 0.4 ms | 13.1 ± 0.3 ms | 2.86 ± 0.00 s | 1.90 ± 0.15 s | 6.9 ± 0.2 ms | 3.5 ± 0.1 ms | 105.3 ± 2.6 ms |
 
-clox is 2.4 to 4 times faster than ludo, Lua 4.7 to 7 times and LuaJIT 8.6 to
-14 times, and ludo is 58 to 121 times faster than plox and ploxb. Gleam's times
+clox is 2.4 to 4 times faster than ludo, Lua 4.6 to 6.7 times and LuaJIT 8.5
+to 14 times, and ludo is 60 to 116 times faster than plox and ploxb. Gleam's times
 are almost all the start of the BEAM: `erl` takes about 106 ms to start and
 stop doing nothing, so these problems are too short to time Gleam itself.
 
@@ -95,20 +95,20 @@ stop doing nothing, so these problems are too short to time Gleam itself.
 
 | | ludo | love |
 | --- | ---: | ---: |
-| 3600 frames | 103.0 ± 2.4 ms | 131.6 ± 5.0 ms |
+| 3600 frames | 58.8 ± 0.8 ms | 131.8 ± 4.7 ms |
 
 Over a minute of game ludo takes less, but only because it starts sooner:
 ludo starts in about 5 ms and LÖVE in about 135 ms, as long as a minute of
-game takes it. Each frame takes ludo about 28 µs and LÖVE about 3.3 µs, 8
-times less: 36000 frames take ludo 1.01 s, and 360000 take LÖVE 1.33 s. Both
+game takes it. Each frame takes ludo about 15 µs and LÖVE about 3.3 µs, 4.5
+times less: 36000 frames take ludo 0.54 s, and 360000 take LÖVE 1.33 s. Both
 are far below the 16.7 ms that a frame has at 60 frames per second.
 
 ### 3. Lists and structs
 
 | | ludo | lua | luajit | gleam |
 | --- | ---: | ---: | ---: | ---: |
-| `lists` | 60.5 ± 1.1 ms | 17.1 ± 0.4 ms | 7.0 ± 0.2 ms | 112.3 ± 1.4 ms |
-| `structs` | 67.4 ± 3.1 ms | 23.2 ± 1.0 ms | 9.8 ± 0.3 ms | 105.0 ± 2.8 ms |
+| `lists` | 60.0 ± 1.1 ms | 17.0 ± 0.4 ms | 7.0 ± 0.2 ms | 110.7 ± 1.4 ms |
+| `structs` | 42.4 ± 0.9 ms | 22.8 ± 0.8 ms | 9.1 ± 0.1 ms | 101.3 ± 1.5 ms |
 
 In `lists`, natives call back into ludo many times, as `map` does. Each of
 those calls pushes the call onto the stack and enters the VM's loop again,
