@@ -43,12 +43,18 @@ pub(crate) fn enum_hint(name: &str, symbol: &str) -> String {
     format!("`{name}` is an enum, not a value: its values are its symbols, like `:{symbol}`")
 }
 
+/// A function written where it is used has no name, so its error says "the
+/// function".
 pub(crate) fn check_arity(name: &str, expected: usize, got: usize) -> Result<(), RuntimeError> {
     if expected == got {
         return Ok(());
     }
+    let who = match name {
+        "" => "the function".to_string(),
+        name => format!("`{name}`"),
+    };
     Err(error(format!(
-        "`{name}` expects {expected} argument{}, got {got}",
+        "{who} expects {expected} argument{}, got {got}",
         if expected == 1 { "" } else { "s" }
     )))
 }

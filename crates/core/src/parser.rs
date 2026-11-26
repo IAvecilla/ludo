@@ -67,15 +67,6 @@ pub fn parse_with(tokens: Vec<Token>, exprs: ExprParser) -> Result<Vec<Stmt>, Ve
     }
 }
 
-pub fn parse_expr(tokens: Vec<Token>) -> Result<Expr, ParseError> {
-    let mut parser = Parser::new(tokens, ExprParser::default());
-    let expr = parser.expression()?;
-    if !parser.is_at_end() {
-        return Err(parser.error("unexpected trailing input"));
-    }
-    Ok(expr)
-}
-
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
@@ -400,6 +391,7 @@ impl Parser {
                 return self.struct_literal(name);
             }
             TokenKind::Ident(v) => Expr::Ident(v),
+            TokenKind::LParen if self.starts_function() => return self.function(),
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.with_structs(true, Self::expression)?;
@@ -418,7 +410,6 @@ impl Parser {
                 return Ok(Expr::List(items));
             }
             TokenKind::LBrace => return self.block(),
-            TokenKind::Fn => return self.lambda(),
             TokenKind::If => return self.if_expression(),
             TokenKind::Case => return self.case_expression(),
             TokenKind::Wait | TokenKind::Over => {
@@ -437,15 +428,25 @@ impl Parser {
         Ok(expr)
     }
 
-    /// `fn(x: Int) -> Int { x * 2 }`: written as a declared function is,
-    /// with `fn` in place of its name and `::`.
-    fn lambda(&mut self) -> Result<Expr, ParseError> {
+    /// Whether the `(` here starts a function, `(x: Int) -> ...` or
+    /// `() -> ...`, and not a group: no expression starts with a name and
+    /// `:`, or is `()`.
+    fn starts_function(&self) -> bool {
+        matches!(
+            (self.kind_at(1), self.kind_at(2)),
+            (Some(TokenKind::Ident(_)), Some(TokenKind::Colon))
+                | (Some(TokenKind::RParen), Some(TokenKind::Arrow))
+        )
+    }
+
+    /// `(x: Int) -> Int { x * 2 }`: written as a declared function is,
+    /// without its name and `::`.
+    fn function(&mut self) -> Result<Expr, ParseError> {
         self.advance();
-        self.expect(TokenKind::LParen, "`(` and the parameters after `fn`")?;
-        let StmtKind::Fn(decl) = self.fn_declaration("fn".to_string())? else {
+        let StmtKind::Fn(decl) = self.fn_declaration(String::new())? else {
             unreachable!("fn_declaration gives a function")
         };
-        Ok(Expr::Lambda(decl))
+        Ok(Expr::Function(decl))
     }
 
     fn block(&mut self) -> Result<Expr, ParseError> {
@@ -832,8 +833,6 @@ mod tests {
             ("1 + )", "expected an expression, found `)`"),
             ("let x = 1 +\n2", "expected an expression, at end of line"),
         ]);
-        let error = parse_expr(scan_tokens("1 2").unwrap()).unwrap_err();
-        assert_eq!(error.message, "unexpected trailing input, found `2`");
     }
 
     #[test]
@@ -1124,37 +1123,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_lambdas() {
+    fn parses_functions_written_where_they_are_used() {
         parses(&[
             (
-                "let double = fn(x: Int) -> Int { x * 2 }",
+                "let double = (x: Int) -> Int { x * 2 }",
                 "(let double (fn (x: Int) -> Int (block (* x 2))))",
             ),
             (
-                "xs |> filter(fn(x: Int) -> Bool { x > 0 })",
+                "xs |> filter((x: Int) -> Bool { x > 0 })",
                 "(call filter xs (fn (x: Int) -> Bool (block (> x 0))))",
             ),
-            ("fn() -> Int { 1 }()", "(call (fn () -> Int (block 1)))"),
+            ("() -> Int { 1 }()", "(call (fn () -> Int (block 1)))"),
+            // A group is still a group.
+            ("(x) + (1)", "(+ x 1)"),
             (
-                "map(xs, fn(x: Int) -> Int {\n  let y = x + 1\n  y\n})",
+                "map(xs, (x: Int) -> Int {\n  let y = x + 1\n  y\n})",
                 "(call map xs (fn (x: Int) -> Int (block (let y (+ x 1)) y)))",
             ),
             (
-                "fn(a: Int) -> (Int) -> Int { fn(b: Int) -> Int { a + b } }",
+                "(a: Int) -> (Int) -> Int { (b: Int) -> Int { a + b } }",
                 "(fn (a: Int) -> (Int) -> Int (block (fn (b: Int) -> Int (block (+ a b)))))",
             ),
         ]);
         rejects(&[
             (
-                "fn x -> x",
-                "expected `(` and the parameters after `fn`, found `x`",
-            ),
-            (
-                "fn(x: Int) { x }",
+                "(x: Int) { x }",
                 "expected `->` and a return type, found `{`",
             ),
             (
-                "fn(x: Int) -> Int {\n  f :: () -> Int { 1 }\n  x\n}",
+                "(x: Int) -> Int {\n  f :: () -> Int { 1 }\n  x\n}",
                 "functions can only be declared at the top level, found `f`",
             ),
         ]);

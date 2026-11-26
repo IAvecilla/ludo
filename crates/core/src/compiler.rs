@@ -1,4 +1,3 @@
-use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
@@ -7,32 +6,18 @@ use crate::ast::{
 use crate::chunk::{Chunk, Function, Op, Shape, Test};
 use crate::value::Value;
 
-/// An error found while compiling. Every construct of ludo compiles now, so
-/// none is reported yet; the checks planned before running will report here.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompileError {
-    pub message: String,
-    pub line: usize,
-}
-
-impl fmt::Display for CompileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[line {}] Compile Error: {}", self.line, self.message)
-    }
-}
-
 /// Compiles a top-level statement into a function with no name, the script
 /// that runs it. An expression returns its value; a `let` or a declaration
 /// binds a global and returns nothing. The VM keeps the globals from one
 /// script to the next.
-pub fn compile(stmt: &Stmt) -> Result<Function, CompileError> {
+pub fn compile(stmt: &Stmt) -> Function {
     let mut compiler = Compiler::new(stmt.line);
     match &stmt.kind {
-        StmtKind::Expr(expr) => compiler.expression(expr)?,
-        _ => compiler.statement(stmt)?,
+        StmtKind::Expr(expr) => compiler.expression(expr),
+        _ => compiler.statement(stmt),
     }
     compiler.emit(Op::Return);
-    Ok(compiler.finish(None))
+    compiler.finish(None)
 }
 
 /// A local variable while its block is being compiled.
@@ -116,13 +101,13 @@ impl Compiler {
             .expect("the compiler never pops an empty stack");
     }
 
-    /// Compiles a function written with `fn` and makes a closure of it. It
+    /// Compiles a function written where it is used and makes a closure of it. It
     /// keeps the locals in scope here that its body names, which go on the
     /// stack above the function for `Closure` to take. In its own chunk they
     /// are locals right after its parameters, where the VM puts them when it
     /// is called. A local of the function around it is a local here too, so
     /// a closure inside another one finds what it keeps.
-    fn lambda(&mut self, decl: &FnDecl) -> Result<(), CompileError> {
+    fn closure(&mut self, decl: &FnDecl) {
         let mut names = Vec::new();
         mentioned(&decl.body, &mut names);
         let (captured, slots): (Vec<String>, Vec<usize>) = names
@@ -135,7 +120,7 @@ impl Compiler {
             compiler.height += 1;
             compiler.add_local(name);
         }
-        compiler.expression(&decl.body)?;
+        compiler.expression(&decl.body);
         compiler.emit(Op::Return);
         let mut function = compiler.finish(Some(&decl.name));
         function.captured = captured;
@@ -144,7 +129,6 @@ impl Compiler {
             self.emit(Op::GetLocal(*slot));
         }
         self.emit(Op::Closure(slots.len()));
-        Ok(())
     }
 
     fn constant(&mut self, value: Value) {
@@ -214,23 +198,23 @@ impl Compiler {
 
     /// Compiles a statement, which leaves the stack as it found it except
     /// for the new local of a `let` inside a block.
-    fn statement(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+    fn statement(&mut self, stmt: &Stmt) {
         let outer = std::mem::replace(&mut self.line, stmt.line);
         match &stmt.kind {
             StmtKind::Let(name, value) if self.scope_depth == 0 => {
                 let global = self.identifier_constant(name);
-                self.expression(value)?;
+                self.expression(value);
                 self.emit(Op::DefineGlobal(global));
             }
             // The value stays where it was pushed and becomes the local. It
             // is declared only now, so its own initializer still sees the
             // outer variable with that name.
             StmtKind::Let(name, value) => {
-                self.expression(value)?;
+                self.expression(value);
                 self.add_local(name);
             }
             StmtKind::Expr(expr) => {
-                self.expression(expr)?;
+                self.expression(expr);
                 self.emit(Op::Pop);
             }
             // The parser only lets functions be declared at the top level, so
@@ -238,7 +222,7 @@ impl Compiler {
             StmtKind::Fn(decl) => {
                 let global = self.identifier_constant(&decl.name);
                 let mut compiler = Compiler::function(stmt.line, &decl.params);
-                compiler.expression(&decl.body)?;
+                compiler.expression(&decl.body);
                 compiler.emit(Op::Return);
                 let function = compiler.finish(Some(&decl.name));
                 self.constant(Value::Function(Rc::new(function)));
@@ -265,7 +249,7 @@ impl Compiler {
                 let mut compiler = Compiler::function(stmt.line, &decl.params);
                 compiler.state = decl.params.first().map(|param| param.name.clone());
                 for step in &decl.body {
-                    compiler.step(step)?;
+                    compiler.step(step);
                 }
                 compiler.emit(Op::End);
                 let sequence = compiler.finish(Some(&decl.name));
@@ -274,7 +258,7 @@ impl Compiler {
             }
             StmtKind::Start(name, args) => {
                 for arg in args {
-                    self.expression(arg)?;
+                    self.expression(arg);
                 }
                 let name = self.identifier_constant(name);
                 let argc = args.len();
@@ -282,7 +266,6 @@ impl Compiler {
             }
         }
         self.line = outer;
-        Ok(())
     }
 
     fn shape(&mut self, name: &str, fields: Vec<String>) -> usize {
@@ -292,7 +275,7 @@ impl Compiler {
 
     /// Compiles a step of a sequence, which, like a statement, leaves the
     /// stack as it found it except for a new local.
-    fn step(&mut self, step: &Step) -> Result<(), CompileError> {
+    fn step(&mut self, step: &Step) {
         let outer = std::mem::replace(&mut self.line, step.line);
         match &step.kind {
             // Binding the state's name again replaces the state: the newest
@@ -301,12 +284,12 @@ impl Compiler {
                 kind: StmtKind::Let(name, value),
                 ..
             }) if self.state.as_ref() == Some(name) => {
-                self.expression(value)?;
+                self.expression(value);
                 self.emit(Op::SetState);
             }
-            StepKind::Stmt(stmt) => self.statement(stmt)?,
+            StepKind::Stmt(stmt) => self.statement(stmt),
             StepKind::Set(target, field, value) => {
-                self.expression(value)?;
+                self.expression(value);
                 let state = self.identifier_constant(target);
                 let field = self.identifier_constant(field);
                 self.emit(Op::SetField { state, field });
@@ -315,24 +298,18 @@ impl Compiler {
                 duration,
                 var,
                 body,
-            } => self.over(duration, var.as_deref(), body)?,
+            } => self.over(duration, var.as_deref(), body),
         }
         self.line = outer;
-        Ok(())
     }
 
     /// Compiles an `over`, or a `wait`, which is an `over` with no body, into
     /// a loop of passes, one per frame of the game.
-    fn over(
-        &mut self,
-        duration: &Expr,
-        var: Option<&str>,
-        body: &[Step],
-    ) -> Result<(), CompileError> {
+    fn over(&mut self, duration: &Expr, var: Option<&str>, body: &[Step]) {
         // If this frame already had a pass, the duration waits for the next
         // one too, since it is evaluated at the first pass.
         self.emit(Op::Yield);
-        self.expression(duration)?;
+        self.expression(duration);
         self.emit(Op::OverStart);
         let counters = self.height - 2;
 
@@ -342,7 +319,7 @@ impl Compiler {
         // `t` is a local of the body, with no name when there is no `as`.
         self.add_local(var.unwrap_or_default());
         for step in body {
-            self.step(step)?;
+            self.step(step);
         }
         self.drop_scope();
         let distance = self.chunk.code.len() + 1 - top;
@@ -350,15 +327,14 @@ impl Compiler {
 
         self.emit(Op::Pop);
         self.emit(Op::Pop);
-        Ok(())
     }
 
     /// Compiles a `case`. Its value stays on the stack as a hidden local while
     /// each branch tests it in turn. A branch that does not apply drops what
     /// it pushed and goes on to the next one; one that does leaves its value
     /// and jumps to the end, where the hidden local goes.
-    fn case(&mut self, value: &Expr, arms: &[Arm]) -> Result<(), CompileError> {
-        self.expression(value)?;
+    fn case(&mut self, value: &Expr, arms: &[Arm]) {
+        self.expression(value);
         let slot = self.height - 1;
         let line = self.line;
         let mut ends = Vec::new();
@@ -376,12 +352,12 @@ impl Compiler {
             let bound = self.height - slot - 1;
             let mut unmet = Vec::new();
             if let Some(guard) = &arm.guard {
-                self.expression(guard)?;
+                self.expression(guard);
                 self.emit(Op::CheckBool(Test::When));
                 unmet.push(self.emit_jump(Op::JumpIfFalse));
                 self.emit(Op::Pop);
             }
-            self.expression(&arm.body)?;
+            self.expression(&arm.body);
             self.end_scope();
             ends.push(self.emit_jump(Op::Jump));
 
@@ -423,7 +399,6 @@ impl Compiler {
         }
         self.height = slot + 2;
         self.emit(Op::PopBelow(1));
-        Ok(())
     }
 
     /// Tests the value on top of the stack against a pattern, taking it. If
@@ -452,7 +427,7 @@ impl Compiler {
         }
     }
 
-    fn expression(&mut self, expr: &Expr) -> Result<(), CompileError> {
+    fn expression(&mut self, expr: &Expr) {
         match expr {
             Expr::Int(v) => self.constant(Value::Int(*v)),
             Expr::Float(v) => self.constant(Value::Float(*v)),
@@ -461,7 +436,7 @@ impl Compiler {
             Expr::Bool(true) => self.emit(Op::True),
             Expr::Bool(false) => self.emit(Op::False),
             Expr::Unary(op, right) => {
-                self.expression(right)?;
+                self.expression(right);
                 self.emit(match op {
                     UnaryOp::Neg => Op::Negate,
                     UnaryOp::Not => Op::Not,
@@ -470,30 +445,30 @@ impl Compiler {
             // If the left side is false, so is the whole `and`: it stays as
             // the value and the right side is skipped.
             Expr::Binary(left, BinaryOp::And, right) => {
-                self.expression(left)?;
+                self.expression(left);
                 self.emit(Op::CheckBool(Test::And));
                 let end = self.emit_jump(Op::JumpIfFalse);
                 self.emit(Op::Pop);
-                self.expression(right)?;
+                self.expression(right);
                 self.emit(Op::CheckBool(Test::And));
                 self.patch_jump(end);
             }
             // If the left side is true, so is the whole `or`. clox has no
             // jump on true, so a false one jumps over a jump to the end.
             Expr::Binary(left, BinaryOp::Or, right) => {
-                self.expression(left)?;
+                self.expression(left);
                 self.emit(Op::CheckBool(Test::Or));
                 let else_jump = self.emit_jump(Op::JumpIfFalse);
                 let end = self.emit_jump(Op::Jump);
                 self.patch_jump(else_jump);
                 self.emit(Op::Pop);
-                self.expression(right)?;
+                self.expression(right);
                 self.emit(Op::CheckBool(Test::Or));
                 self.patch_jump(end);
             }
             Expr::Binary(left, op, right) => {
-                self.expression(left)?;
-                self.expression(right)?;
+                self.expression(left);
+                self.expression(right);
                 self.emit(Op::Binary(*op));
             }
             Expr::Ident(name) => match self.resolve_local(name) {
@@ -506,24 +481,24 @@ impl Compiler {
             Expr::Block(statements, tail, line) => {
                 self.begin_scope();
                 for stmt in statements {
-                    self.statement(stmt)?;
+                    self.statement(stmt);
                 }
                 let outer = std::mem::replace(&mut self.line, *line);
-                self.expression(tail)?;
+                self.expression(tail);
                 self.end_scope();
                 self.line = outer;
             }
             // The callee goes first, then its arguments above it, so the frame
             // of the call starts at the first argument.
             Expr::Call(callee, args) => {
-                self.expression(callee)?;
+                self.expression(callee);
                 for arg in args {
-                    self.expression(arg)?;
+                    self.expression(arg);
                 }
                 self.emit(Op::Call(args.len()));
             }
             Expr::Field(target, name) => {
-                self.expression(target)?;
+                self.expression(target);
                 let field = self.identifier_constant(name);
                 self.emit(Op::GetField(field));
             }
@@ -531,22 +506,22 @@ impl Compiler {
             // paths reach the end with the stack one value higher, so the
             // height the compiler counts holds after the jumps too.
             Expr::If(cond, then, otherwise) => {
-                self.expression(cond)?;
+                self.expression(cond);
                 self.emit(Op::CheckBool(Test::If));
                 let then_jump = self.emit_jump(Op::JumpIfFalse);
                 self.emit(Op::Pop);
-                self.expression(then)?;
+                self.expression(then);
                 let else_jump = self.emit_jump(Op::Jump);
                 self.patch_jump(then_jump);
                 self.emit(Op::Pop);
-                self.expression(otherwise)?;
+                self.expression(otherwise);
                 self.patch_jump(else_jump);
             }
-            Expr::Case(value, arms) => self.case(value, arms)?,
-            Expr::Lambda(decl) => self.lambda(decl)?,
+            Expr::Case(value, arms) => self.case(value, arms),
+            Expr::Function(decl) => self.closure(decl),
             Expr::List(items) => {
                 for item in items {
-                    self.expression(item)?;
+                    self.expression(item);
                 }
                 self.emit(Op::List(items.len()));
             }
@@ -555,10 +530,10 @@ impl Compiler {
             // declaration waits until `Struct` runs.
             Expr::Struct { name, base, fields } => {
                 if let Some(base) = base {
-                    self.expression(base)?;
+                    self.expression(base);
                 }
                 for (_, value) in fields {
-                    self.expression(value)?;
+                    self.expression(value);
                 }
                 let names = fields.iter().map(|(field, _)| field.clone()).collect();
                 let shape = self.shape(name, names);
@@ -566,7 +541,6 @@ impl Compiler {
                 self.emit(Op::Struct { shape, base });
             }
         }
-        Ok(())
     }
 }
 
@@ -623,7 +597,7 @@ fn mentioned(expr: &Expr, names: &mut Vec<String>) {
                 mentioned(&arm.body, names);
             }
         }
-        Expr::Lambda(decl) => mentioned(&decl.body, names),
+        Expr::Function(decl) => mentioned(&decl.body, names),
     }
 }
 
@@ -670,7 +644,7 @@ mod tests {
     /// the functions it declares, as `ludo dis` shows it.
     fn listing(source: &str) -> String {
         let statements = parse(scan_tokens(source).unwrap()).unwrap();
-        let script = compile(&statements[0]).unwrap();
+        let script = compile(&statements[0]);
         let mut listing = script.chunk.to_string();
         for constant in &script.chunk.constants {
             if let Value::Function(function) = constant {
@@ -766,24 +740,24 @@ mod tests {
 
     fn declared(source: &str) -> Rc<Function> {
         let statements = parse(scan_tokens(source).unwrap()).unwrap();
-        functions(&compile(&statements[0]).unwrap().chunk)[0].clone()
+        functions(&compile(&statements[0]).chunk)[0].clone()
     }
 
     #[test]
-    fn a_lambda_keeps_the_locals_it_names() {
-        let f = declared("f :: (k: Int, unused: Int) -> Fn {\n  fn(x: Int) -> Int { x * k }\n}");
+    fn a_closure_keeps_the_locals_it_names() {
+        let f = declared("f :: (k: Int, unused: Int) -> Fn {\n  (x: Int) -> Int { x * k }\n}");
         assert_eq!(
             f.chunk.code,
             [Op::Constant(0), Op::GetLocal(0), Op::Closure(1), Op::Return]
         );
-        let lambda = &functions(&f.chunk)[0];
+        let closure = &functions(&f.chunk)[0];
         assert_eq!(
-            (lambda.arity, lambda.captured.clone()),
+            (closure.arity, closure.captured.clone()),
             (1, vec!["k".to_string()])
         );
         // What it keeps sits right after its parameter.
         assert_eq!(
-            lambda.chunk.code,
+            closure.chunk.code,
             [
                 Op::GetLocal(0),
                 Op::GetLocal(1),
@@ -794,7 +768,7 @@ mod tests {
 
         // The middle one keeps `a` for the inner one, which keeps it and `b`.
         let g = declared(
-            "g :: (a: Int) -> Fn {\n  fn(b: Int) -> Fn { fn(c: Int) -> Int { a + b + c } }\n}",
+            "g :: (a: Int) -> Fn {\n  (b: Int) -> Fn { (c: Int) -> Int { a + b + c } }\n}",
         );
         let middle = &functions(&g.chunk)[0];
         let inner = &functions(&middle.chunk)[0];
@@ -802,7 +776,7 @@ mod tests {
         assert_eq!(inner.captured, ["a", "b"]);
 
         // A parameter with the name of a local around it hides that local.
-        let h = declared("h :: (x: Int) -> Fn {\n  fn(x: Int) -> Int { x }\n}");
+        let h = declared("h :: (x: Int) -> Fn {\n  (x: Int) -> Int { x }\n}");
         assert!(functions(&h.chunk)[0].captured.is_empty());
     }
 

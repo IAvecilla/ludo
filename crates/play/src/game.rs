@@ -5,7 +5,7 @@ use ludo_core::parser::parse;
 use ludo_core::runtime::RuntimeError;
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::{Instance, Value};
-use ludo_core::vm::{Failure, Vm};
+use ludo_core::vm::Vm;
 
 /// What a game can use without declaring it: the input, the shapes it
 /// draws, the colors and the config. The CLI loads it too, so a game file
@@ -215,10 +215,8 @@ fn run(vm: &mut Vm, checker: &mut Checker, source: &str) -> Result<(), Vec<Strin
         .check(&statements)
         .map_err(|errors| errors.iter().map(|e| e.to_string()).collect::<Vec<_>>())?;
     for stmt in &statements {
-        vm.interpret(stmt).map_err(|failure| match failure {
-            Failure::Compile(e) => vec![e.to_string()],
-            Failure::Runtime(e) => vec![runtime("the program", e)],
-        })?;
+        vm.interpret(stmt)
+            .map_err(|e| vec![runtime("the program", e)])?;
     }
     Ok(())
 }

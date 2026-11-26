@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::ast::{Stmt, UnaryOp};
 use crate::chunk::{Chunk, Function, Op, Shape};
-use crate::compiler::{compile, CompileError};
+use crate::compiler::compile;
 use crate::prelude::globals;
 use crate::runtime::{
     binary, build_struct, check_arity, check_bool, contents, enum_hint, error, field, matches,
@@ -37,13 +37,6 @@ impl Run {
     fn name(&self) -> &str {
         self.function.name()
     }
-}
-
-/// Why a statement did not run.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Failure {
-    Compile(CompileError),
-    Runtime(RuntimeError),
 }
 
 /// What a program declares besides its globals, looked up by name when it
@@ -132,9 +125,8 @@ impl Vm {
 
     /// Compiles a top-level statement and runs it, as clox's `interpret`,
     /// giving the value it left, if any.
-    pub fn interpret(&mut self, stmt: &Stmt) -> Result<Option<Value>, Failure> {
-        let script = compile(stmt).map_err(Failure::Compile)?;
-        self.run(script).map_err(Failure::Runtime)
+    pub fn interpret(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
+        self.run(compile(stmt))
     }
 
     /// Runs a compiled top-level statement and returns the value it left,
@@ -481,7 +473,7 @@ impl Vm {
                 self.call_frame(function, argc, &[])?;
             }
             Value::Closure(closure) => {
-                check_arity("fn", closure.function.arity, argc)?;
+                check_arity(closure.function.name(), closure.function.arity, argc)?;
                 self.call_frame(Rc::clone(&closure.function), argc, &closure.captured)?;
             }
             Value::Native(native) => {
@@ -597,8 +589,7 @@ mod tests {
                 .iter()
                 .filter_map(|stmt| match self.0.interpret(stmt) {
                     Ok(value) => value.map(|v| v.to_string()),
-                    Err(Failure::Runtime(e)) => Some(error(&e)),
-                    Err(Failure::Compile(e)) => panic!("{e}"),
+                    Err(e) => Some(error(&e)),
                 });
             shown.collect::<Vec<_>>().join("\n")
         }
@@ -757,44 +748,44 @@ mod tests {
     fn closures_keep_the_locals_around_them() {
         runs(&[
             (
-                "let double = fn(x: Int) -> Int { x * 2 }\ndouble(21)\ndouble",
+                "let double = (x: Int) -> Int { x * 2 }\ndouble(21)\ndouble",
                 "42\n<fn>",
             ),
             (
-                "adder :: (n: Int) -> Fn { fn(x: Int) -> Int { x + n } }\nadder(3)(4)\n[1, 2] |> map(adder(10))",
+                "adder :: (n: Int) -> Fn { (x: Int) -> Int { x + n } }\nadder(3)(4)\n[1, 2] |> map(adder(10))",
                 "7\n[11, 12]",
             ),
             (
-                "scaled :: (xs: List, k: Int) -> List {\n  xs |> map(fn(x: Int) -> Int { x * k })\n}\nscaled([1, 2, 3], 10)",
+                "scaled :: (xs: List, k: Int) -> List {\n  xs |> map((x: Int) -> Int { x * k })\n}\nscaled([1, 2, 3], 10)",
                 "[10, 20, 30]",
             ),
             // A later `let` of the same name is another local.
             (
-                "{\n  let base = 100\n  let f = fn(x: Int) -> Int { x + base }\n  let base = 0\n  f(1)\n}",
+                "{\n  let base = 100\n  let f = (x: Int) -> Int { x + base }\n  let base = 0\n  f(1)\n}",
                 "101",
             ),
             (
-                "let curry = {\n  let a = 1\n  fn(b: Int) -> Fn { fn(c: Int) -> Int { a + b + c } }\n}\ncurry(10)(100)",
+                "let curry = {\n  let a = 1\n  (b: Int) -> Fn { (c: Int) -> Int { a + b + c } }\n}\ncurry(10)(100)",
                 "111",
             ),
             // A local of the body hides the one kept with its name.
             (
-                "{\n  let x = 1\n  let f = fn() -> Int {\n    let x = 2\n    x\n  }\n  f() + x\n}",
+                "{\n  let x = 1\n  let f = () -> Int {\n    let x = 2\n    x\n  }\n  f() + x\n}",
                 "3",
             ),
             (
-                "let pick = case Some(5) {\n  Some(n) -> fn(x: Int) -> Int { x + n }\n  None -> fn(x: Int) -> Int { x }\n}\npick(1)",
+                "let pick = case Some(5) {\n  Some(n) -> (x: Int) -> Int { x + n }\n  None -> (x: Int) -> Int { x }\n}\npick(1)",
                 "6",
             ),
             // The top level is looked up by name when it runs.
-            ("let k = 1\nlet f = fn() -> Int { k }\nlet k = 2\nf()", "2"),
+            ("let k = 1\nlet f = () -> Int { k }\nlet k = 2\nf()", "2"),
             (
-                "let f = fn(x: Int) -> Int {\n  10 / x\n}\n[1, 0] |> map(f)",
+                "let f = (x: Int) -> Int {\n  10 / x\n}\n[1, 0] |> map(f)",
                 "[line 2] error: division by zero",
             ),
             (
-                "let f = fn(x: Int) -> Int { x }\nf(1, 2)",
-                "[line 2] error: `fn` expects 1 argument, got 2",
+                "let f = (x: Int) -> Int { x }\nf(1, 2)",
+                "[line 2] error: the function expects 1 argument, got 2",
             ),
         ]);
     }
@@ -1220,7 +1211,7 @@ mod tests {
     #[test]
     fn a_sequence_keeps_its_closures_between_frames() {
         let mut vm = Machine::new(&format!(
-            "{BALL}s :: sequence (b: Ball) {{\n  let by = 5.0\n  let add = fn(x: Float) -> Float {{ x + by }}\n  wait 0.5s\n  b.x = add(b.x)\n}}\nstart s(Ball {{ x: 0.0, y: 0.0 }})"
+            "{BALL}s :: sequence (b: Ball) {{\n  let by = 5.0\n  let add = (x: Float) -> Float {{ x + by }}\n  wait 0.5s\n  b.x = add(b.x)\n}}\nstart s(Ball {{ x: 0.0, y: 0.0 }})"
         ));
         assert_eq!(vm.frames(ball(1.0), 0.25, 2), "1.0, 6.0 done");
     }

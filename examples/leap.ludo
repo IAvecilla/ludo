@@ -133,8 +133,8 @@ on_screen :: (w: World) -> List[Platform] {
     let lowest = clamp(to_int((floor_y - w.camera - height) / row), 0, rows - 1)
     let highest = clamp(to_int((floor_y - w.camera) / row) + 1, 0, rows - 1)
     range(w.base + lowest, w.base + highest + 1)
-        |> filter(fn(n: Int) -> Bool { has_platform(n) and !(w.broken |> contains(n)) })
-        |> map(fn(n: Int) -> Platform { platform(n, w.time) })
+        |> filter((n: Int) -> Bool { has_platform(n) and !(w.broken |> contains(n)) })
+        |> map((n: Int) -> Platform { platform(n, w.time) })
 }
 
 update :: (w: World, input: Input, dt: Float) -> World {
@@ -142,7 +142,7 @@ update :: (w: World, input: Input, dt: Float) -> World {
         |> steer(input, dt)
         |> fly(dt)
         |> wrap()
-    let w = case on_screen(w) |> find(fn(pl: Platform) -> Bool { lands(p, pl) }) {
+    let w = case on_screen(w) |> find((pl: Platform) -> Bool { lands(p, pl) }) {
         Some(pl) -> bounce_on(World { w | player: p }, pl)
         None -> World { w | player: p }
     }
@@ -219,7 +219,7 @@ next_base :: (w: World) -> Int {
 // keeps. The shapes of each platform are a list, and `fold` joins them.
 draw :: (w: World) -> List[Shape] {
     let platforms = on_screen(w)
-        |> map(fn(p: Platform) -> List[Shape] { paint(p, w.camera) })
+        |> map((p: Platform) -> List[Shape] { paint(p, w.camera) })
         |> fold(sky(), concat)
     concat(platforms, concat(hero(w.player, w.camera), hud(w)))
 }

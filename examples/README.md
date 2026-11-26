@@ -41,3 +41,11 @@ What it shows of the language:
   sets it moving;
 - the net is `range(0, 16) |> map(dash)`, not a loop;
 - `draw` returns shapes, and `config` sets the window.
+
+## Leap
+
+A vertical jumper: every platform you land on throws you up again.
+
+```sh
+ludo play examples/leap.ludo
+```

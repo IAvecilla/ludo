@@ -7,9 +7,10 @@ use ludo_core::checker::Checker;
 use ludo_core::chunk::Chunk;
 use ludo_core::compiler::compile;
 use ludo_core::parser::{parse_with, ExprParser, ParseError};
+use ludo_core::runtime::RuntimeError;
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::Value;
-use ludo_core::vm::{Failure as Fault, Vm};
+use ludo_core::vm::Vm;
 use ludo_play::{Game, Keys, HOST};
 
 const EX_USAGE: u8 = 64;
@@ -159,11 +160,7 @@ impl Session {
         for stmt in &self.check(source)? {
             match self.execute(stmt) {
                 Ok(value) => show(value),
-                Err(Fault::Compile(error)) => {
-                    self.error(Some(error.line), "Compile", &error.message);
-                    return Err(Failure::Static);
-                }
-                Err(Fault::Runtime(error)) => {
+                Err(error) => {
                     self.error(error.line, "Runtime", &error.message);
                     return Err(Failure::Runtime);
                 }
@@ -202,19 +199,19 @@ impl Session {
 
     /// Runs a statement. With the trace on, it first shows its bytecode and
     /// that of the function or sequence it declares.
-    fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, Fault> {
+    fn execute(&mut self, stmt: &Stmt) -> Result<Option<Value>, RuntimeError> {
         if !self.vm.trace {
             return self.vm.interpret(stmt);
         }
-        let script = compile(stmt).map_err(Fault::Compile)?;
+        let script = compile(stmt);
         println!("== {stmt} ==\n{}", script.chunk);
         functions(&script.chunk);
-        self.vm.run(script).map_err(Fault::Runtime)
+        self.vm.run(script)
     }
 }
 
 /// Shows the bytecode of every function in a chunk: the function or sequence
-/// a statement declares, and those written with `fn` inside, with the locals
+/// a statement declares, and those written inside it, with the locals
 /// each of those keeps.
 fn functions(chunk: &Chunk) {
     for constant in &chunk.constants {

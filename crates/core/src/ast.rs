@@ -47,9 +47,9 @@ pub enum Expr {
     /// `case value { pattern [when guard] -> body ... }`: the value of the
     /// first branch whose pattern matches and whose guard holds.
     Case(Box<Expr>, Vec<Arm>),
-    /// `fn(x: Int) -> Int { x * 2 }`: a function written where its value is
+    /// `(x: Int) -> Int { x * 2 }`: a function written where its value is
     /// used. Its body sees the locals around it, as they are when it is made.
-    Lambda(Rc<FnDecl>),
+    Function(Rc<FnDecl>),
 }
 
 /// A branch of a `case`, with the line it starts on.
@@ -290,7 +290,7 @@ impl fmt::Display for Expr {
             }
             Expr::Call(callee, args) => write!(f, "(call {callee}{})", spaced(args)),
             Expr::Case(value, arms) => write!(f, "(case {value}{})", spaced(arms)),
-            Expr::Lambda(decl) => write!(
+            Expr::Function(decl) => write!(
                 f,
                 "(fn ({}) -> {} {})",
                 joined(&decl.params, ", "),

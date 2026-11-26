@@ -124,7 +124,7 @@ pub enum Op {
 pub struct Function {
     pub name: Option<String>,
     pub arity: usize,
-    /// For a function written with `fn`, the names of the locals around it
+    /// For a function written where it is used, the names of the locals around it
     /// that it keeps. When it is called they go on the stack after the
     /// arguments, so the body reads them as more locals.
     pub captured: Vec<String>,
@@ -140,7 +140,8 @@ impl Function {
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.name {
-            Some(name) if name == "fn" => f.write_str("<fn>"),
+            // A function written where it is used has no name.
+            Some(name) if name.is_empty() => f.write_str("<fn>"),
             Some(name) => write!(f, "<fn {name}>"),
             None => f.write_str("<script>"),
         }

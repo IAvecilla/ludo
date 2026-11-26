@@ -15,7 +15,7 @@ pub enum Value {
     Symbol(String),
     /// A function compiled to bytecode.
     Function(Rc<Function>),
-    /// A function written with `fn`, with the values it keeps.
+    /// A function written where it is used, with the values it keeps.
     Closure(Rc<Closure>),
     Native(Native),
     Struct(Rc<Instance>),
@@ -26,7 +26,7 @@ pub enum Value {
     Result(Result<Rc<Value>, Rc<Value>>),
 }
 
-/// A function written with `fn` and the values of the locals it keeps, in
+/// A function written where it is used, and the values of the locals it keeps, in
 /// the order its `captured` names them. Values never change, so keeping a
 /// copy of them is the same as keeping the variables.
 #[derive(Debug, Clone, PartialEq)]

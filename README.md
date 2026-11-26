@@ -86,6 +86,7 @@ again.
 ```sh
 ludo                    # start the REPL
 ludo run <file>         # run a program
+ludo check <file>       # check a program without running it
 ludo play <file>        # play a game in a window
 ludo dis <file>         # show the bytecode of a program and trace it
 ```
@@ -274,8 +275,8 @@ x                   // 1
 
 A function can call any function of the file, even one declared after it, so two
 functions can call each other. It sees the names at the top level of the file,
-but not the names of the code that calls it. A function written with `fn` also
-sees the names around it, see [Functions](#functions).
+but not the names of the code that calls it. A function written where it is
+used also sees the names around it, see [Functions](#functions).
 
 ```
 is_even :: (n: Int) -> Bool { n == 0 or is_odd(n - 1) }
@@ -285,7 +286,7 @@ is_even(10)         // true
 peek :: () -> Int { hidden }
 {
     let hidden = 1
-    peek()          // error: undefined variable `hidden`
+    peek()          // error: undefined name `hidden`
 }
 ```
 
@@ -316,17 +317,17 @@ Functions are values, so they can be bound with `let` and passed to other
 functions. Recursion more than 200 calls deep is an error, so to go over a long
 list use `map`, `filter` and `fold`.
 
-A function can also be written where its value is used, with `fn` in place of
-its name and `::`. Unlike a declared one, it sees the names around it, so what
-it is given to can use them, as `map` does here with `k`.
+A function can also be written where its value is used, without its name and
+`::`. Unlike a declared one, it sees the names around it, so what it is given to
+can use them, as `map` does here with `k`.
 
 ```
 scaled :: (xs: List[Int], k: Int) -> List[Int] {
-    xs |> map(fn(x: Int) -> Int { x * k })
+    xs |> map((x: Int) -> Int { x * k })
 }
 
 adder :: (n: Int) -> (Int) -> Int {
-    fn(x: Int) -> Int { x + n }
+    (x: Int) -> Int { x + n }
 }
 let add3 = adder(3)
 add3(4)             // 7
@@ -550,7 +551,7 @@ unary          → ( "-" | "!" ) unary | call ;
 call           → primary ( "(" arguments? ")" | "." IDENTIFIER ( "(" arguments? ")" )? )* ;
 primary        → INT | FLOAT | STRING | SYMBOL | IDENTIFIER | "true" | "false"
                | "(" expression ")" | ifExpr | caseExpr | block | structLit | list
-               | lambda ;
+               | function ;
 ifExpr         → "if" expression block "else" ( ifExpr | block ) ;
 caseExpr       → "case" expression "{" branch ( separator branch )* separator? "}" ;
 branch         → pattern ( "when" expression )? "->" expression ;
@@ -559,7 +560,6 @@ pattern        → "-"? ( INT | FLOAT ) | STRING | SYMBOL | "true" | "false" | I
 block          → "{" ( statement NEWLINE )* expression "}" ;
 structLit      → IDENTIFIER "{" ( expression "|" )? ( fieldValue ( separator fieldValue )* separator? )? "}" ;
 list           → "[" ( expression ( "," expression )* ","? )? "]" ;
-lambda         → "fn" function ;
 ```
 
 #### Utility rules
@@ -714,7 +714,7 @@ implementations, jlox and plox.
 | --- | --- | --- |
 | Variables | `var`, and `=` changes them | `let` only. Values never change, and a new `let` with the same name hides the old one |
 | Scope | a block's variables live in a table that assignments and closures can change later | a block's names disappear when it ends, and nothing can change them in the meantime |
-| Functions | closures that capture the scope where they were declared, and share its variables with it | declared at the top level, or written with `fn` where they are used. A `fn` keeps a copy of the names around it, which never change, so there are no upvalues to close. Neither sees the caller's variables |
+| Functions | closures that capture the scope where they were declared, and share its variables with it | declared at the top level, or written without a name where they are used. One written in place keeps a copy of the names around it, which never change, so there are no upvalues to close. Neither sees the caller's variables |
 | Values of blocks | `if` and blocks are statements, and functions `return` | everything is an expression. `if` needs an `else`, and there is no `return` |
 | Truthiness | `nil` and `false` are false, everything else is true | conditions must be a `Bool` |
 | `nil` | a value | does not exist |
