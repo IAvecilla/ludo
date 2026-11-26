@@ -144,7 +144,7 @@ make run FILE=examples/pong.ludo
 make play FILE=examples/pong.ludo
 make test
 make lint
-make bench    # time ludo against clox, plox and ploxb, see bench/README.md
+make bench    # time ludo against Lox, Lua, Gleam and LÖVE, see bench/README.md
 ```
 
 ## Language

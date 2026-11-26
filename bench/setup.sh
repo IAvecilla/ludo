@@ -7,7 +7,8 @@
 #   ploxb  the course's bytecode VM, in Python: the branch with functions
 #
 # plox and ploxb are installed with uv from their lockfiles, as their READMEs
-# say. Running it again only redoes what changed.
+# say. It also compiles the Gleam programs, in bench/gleam. Running it again
+# only redoes what changed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -61,3 +62,6 @@ for name in plox ploxb; do
         (cd "$dir/$name" && uv sync --frozen --quiet)
     fi
 done
+
+echo "== compiling the Gleam programs"
+(cd bench/gleam && gleam build --no-print-progress)

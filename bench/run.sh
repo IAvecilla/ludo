@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Times ludo with hyperfine, in three parts:
 #
-#   1. Problems that can be written in ludo and in Lox, on ludo and on clox,
-#      plox and ploxb, which setup.sh builds.
-#   2. Pong played without a window.
-#   3. Problems of ludo alone, with lists and structs.
+#   1. Problems that can be written in ludo and in other languages, on ludo,
+#      on clox, plox and ploxb, on Lua and LuaJIT, and on Gleam.
+#   2. Pong played without a window, on ludo and on LÖVE.
+#   3. Lists and structs, on ludo, Lua, LuaJIT and Gleam.
 #
 # Each comparison is a Markdown table in target/bench, and results.md has them
 # all.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if ! command -v hyperfine >/dev/null; then
-    echo "hyperfine is not installed: cargo install hyperfine --locked" >&2
-    exit 1
-fi
+for tool in hyperfine lua luajit love gleam erl; do
+    if ! command -v "$tool" >/dev/null; then
+        echo "$tool is not installed" >&2
+        exit 1
+    fi
+done
 
 cargo build --release --quiet -p ludo
 bench/setup.sh
@@ -22,6 +24,12 @@ ludo=target/release/ludo
 lox=target/bench/lox
 out=target/bench
 mkdir -p "$out"
+
+# What Gleam compiled, run on the BEAM: `gleam_run MODULE` calls its main.
+ebin=bench/gleam/build/dev/erlang
+gleam_run() {
+    echo "erl -noshell -pa $ebin/ludo_bench/ebin -pa $ebin/gleam_stdlib/ebin -eval 'bench_$1:main(), halt().'"
+}
 
 # compare NAME [hyperfine arguments...]
 compare() {
@@ -39,17 +47,28 @@ for problem in "${common[@]}"; do
         -n ludo "$ludo run bench/common/$problem.ludo" \
         -n clox "$lox/craftinginterpreters/build/clox bench/common/$problem.lox" \
         -n plox "$lox/plox/.venv/bin/plox bench/common/$problem.lox" \
-        -n ploxb "$lox/ploxb/.venv/bin/ploxb bench/common/$problem.lox"
+        -n ploxb "$lox/ploxb/.venv/bin/ploxb bench/common/$problem.lox" \
+        -n lua "lua bench/common/$problem.lua" \
+        -n luajit "luajit bench/common/$problem.lua" \
+        -n gleam "$(gleam_run "$problem")"
 done
 
-# 2 and 3. A minute of game, 3600 frames of update, sequences and draw, and
-# the problems of ludo alone, in one table.
-compare alone \
-    -n pong "$ludo play --frames=3600 examples/pong.ludo" \
-    -n lists "$ludo run bench/lists.ludo" \
-    -n structs "$ludo run bench/structs.ludo"
+# 2. A minute of game: 3600 frames of update, the serve and the shapes to draw.
+compare pong \
+    -n ludo "$ludo play --frames=3600 examples/pong.ludo" \
+    -n love "love bench/love/pong 3600"
 
-for name in "${common[@]}" alone; do
+# 3.
+alone=(lists structs)
+for problem in "${alone[@]}"; do
+    compare "$problem" \
+        -n ludo "$ludo run bench/$problem.ludo" \
+        -n lua "lua bench/$problem.lua" \
+        -n luajit "luajit bench/$problem.lua" \
+        -n gleam "$(gleam_run "$problem")"
+done
+
+for name in "${common[@]}" pong "${alone[@]}"; do
     printf '### %s\n\n' "$name"
     cat "$out/$name.md"
     echo
