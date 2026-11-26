@@ -15,6 +15,8 @@ pub enum Value {
     Symbol(String),
     /// A function compiled to bytecode.
     Function(Rc<Function>),
+    /// A function written with `fn`, with the values it keeps.
+    Closure(Rc<Closure>),
     Native(Native),
     Struct(Rc<Instance>),
     List(Rc<Vec<Value>>),
@@ -22,6 +24,15 @@ pub enum Value {
     Option(Option<Rc<Value>>),
     /// `Ok(x)` or `Error(e)`.
     Result(Result<Rc<Value>, Rc<Value>>),
+}
+
+/// A function written with `fn` and the values of the locals it keeps, in
+/// the order its `captured` names them. Values never change, so keeping a
+/// copy of them is the same as keeping the variables.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Closure {
+    pub function: Rc<Function>,
+    pub captured: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,7 +70,7 @@ impl Value {
             Value::Bool(_) => "Bool",
             Value::Str(_) => "String",
             Value::Symbol(_) => "Symbol",
-            Value::Function(_) | Value::Native(_) => "Function",
+            Value::Function(_) | Value::Closure(_) | Value::Native(_) => "Function",
             Value::Struct(instance) => &instance.name,
             Value::List(_) => "List",
             Value::Option(_) => "Option",
@@ -68,7 +79,10 @@ impl Value {
     }
 
     pub fn is_function(&self) -> bool {
-        matches!(self, Value::Function(_) | Value::Native(_))
+        matches!(
+            self,
+            Value::Function(_) | Value::Closure(_) | Value::Native(_)
+        )
     }
 
     pub fn same_type(&self, other: &Value) -> bool {
@@ -101,6 +115,7 @@ impl fmt::Display for Value {
             Value::Str(v) => write!(f, "{v}"),
             Value::Symbol(v) => write!(f, ":{v}"),
             Value::Function(function) => write!(f, "{function}"),
+            Value::Closure(_) => f.write_str("<fn>"),
             Value::Native(native) => write!(f, "<fn {}>", native.name),
             Value::Struct(instance) => {
                 write!(f, "{} {{", instance.name)?;

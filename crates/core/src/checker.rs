@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::ast::{
-    Arm, BinaryOp, Expr, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
+    Arm, BinaryOp, Expr, FnDecl, Literal, Param, Pattern, SeqDecl, Step, StepKind, Stmt, StmtKind,
     TypeExpr, UnaryOp, Variant,
 };
 use crate::prelude::{constants, NATIVES};
@@ -285,8 +285,7 @@ impl Pass {
                     self.lets.entry(name.clone()).or_insert(stmt.line);
                 }
                 StmtKind::Fn(decl) => {
-                    let params = decl.params.iter().map(|p| self.resolve(&p.ty)).collect();
-                    let signature = Type::function(params, self.resolve(&decl.ret));
+                    let signature = self.signature(decl);
                     self.ahead.values.insert(decl.name.clone(), signature);
                 }
                 StmtKind::Struct(decl) => {
@@ -306,6 +305,11 @@ impl Pass {
     }
 
     /// The type a written type stands for.
+    fn signature(&mut self, decl: &FnDecl) -> Type {
+        let params = decl.params.iter().map(|p| self.resolve(&p.ty)).collect();
+        Type::function(params, self.resolve(&decl.ret))
+    }
+
     fn resolve(&mut self, ty: &TypeExpr) -> Type {
         let (name, args) = match ty {
             TypeExpr::Function { params, ret } => {
@@ -551,6 +555,7 @@ impl Pass {
             Expr::Binary(left, op, right) => self.binary(left, *op, right),
             Expr::Field(target, name) => self.field(target, name),
             Expr::Struct { name, base, fields } => self.structure(name, base.as_deref(), fields),
+            Expr::Lambda(decl) => self.lambda(decl),
         };
         if let Some((want, what)) = expected {
             if !self.fits(&ty, want) {
@@ -581,6 +586,25 @@ impl Pass {
                 self.join(&then, &otherwise, "the branches of `if`")
             }
         }
+    }
+
+    /// The type of a function written with `fn`. Its body sees the locals
+    /// around it, and the top level as the body of a declared function does,
+    /// since it runs when it is called.
+    fn lambda(&mut self, decl: &FnDecl) -> Type {
+        let signature = self.signature(decl);
+        let Type::Function(params, ret) = &signature else {
+            unreachable!("a function has a function type")
+        };
+        let outer = self.body;
+        self.body = outer.or(Some("function"));
+        let locals = decl.params.iter().map(|p| p.name.clone());
+        self.scopes
+            .push(locals.zip(params.iter().cloned()).collect());
+        self.check(&decl.body, ret, "the value of the `fn`");
+        self.scopes.pop();
+        self.body = outer;
+        signature
     }
 
     fn block(&mut self, statements: &[Stmt], tail: &Expr, line: usize, expected: Expected) -> Type {
@@ -1133,6 +1157,42 @@ mod tests {
              case half(4) { Ok(n) -> n, Error(_) -> 0 }\nis_two :: (n: Int) -> Bool { n == 2 }\nfind([1, 2], is_two) == Some(2)",
             // An empty list takes its type from where it is used.
             "let xs = []\nconcat(xs, [1])\nsum :: (xs: List[Int]) -> Int { 0 }\nsum([])",
+        ]);
+    }
+
+    #[test]
+    fn a_lambda_sees_the_locals_around_it() {
+        passes(&[
+            "let double = fn(x: Int) -> Int { x * 2 }\nprint(double(2))",
+            "adder :: (n: Int) -> (Int) -> Int {\n  fn(x: Int) -> Int { x + n }\n}",
+            "scaled :: (xs: List[Int], k: Int) -> List[Int] {\n  xs |> map(fn(x: Int) -> Int { x * k })\n}",
+            "print(range(0, 3) |> map(fn(x: Int) -> String { to_string(x) }))",
+            // Like a function body, it runs when it is called.
+            "let f = fn() -> Int { later() }\nlater :: () -> Int { 1 }",
+        ]);
+        rejects(&[
+            (
+                "let f = fn(x: Int) -> Int { \"a\" }",
+                "[line 1] the value of the `fn` must be Int, got String",
+            ),
+            (
+                "print([1] |> map(fn(x: String) -> Int { 1 }))",
+                "[line 1] argument 2 of `map` must be (Int) -> _, got (String) -> Int",
+            ),
+            ("let f = fn(x: Int) -> Int { y }", "[line 1] undefined name `y`"),
+            (
+                "let f = fn() -> Int { speed }\nlet speed = 2",
+                "[line 1] `speed` is declared after this function, on line 2: a function can only use a top level `let` declared before it",
+            ),
+            (
+                "let f = fn(x: Int) -> Int { x }\nprint(f(1, 2))",
+                "[line 2] `f` expects 1 argument, got 2",
+            ),
+            // A declared function still sees only its parameters.
+            (
+                "peek :: () -> Int { hidden }\nlet r = {\n  let hidden = 1\n  peek()\n}",
+                "[line 1] undefined name `hidden`",
+            ),
         ]);
     }
 

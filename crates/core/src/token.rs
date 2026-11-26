@@ -17,6 +17,7 @@ pub enum TokenKind {
     Or,
     True,
     False,
+    Fn,
 
     Sequence,
     Over,

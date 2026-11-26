@@ -7,6 +7,7 @@ fn a_game_file_runs_with_the_host_prelude() {
     for (name, printed) in [
         ("pong.ludo", "This is a game file to play pong\n"),
         ("square.ludo", ""),
+        ("leap.ludo", ""),
     ] {
         let path = format!("{}/../../examples/{name}", env!("CARGO_MANIFEST_DIR"));
         let output = Command::new(env!("CARGO_BIN_EXE_ludo"))

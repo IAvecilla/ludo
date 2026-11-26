@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use ludo_core::ast::Stmt;
 use ludo_core::checker::Checker;
+use ludo_core::chunk::Chunk;
 use ludo_core::compiler::compile;
 use ludo_core::parser::{parse_with, ExprParser, ParseError};
 use ludo_core::scanner::scan_tokens;
@@ -207,12 +208,27 @@ impl Session {
         }
         let script = compile(stmt).map_err(Fault::Compile)?;
         println!("== {stmt} ==\n{}", script.chunk);
-        for constant in &script.chunk.constants {
-            if let Value::Function(function) = constant {
-                println!("== {function} ==\n{}", function.chunk);
-            }
-        }
+        functions(&script.chunk);
         self.vm.run(script).map_err(Fault::Runtime)
+    }
+}
+
+/// Shows the bytecode of every function in a chunk: the function or sequence
+/// a statement declares, and those written with `fn` inside, with the locals
+/// each of those keeps.
+fn functions(chunk: &Chunk) {
+    for constant in &chunk.constants {
+        if let Value::Function(function) = constant {
+            match function.captured.as_slice() {
+                [] => println!("== {function} ==\n{}", function.chunk),
+                kept => println!(
+                    "== {function} keeping {} ==\n{}",
+                    kept.join(", "),
+                    function.chunk
+                ),
+            }
+            functions(&function.chunk);
+        }
     }
 }
 

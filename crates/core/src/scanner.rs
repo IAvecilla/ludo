@@ -192,6 +192,7 @@ impl Scanner {
             "or" => TokenKind::Or,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "fn" => TokenKind::Fn,
             "sequence" => TokenKind::Sequence,
             "over" => TokenKind::Over,
             "wait" => TokenKind::Wait,
@@ -274,6 +275,7 @@ mod tests {
                 "over overflow _unused",
                 r#"Over Ident("overflow") Ident("_unused")"#,
             ),
+            ("fn fns", r#"Fn Ident("fns")"#),
             // A colon before a lowercase name starts a symbol.
             (
                 "f :: :jump pos:Vec2",
