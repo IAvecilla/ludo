@@ -6,19 +6,7 @@ use crate::ast::{
 };
 use crate::token::{Token, TokenKind};
 
-mod ladder;
 mod pratt;
-
-/// How expressions are parsed. Both build the same tree; the ladder stays to
-/// compare against Pratt.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ExprParser {
-    /// One loop driven by a table of precedences, as in clox.
-    #[default]
-    Pratt,
-    /// One function per level of precedence, as in jlox.
-    Ladder,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -38,11 +26,7 @@ impl ParseError {
 }
 
 pub fn parse(tokens: Vec<Token>) -> Result<Vec<Stmt>, Vec<ParseError>> {
-    parse_with(tokens, ExprParser::default())
-}
-
-pub fn parse_with(tokens: Vec<Token>, exprs: ExprParser) -> Result<Vec<Stmt>, Vec<ParseError>> {
-    let mut parser = Parser::new(tokens, exprs);
+    let mut parser = Parser::new(tokens);
     let mut statements = Vec::new();
     let mut errors = Vec::new();
 
@@ -70,7 +54,6 @@ pub fn parse_with(tokens: Vec<Token>, exprs: ExprParser) -> Result<Vec<Stmt>, Ve
 struct Parser {
     tokens: Vec<Token>,
     current: usize,
-    exprs: ExprParser,
     /// How many `{ }` the parser is inside of.
     blocks: usize,
     /// Whether `Name {` starts a struct. It does not in a condition, as in
@@ -82,11 +65,10 @@ struct Parser {
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, exprs: ExprParser) -> Self {
+    fn new(tokens: Vec<Token>) -> Self {
         Self {
             tokens,
             current: 0,
-            exprs,
             blocks: 0,
             struct_ok: true,
             state: String::new(),
@@ -355,10 +337,7 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Result<Expr, ParseError> {
-        match self.exprs {
-            ExprParser::Pratt => self.pratt_expression(),
-            ExprParser::Ladder => self.ladder_expression(),
-        }
+        self.pratt_expression()
     }
 
     /// What follows a `.`: a field of `receiver`, or a method call that
@@ -774,21 +753,12 @@ mod tests {
     use super::*;
     use crate::scanner::scan_tokens;
 
-    /// Parses with Pratt and with the ladder, which must agree on every tree
-    /// and every error.
-    fn both(source: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
-        let run = |exprs| parse_with(scan_tokens(source).expect("source should scan"), exprs);
-        let pratt = run(ExprParser::Pratt);
-        assert_eq!(
-            run(ExprParser::Ladder),
-            pratt,
-            "the parsers disagree on {source:?}"
-        );
-        pratt
+    fn parsed(source: &str) -> Result<Vec<Stmt>, Vec<ParseError>> {
+        parse(scan_tokens(source).expect("source should scan"))
     }
 
     fn tree(source: &str) -> Result<String, String> {
-        match both(source) {
+        match parsed(source) {
             Ok(statements) => Ok(statements
                 .iter()
                 .map(|s| s.to_string())
@@ -879,7 +849,7 @@ mod tests {
 
     #[test]
     fn errors_know_their_line_and_whether_the_input_ended() {
-        let errors = |source: &str| both(source).unwrap_err();
+        let errors = |source: &str| parsed(source).unwrap_err();
         let lines: Vec<usize> = errors("let ok = 1\nlet 1 = 2\n\nlet x")
             .iter()
             .map(|e| e.line)
@@ -1180,15 +1150,5 @@ mod tests {
                 "expected `->` and the type of the result, found `Int`",
             ),
         ]);
-    }
-
-    #[test]
-    fn the_examples_parse_the_same_both_ways() {
-        for source in [
-            include_str!("../../../examples/pong.ludo"),
-            include_str!("../../../examples/square.ludo"),
-        ] {
-            assert!(both(source).is_ok());
-        }
     }
 }

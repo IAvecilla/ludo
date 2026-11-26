@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Times ludo with hyperfine, in four parts:
+# Times ludo with hyperfine, in three parts:
 #
 #   1. Problems that can be written in ludo and in Lox, on ludo and on clox,
 #      plox and ploxb, which setup.sh builds.
-#   2. The Pratt parser against the ladder.
-#   3. Pong played without a window.
-#   4. Problems of ludo alone, with lists and structs.
+#   2. Pong played without a window.
+#   3. Problems of ludo alone, with lists and structs.
 #
 # Each comparison is a Markdown table in target/bench, and results.md has them
 # all.
@@ -23,7 +22,6 @@ ludo=target/release/ludo
 lox=target/bench/lox
 out=target/bench
 mkdir -p "$out"
-bench/big.sh "$out/big.ludo"
 
 # compare NAME [hyperfine arguments...]
 compare() {
@@ -44,19 +42,14 @@ for problem in "${common[@]}"; do
         -n ploxb "$lox/ploxb/.venv/bin/ploxb bench/common/$problem.lox"
 done
 
-# 2. Running a 30000 line program: only the parser changes in each pair.
-compare parser \
-    -n ladder "$ludo run --parser=ladder $out/big.ludo" \
-    -n pratt "$ludo run --parser=pratt $out/big.ludo"
-
-# 3 and 4. A minute of game, 3600 frames of update, sequences and draw, and
+# 2 and 3. A minute of game, 3600 frames of update, sequences and draw, and
 # the problems of ludo alone, in one table.
 compare alone \
     -n pong "$ludo play --frames=3600 examples/pong.ludo" \
     -n lists "$ludo run bench/lists.ludo" \
     -n structs "$ludo run bench/structs.ludo"
 
-for name in "${common[@]}" parser alone; do
+for name in "${common[@]}" alone; do
     printf '### %s\n\n' "$name"
     cat "$out/$name.md"
     echo

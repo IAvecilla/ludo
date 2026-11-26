@@ -2,14 +2,13 @@
 
 `make bench` builds `ludo` in release mode and times it with
 [hyperfine](https://github.com/sharkdp/hyperfine) (`cargo install hyperfine
---locked`), in four parts. Each comparison is a Markdown table in
+--locked`), in three parts. Each comparison is a Markdown table in
 `target/bench`, and `target/bench/results.md` has them all.
 
 1. **Common problems**: programs that can be written both in ludo and in Lox,
    on ludo and on three implementations of Lox.
-2. **Parser**: the Pratt parser against the precedence ladder.
-3. **Pong**: a minute of game.
-4. **Lists and structs**: problems of ludo alone.
+2. **Pong**: a minute of game.
+3. **Lists and structs**: problems of ludo alone.
 
 The Lox implementations are fetched and built by `bench/setup.sh`, each at a
 fixed commit, into `target/bench/lox`. It needs `git`, `make`, a C compiler
@@ -47,20 +46,13 @@ Calls nest only a few levels deep, because clox allows at most 64 and ludo
 and clox, and about 0.1 s for plox and ploxb, which import the libraries of
 their REPL.
 
-## 2. Parser
-
-`ludo run` on a 30000 line program that `big.sh` writes, with
-`--parser=ladder` and `--parser=pratt`. The program is lines
-of expressions that go through every level of precedence, so in each pair only
-the parser changes.
-
-## 3. Pong
+## 2. Pong
 
 `examples/pong.ludo` played for 3600 frames, a minute of game, with
 `ludo play --frames=3600` and no window: `update`, the sequences and `draw`
 every frame.
 
-## 4. Lists and structs
+## 3. Lists and structs
 
 | Program | What runs |
 | --- | --- |
@@ -89,13 +81,7 @@ language the gap is much smaller: ploxb is 1.4 to 1.6 times faster than plox. Th
 version of Python: on Python 3.14, plox runs `fib` in about 4.0 s and ploxb
 in about 3.8 s.
 
-### 2. Parser
-
-| Ladder | Pratt | |
-| ---: | ---: | --- |
-| 216.4 ± 3.4 ms | 202.7 ± 8.4 ms | Pratt 6% faster |
-
-### 3 and 4. Pong, lists and structs
+### 2 and 3. Pong, lists and structs
 
 | | Time |
 | --- | ---: |
