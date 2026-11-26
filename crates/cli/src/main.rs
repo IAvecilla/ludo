@@ -6,7 +6,7 @@ use ludo_core::ast::Stmt;
 use ludo_core::checker::Checker;
 use ludo_core::chunk::Chunk;
 use ludo_core::compiler::compile;
-use ludo_core::parser::{parse_with, ExprParser, ParseError};
+use ludo_core::parser::{parse, ParseError};
 use ludo_core::runtime::RuntimeError;
 use ludo_core::scanner::scan_tokens;
 use ludo_core::value::Value;
@@ -30,9 +30,6 @@ struct Options {
     /// `--trace`: show the bytecode of each input of the REPL and trace it as
     /// it runs.
     trace: bool,
-    /// `--parser=ladder` or `--parser=pratt`: how to parse expressions, to
-    /// compare the two.
-    parser: ExprParser,
     /// `--frames=N`: play a game for N frames without a window, to time it.
     frames: Option<usize>,
 }
@@ -45,17 +42,13 @@ impl Options {
         for flag in flags {
             match (*flag, command) {
                 ("--trace", None) => options.trace = true,
-                ("--parser=pratt", _) => options.parser = ExprParser::Pratt,
-                ("--parser=ladder", _) => options.parser = ExprParser::Ladder,
                 (_, Some("play")) => {
                     options.frames = Some(flag.strip_prefix("--frames=")?.parse().ok()?)
                 }
                 _ => return None,
             }
         }
-        // A game is always parsed the usual way.
-        let plays_ladder = command == Some("play") && options.parser != ExprParser::default();
-        (!plays_ladder).then_some(options)
+        Some(options)
     }
 }
 
@@ -87,23 +80,21 @@ fn main() -> ExitCode {
     match command {
         "run" => exit(Session::new(&options, true).run(&source, |_| {})),
         "check" => exit(Session::new(&options, true).check(&source).map(drop)),
-        "dis" => disassemble(&source, options.parser),
+        "dis" => disassemble(&source),
         _ => play(path, &source, &options),
     }
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: ludo [--trace] [--parser=P]     start the REPL");
-    eprintln!("       ludo run [--parser=P] FILE      run a program");
-    eprintln!("       ludo check [--parser=P] FILE    check a program without running it");
-    eprintln!("       ludo play [--frames=N] FILE     play a game file in a window");
-    eprintln!("       ludo dis [--parser=P] FILE      compile to bytecode and trace it on the VM");
+    eprintln!("usage: ludo [--trace]               start the REPL");
+    eprintln!("       ludo run FILE                run a program");
+    eprintln!("       ludo check FILE              check a program without running it");
+    eprintln!("       ludo play [--frames=N] FILE  play a game file in a window");
+    eprintln!("       ludo dis FILE                compile to bytecode and trace it on the VM");
     eprintln!();
     eprintln!("Programs compile to bytecode and run on the VM. With --trace the REPL");
     eprintln!("shows the bytecode of each input and traces it as it runs.");
-    eprintln!("--parser=ladder parses expressions with the precedence ladder instead of");
-    eprintln!("Pratt, and --frames=N plays a game for N frames without a window; both are");
-    eprintln!("there for the benchmarks.");
+    eprintln!("--frames=N plays a game for N frames without a window, for the benchmarks.");
     ExitCode::from(EX_USAGE)
 }
 
@@ -120,7 +111,6 @@ fn exit(result: Result<(), Failure>) -> ExitCode {
 struct Session {
     vm: Vm,
     checker: Checker,
-    parser: ExprParser,
     /// Whether it runs a file, whose errors say their line, and not the REPL.
     file: bool,
 }
@@ -130,7 +120,6 @@ impl Session {
         let mut session = Session {
             vm: Vm::new(),
             checker: Checker::new(),
-            parser: options.parser,
             file,
         };
         if session.run(HOST, |_| {}).is_err() {
@@ -178,7 +167,7 @@ impl Session {
             }
             Failure::Static
         })?;
-        let statements = match parse_with(tokens, self.parser) {
+        let statements = match parse(tokens) {
             Ok(statements) => statements,
             Err(errors) if !self.file && errors.last().is_some_and(|e| e.at_end) => {
                 return Err(Failure::Incomplete(errors));
@@ -229,10 +218,9 @@ fn functions(chunk: &Chunk) {
     }
 }
 
-fn disassemble(source: &str, parser: ExprParser) -> ExitCode {
+fn disassemble(source: &str) -> ExitCode {
     let options = Options {
         trace: true,
-        parser,
         ..Options::default()
     };
     exit(
