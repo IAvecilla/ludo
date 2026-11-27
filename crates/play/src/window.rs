@@ -4,8 +4,9 @@ use macroquad::prelude::*;
 
 use crate::game::{Game, Keys, Reload, Rgba, Shape};
 
-const DT: f64 = 1.0 / 60.0;
-const MAX_STEPS_PER_FRAME: usize = 8;
+/// The longest a step can be: after a pause, as a reload makes, the game
+/// goes on from where it was instead of jumping ahead.
+const MAX_DT: f64 = 1.0 / 30.0;
 
 pub fn play(game: Game, path: String) {
     let config = game.config();
@@ -23,8 +24,6 @@ async fn run(mut game: Game, path: String) {
     let mut shapes = Vec::new();
     let mut failure: Option<String> = None;
     let mut reload_errors: Option<String> = None;
-    let mut elapsed = 0.0;
-    let mut pending: Vec<&str> = Vec::new();
     let mut modified = modified_at(&path);
 
     loop {
@@ -45,7 +44,6 @@ async fn run(mut game: Game, path: String) {
                     );
                     reload_errors = None;
                     failure = None;
-                    elapsed = 0.0;
                 }
                 Err(errors) => {
                     let errors = errors.join("\n");
@@ -57,37 +55,22 @@ async fn run(mut game: Game, path: String) {
 
         if is_key_pressed(KeyCode::F5) {
             match game.restart() {
-                Ok(()) => {
-                    failure = None;
-                    elapsed = 0.0;
-                }
+                Ok(()) => failure = None,
                 Err(error) => failure = Some(error),
             }
         }
 
+        // One step for each frame the screen shows, over the time the last
+        // one took, at whatever rate the screen refreshes.
         if failure.is_none() {
-            elapsed += f64::from(get_frame_time());
-            for key in keys(is_key_pressed) {
-                if !pending.contains(&key) {
-                    pending.push(key);
-                }
-            }
-            let mut steps = 0;
-            while elapsed >= DT && steps < MAX_STEPS_PER_FRAME {
-                let keys = Keys {
-                    held: keys(is_key_down).collect(),
-                    pressed: std::mem::take(&mut pending),
-                };
-                if let Err(error) = game.step(&keys, DT) {
-                    eprintln!("{error}");
-                    failure = Some(error);
-                    break;
-                }
-                elapsed -= DT;
-                steps += 1;
-            }
-            if steps == MAX_STEPS_PER_FRAME {
-                elapsed = 0.0;
+            let keys = Keys {
+                held: keys(is_key_down).collect(),
+                pressed: keys(is_key_pressed).collect(),
+            };
+            let dt = f64::from(get_frame_time()).min(MAX_DT);
+            if let Err(error) = game.step(&keys, dt) {
+                eprintln!("{error}");
+                failure = Some(error);
             }
         }
 

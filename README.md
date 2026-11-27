@@ -35,7 +35,7 @@ draw :: (w: World) -> List[Shape] {
 ludo play examples/square.ludo
 ```
 
-`init` builds the world, `update` makes a new one 60 times per second, and
+`init` builds the world, `update` makes a new one every frame, and
 `draw` says what to show. The language is explained in more detail [Language](#language),
 and games in detail in [Games](#games).
 
@@ -669,9 +669,11 @@ draw :: (w: World) -> List[Shape]
   `config :: () -> Config { Config { width: 800, height: 600, title: "Pong" } }`.
   Without it the window is 640×480 and titled "ludo". Width and height are
   `Int`s from 1 to 4096.
-- `update` is called 60 times per second of game time, always with
-  `dt = 1.0 / 60.0`. After each call, every running sequence takes one step over
-  the new world, and what the last one leaves is the world for the next step.
+- `update` is called once per frame, with `dt` the seconds the last frame
+  took, at most `1.0 / 30.0`; `ludo play --frames=N`, which plays without a
+  window, always uses `1.0 / 60.0`. After each call, every running sequence
+  takes one step over the new world, and what the last one leaves is the world
+  for the next step.
 - `draw` is called once per frame and returns what to show, from the back, as
   `Rect { x, y, w, h, color }`, `Circle { x, y, r, color }`,
   `Line { x1, y1, x2, y2, thickness, color }` and
